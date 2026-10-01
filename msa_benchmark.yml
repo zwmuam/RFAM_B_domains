@@ -1,0 +1,17 @@
+# msa_benchmark.yml
+name: msa_benchmark
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - python=3.10
+  - mafft>=7.520
+  - muscle>=5.1.0
+  - viennarna>=2.5.1
+  - numpy>=1.26.4,<2.0
+  - pandas>=2.2.1
+  - openpyxl>=3.1.2
+  - biopython>=1.83
+  - psutil>=5.9.0
+  - pytest
