@@ -4,6 +4,8 @@ plot_benchmark.py
 Generates comparative bar charts for pipeline performance metrics
 (MMseqs2_simweighted vs RiboSeek_simweighted vs RiboSeek_None)
 across datasets, arranged by mean Adjusted Rand Index (ARI) in descending order.
+Includes visualizations for glued references, split references, and pair accuracy metrics
+(accurate / faulty / missing pairs) at COV 50%, 75%, and 90% thresholds.
 """
 
 from pathlib import Path
@@ -159,6 +161,84 @@ def create_comparative_bar_chart(
     return output_path
 
 
+def create_pairs_breakdown_figure(
+    df: pd.DataFrame,
+    dataset_order: List[str],
+    cov_percentage: str,
+    pair_type: str,  # 'ref_pairs_in_pred' or 'pred_pairs_in_ref'
+    output_path: Path
+) -> Path:
+    """
+    Creates a 1x3 panel figure comparing Accurate (Right), Faulty (Wrong), and Missing pairs
+    at a specific COV coverage threshold (e.g. '50%', '75%', '90%').
+
+    :param df: Prepared DataFrame
+    :param dataset_order: Datasets ordered by mean ARI desc
+    :param cov_percentage: Coverage threshold string e.g. '50%'
+    :param pair_type: 'ref_pairs_in_pred' or 'pred_pairs_in_ref'
+    :param output_path: Destination PNG path
+    :return: Saved file path
+    """
+    if pair_type == "ref_pairs_in_pred":
+        prefix = "ref_pairs_in_pred_clusters"
+        type_title = "Reference Pairs in Predicted Clusters"
+    else:
+        prefix = "pred_pairs_in_ref_clusters"
+        type_title = "Predicted Pairs in Reference Clusters"
+
+    metric_cols = [
+        (f"accurate_{prefix}_COV_{cov_percentage}", "Accurate (Right) Pairs", "#2ca02c"),
+        (f"faulty_{prefix}_COV_{cov_percentage}", "Faulty (Wrong) Pairs", "#d62728"),
+        (f"missing_{prefix}_COV_{cov_percentage}", "Missing Pairs", "#ff7f0e")
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(22, 6))
+    pipelines = df["pipeline"].unique().tolist()
+    x = np.arange(len(dataset_order))
+    n_pipelines = len(pipelines)
+    total_width = 0.8
+    bar_width = total_width / n_pipelines
+    colors = ["#2b5c8f", "#d95f02", "#7570b3"]
+
+    for ax_idx, (col_name, status_title, status_color) in enumerate(metric_cols):
+        ax = axes[ax_idx]
+        for idx, pipeline in enumerate(pipelines):
+            pipe_df = df[df["pipeline"] == pipeline].set_index("dataset")
+            values = [pipe_df.loc[d, col_name] if (d in pipe_df.index and col_name in pipe_df.columns) else 0 for d in dataset_order]
+            offset = x - (total_width / 2) + (idx + 0.5) * bar_width
+
+            ax.bar(
+                offset,
+                values,
+                width=bar_width,
+                label=pipeline,
+                color=colors[idx % len(colors)],
+                edgecolor="black",
+                linewidth=0.5
+            )
+
+        ax.set_title(f"{status_title} ({cov_percentage} Coverage)", fontweight="bold", fontsize=12)
+        ax.set_ylabel("Pair Count", fontweight="bold", fontsize=10)
+        ax.set_xticks(x)
+        ax.set_xticklabels(dataset_order, rotation=45, ha="right", fontsize=8)
+        ax.grid(axis="y", linestyle="--", alpha=0.7)
+        if ax_idx == 0:
+            ax.legend(title="Pipeline", fontsize=9, title_fontsize=10)
+
+    fig.suptitle(
+        f"{type_title} Comparison at COV {cov_percentage} (Datasets Ordered by Mean ARI Descending)",
+        fontsize=15,
+        fontweight="bold",
+        y=1.02
+    )
+    plt.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    return output_path
+
+
 def create_summary_grid_figure(
     df: pd.DataFrame,
     dataset_order: List[str],
@@ -293,6 +373,54 @@ def generate_all_plots(excel_path: Path, output_dir: Path) -> List[Path]:
         output_path=output_dir / "summary_metrics_comparison.png"
     )
     generated_files.append(p_summary)
+
+    # 7-12. Pair accuracy breakdown figures at COV 50%, 75%, and 90%
+    cov_thresholds = ["50%", "75%", "90%"]
+    pair_types = [
+        ("ref_pairs_in_pred", "ref_pairs"),
+        ("pred_pairs_in_ref", "pred_pairs")
+    ]
+
+    for pair_type, label in pair_types:
+        for cov in cov_thresholds:
+            clean_cov = cov.replace("%", "")
+            fig_path = create_pairs_breakdown_figure(
+                df=df,
+                dataset_order=dataset_order,
+                cov_percentage=cov,
+                pair_type=pair_type,
+                output_path=output_dir / f"{label}_accuracy_cov_{clean_cov}.png"
+            )
+            generated_files.append(fig_path)
+
+            # Standalone charts for accurate (right), faulty (wrong), missing pairs
+            prefix = "ref_pairs_in_pred_clusters" if pair_type == "ref_pairs_in_pred" else "pred_pairs_in_ref_clusters"
+            p_acc = create_comparative_bar_chart(
+                df=df,
+                metric_col=f"accurate_{prefix}_COV_{cov}",
+                title=f"Accurate Pairs ({label.replace('_', ' ').title()}) at COV {cov}",
+                ylabel="Accurate Pairs Count",
+                output_path=output_dir / f"{label}_accurate_cov_{clean_cov}.png"
+            )
+            generated_files.append(p_acc)
+
+            p_fault = create_comparative_bar_chart(
+                df=df,
+                metric_col=f"faulty_{prefix}_COV_{cov}",
+                title=f"Faulty (Wrong) Pairs ({label.replace('_', ' ').title()}) at COV {cov}",
+                ylabel="Faulty Pairs Count",
+                output_path=output_dir / f"{label}_faulty_cov_{clean_cov}.png"
+            )
+            generated_files.append(p_fault)
+
+            p_miss = create_comparative_bar_chart(
+                df=df,
+                metric_col=f"missing_{prefix}_COV_{cov}",
+                title=f"Missing Pairs ({label.replace('_', ' ').title()}) at COV {cov}",
+                ylabel="Missing Pairs Count",
+                output_path=output_dir / f"{label}_missing_cov_{clean_cov}.png"
+            )
+            generated_files.append(p_miss)
 
     return generated_files
 
