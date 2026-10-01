@@ -1,4 +1,3 @@
-# environment.yml
 name: msa_benchmark
 channels:
   - conda-forge

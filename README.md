@@ -38,22 +38,22 @@ The framework operates via a 4-step benchmarking workflow:
 * Linux / macOS system environment
 * Conda or Mamba package manager
 
-### 1. Environment Setup via Conda / Mamba
-Clone the repository and create the Conda environment using `msa_benchmark.yml` or `environment.yml`:
+### 1. Unified Environment Setup via Conda / Mamba
+Clone the repository and create the single, unified Conda environment using `environment.yml`:
 
 ```bash
 git clone https://github.com/your-org/RFAM_B_domains.git
 cd RFAM_B_domains
 
-# Create and activate environment via msa_benchmark.yml or environment.yml
-conda env create -f msa_benchmark.yml
+# Create and activate environment via environment.yml
+conda env create -f environment.yml
 conda activate msa_benchmark
 ```
 
-The Conda environment automatically installs both Python dependencies (`numpy`, `pandas`, `openpyxl`, `biopython`, `psutil`, `matplotlib`, `seaborn`, `pytest`) and external CLI tools (`mafft`, `muscle`, `t-coffee`, `viennarna`).
+The `environment.yml` specification manages both Python libraries (`numpy`, `pandas`, `openpyxl`, `biopython`, `psutil`, `matplotlib`, `seaborn`, `pytest`) and required external CLI tools (`mafft`, `muscle`, `t-coffee`, `viennarna`).
 
 ### 2. Manual Installation (Pip)
-If managing Python dependencies via `pip` in an existing environment:
+If managing Python dependencies via `pip` in an existing environment with pre-installed CLI tools:
 
 ```bash
 pip install -r requirements.txt
