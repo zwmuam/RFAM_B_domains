@@ -4,6 +4,7 @@ msa.py
 Object-oriented framework for running Multiple Sequence Alignment (MSA) tools on ncRNA sequences.
 Defines RNASequenceDataset, AlignmentResult dataclass, abstract AlignmentPipeline interface,
 and implementations for MUSCLE v5, MAFFT (Q-INS-i, L-INS-i, X-INS-i), R-Coffee, and Structural Encoding.
+Includes lightweight psutil memory tracking for subprocess execution.
 """
 
 import abc
@@ -13,7 +14,9 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+import psutil
 
 from gff_sequence_extractor import standardize_rna_sequence
 
@@ -93,6 +96,49 @@ class AlignmentResult:
     is_successful: bool = True
     error_message: Optional[str] = None
     execution_time_seconds: float = 0.0
+    memory_peak_mb: float = 0.0
+
+
+def _run_cmd_with_memory_tracking(
+    cmd: List[str],
+    cwd: Path,
+    timeout: float = 120.0
+) -> Tuple[int, str, str, float, float]:
+    """
+    Executes a subprocess command while polling process memory RSS using psutil.
+
+    :param cmd: Command list to execute.
+    :param cwd: Working directory path.
+    :param timeout: Maximum execution timeout in seconds.
+    :return: Tuple of (returncode, stdout, stderr, elapsed_seconds, peak_memory_mb).
+    """
+    start_time = time.time()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd)
+
+    peak_rss_bytes = 0
+    try:
+        ps_proc = psutil.Process(proc.pid)
+        while proc.poll() is None:
+            try:
+                # Include child process memory usage if applicable
+                mem_info = ps_proc.memory_info()
+                current_rss = mem_info.rss
+                for child in ps_proc.children(recursive=True):
+                    current_rss += child.memory_info().rss
+                if current_rss > peak_rss_bytes:
+                    peak_rss_bytes = current_rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+            time.sleep(0.01)
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+        return -1, stdout, stderr, time.time() - start_time, peak_rss_bytes / (1024 * 1024)
+
+    elapsed = time.time() - start_time
+    peak_mb = peak_rss_bytes / (1024 * 1024) if peak_rss_bytes > 0 else 0.0
+    return proc.returncode, stdout, stderr, elapsed, peak_mb
 
 
 class AlignmentPipeline(abc.ABC):
@@ -145,7 +191,6 @@ class Muscle5Pipeline(AlignmentPipeline):
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
                                    error_message="MUSCLE executable not found in system PATH")
 
-        start_time = time.time()
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_dir_path = Path(temp_dir)
@@ -161,22 +206,21 @@ class Muscle5Pipeline(AlignmentPipeline):
                 if self.extra_args:
                     cmd.extend(self.extra_args)
 
-                proc: subprocess.CompletedProcess = subprocess.run(
-                    cmd, capture_output=True, text=True, check=False, cwd=temp_dir_path, timeout=120
-                )
-                elapsed = time.time() - start_time
-                if proc.returncode == 0 and temp_output.exists() and temp_output.stat().st_size > 0:
+                retcode, stdout, stderr, elapsed, peak_mb = _run_cmd_with_memory_tracking(cmd, temp_dir_path, timeout=120)
+
+                if retcode == 0 and temp_output.exists() and temp_output.stat().st_size > 0:
                     aligned_dataset: RNASequenceDataset = RNASequenceDataset.from_fasta(temp_output)
                     aligned_dataset.write_fasta(output_path)
                     return AlignmentResult(self.name, dataset.dataset_name, aligned_dataset.sequences,
-                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed)
+                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed,
+                                           memory_peak_mb=peak_mb)
                 else:
                     return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                           error_message=proc.stderr or f"Exit code {proc.returncode}",
-                                           execution_time_seconds=elapsed)
+                                           error_message=stderr or f"Exit code {retcode}",
+                                           execution_time_seconds=elapsed, memory_peak_mb=peak_mb)
         except Exception as err:
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                   error_message=str(err), execution_time_seconds=time.time() - start_time)
+                                   error_message=str(err))
 
 
 class MafftQinsiPipeline(AlignmentPipeline):
@@ -199,28 +243,28 @@ class MafftQinsiPipeline(AlignmentPipeline):
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
                                    error_message="MAFFT executable not found in system PATH")
 
-        start_time = time.time()
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_input: Path = Path(temp_dir) / "input.fasta"
                 dataset.write_fasta(temp_input)
                 cmd = [executable, "--qinsi", "--maxiterate", "1000",
                        str(temp_input)] if "mafft-qinsi" not in executable else [executable, str(temp_input)]
-                proc = subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=Path(temp_dir),
-                                      timeout=120)
-                elapsed = time.time() - start_time
-                if proc.returncode == 0 and proc.stdout.strip():
-                    output_path.write_text(proc.stdout, encoding="utf-8")
+
+                retcode, stdout, stderr, elapsed, peak_mb = _run_cmd_with_memory_tracking(cmd, Path(temp_dir), timeout=120)
+
+                if retcode == 0 and stdout.strip():
+                    output_path.write_text(stdout, encoding="utf-8")
                     aligned_dataset = RNASequenceDataset.from_fasta(output_path)
                     return AlignmentResult(self.name, dataset.dataset_name, aligned_dataset.sequences,
-                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed)
+                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed,
+                                           memory_peak_mb=peak_mb)
                 else:
                     return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                           error_message=proc.stderr or f"Exit code {proc.returncode}",
-                                           execution_time_seconds=elapsed)
+                                           error_message=stderr or f"Exit code {retcode}",
+                                           execution_time_seconds=elapsed, memory_peak_mb=peak_mb)
         except Exception as err:
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                   error_message=str(err), execution_time_seconds=time.time() - start_time)
+                                   error_message=str(err))
 
 
 class MafftLinsiPipeline(AlignmentPipeline):
@@ -243,28 +287,28 @@ class MafftLinsiPipeline(AlignmentPipeline):
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
                                    error_message="MAFFT executable not found in system PATH")
 
-        start_time = time.time()
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_input: Path = Path(temp_dir) / "input.fasta"
                 dataset.write_fasta(temp_input)
                 cmd = [executable, "--localpair", "--maxiterate", "1000",
                        str(temp_input)] if "mafft-linsi" not in executable else [executable, str(temp_input)]
-                proc = subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=Path(temp_dir),
-                                      timeout=120)
-                elapsed = time.time() - start_time
-                if proc.returncode == 0 and proc.stdout.strip():
-                    output_path.write_text(proc.stdout, encoding="utf-8")
+
+                retcode, stdout, stderr, elapsed, peak_mb = _run_cmd_with_memory_tracking(cmd, Path(temp_dir), timeout=120)
+
+                if retcode == 0 and stdout.strip():
+                    output_path.write_text(stdout, encoding="utf-8")
                     aligned_dataset = RNASequenceDataset.from_fasta(output_path)
                     return AlignmentResult(self.name, dataset.dataset_name, aligned_dataset.sequences,
-                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed)
+                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed,
+                                           memory_peak_mb=peak_mb)
                 else:
                     return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                           error_message=proc.stderr or f"Exit code {proc.returncode}",
-                                           execution_time_seconds=elapsed)
+                                           error_message=stderr or f"Exit code {retcode}",
+                                           execution_time_seconds=elapsed, memory_peak_mb=peak_mb)
         except Exception as err:
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                   error_message=str(err), execution_time_seconds=time.time() - start_time)
+                                   error_message=str(err))
 
 
 class MafftXinsiPipeline(AlignmentPipeline):
@@ -287,28 +331,28 @@ class MafftXinsiPipeline(AlignmentPipeline):
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
                                    error_message="MAFFT executable not found in system PATH")
 
-        start_time = time.time()
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_input: Path = Path(temp_dir) / "input.fasta"
                 dataset.write_fasta(temp_input)
                 cmd = [executable, "--xinsi", "--maxiterate", "1000",
                        str(temp_input)] if "mafft-xinsi" not in executable else [executable, str(temp_input)]
-                proc = subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=Path(temp_dir),
-                                      timeout=120)
-                elapsed = time.time() - start_time
-                if proc.returncode == 0 and proc.stdout.strip():
-                    output_path.write_text(proc.stdout, encoding="utf-8")
+
+                retcode, stdout, stderr, elapsed, peak_mb = _run_cmd_with_memory_tracking(cmd, Path(temp_dir), timeout=120)
+
+                if retcode == 0 and stdout.strip():
+                    output_path.write_text(stdout, encoding="utf-8")
                     aligned_dataset = RNASequenceDataset.from_fasta(output_path)
                     return AlignmentResult(self.name, dataset.dataset_name, aligned_dataset.sequences,
-                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed)
+                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed,
+                                           memory_peak_mb=peak_mb)
                 else:
                     return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                           error_message=proc.stderr or f"Exit code {proc.returncode}",
-                                           execution_time_seconds=elapsed)
+                                           error_message=stderr or f"Exit code {retcode}",
+                                           execution_time_seconds=elapsed, memory_peak_mb=peak_mb)
         except Exception as err:
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                   error_message=str(err), execution_time_seconds=time.time() - start_time)
+                                   error_message=str(err))
 
 
 class RCoffeePipeline(AlignmentPipeline):
@@ -331,7 +375,6 @@ class RCoffeePipeline(AlignmentPipeline):
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
                                    error_message="T-Coffee executable not found in system PATH")
 
-        start_time = time.time()
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_dir_path: Path = Path(temp_dir)
@@ -341,21 +384,21 @@ class RCoffeePipeline(AlignmentPipeline):
                 cmd = [executable, "-seq", str(temp_input.resolve()), "-mode", "rcoffee", "-output", "fasta_aln",
                        "-outfile", str(temp_out.resolve())]
 
-                proc = subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=temp_dir_path,
-                                      timeout=120)
-                elapsed = time.time() - start_time
-                if proc.returncode == 0 and temp_out.exists():
+                retcode, stdout, stderr, elapsed, peak_mb = _run_cmd_with_memory_tracking(cmd, temp_dir_path, timeout=120)
+
+                if retcode == 0 and temp_out.exists():
                     aligned_dataset = RNASequenceDataset.from_fasta(temp_out)
                     aligned_dataset.write_fasta(output_path)
                     return AlignmentResult(self.name, dataset.dataset_name, aligned_dataset.sequences,
-                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed)
+                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed,
+                                           memory_peak_mb=peak_mb)
                 else:
                     return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                           error_message=proc.stderr or f"Exit code {proc.returncode}",
-                                           execution_time_seconds=elapsed)
+                                           error_message=stderr or f"Exit code {retcode}",
+                                           execution_time_seconds=elapsed, memory_peak_mb=peak_mb)
         except Exception as err:
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                   error_message=str(err), execution_time_seconds=time.time() - start_time)
+                                   error_message=str(err))
 
 
 class StructuralEncodingPipeline(AlignmentPipeline):
@@ -379,7 +422,6 @@ class StructuralEncodingPipeline(AlignmentPipeline):
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
                                    error_message="MAFFT executable not found in system PATH")
 
-        start_time = time.time()
         try:
             with tempfile.TemporaryDirectory() as temporary_directory:
                 temp_dir_path: Path = Path(temporary_directory)
@@ -392,21 +434,21 @@ class StructuralEncodingPipeline(AlignmentPipeline):
                                                                                                             "1000",
                                                                                                             str(temp_input)]
 
-                proc = subprocess.run(mafft_cmd, capture_output=True, text=True, check=False, cwd=temp_dir_path,
-                                      timeout=120)
-                elapsed = time.time() - start_time
-                if proc.returncode == 0 and proc.stdout.strip():
-                    output_path.write_text(proc.stdout, encoding="utf-8")
+                retcode, stdout, stderr, elapsed, peak_mb = _run_cmd_with_memory_tracking(mafft_cmd, temp_dir_path, timeout=120)
+
+                if retcode == 0 and stdout.strip():
+                    output_path.write_text(stdout, encoding="utf-8")
                     aligned_dataset = RNASequenceDataset.from_fasta(output_path)
                     return AlignmentResult(self.name, dataset.dataset_name, aligned_dataset.sequences,
-                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed)
+                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed,
+                                           memory_peak_mb=peak_mb)
                 else:
                     return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                           error_message=proc.stderr or f"Exit code {proc.returncode}",
-                                           execution_time_seconds=elapsed)
+                                           error_message=stderr or f"Exit code {retcode}",
+                                           execution_time_seconds=elapsed, memory_peak_mb=peak_mb)
         except Exception as err:
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                   error_message=str(err), execution_time_seconds=time.time() - start_time)
+                                   error_message=str(err))
 
 
 available_pipelines: List[AlignmentPipeline] = [

@@ -2,7 +2,7 @@
 generate_mock_results.py
 
 Generates a realistic mock_results.xlsx file simulating 100-cluster alignment evaluation output
-across all 6 alignment pipelines and 14 metrics (including execution_time_seconds).
+across all 6 alignment pipelines and 15 metrics (including execution_time_seconds and memory_peak_mb).
 """
 
 from pathlib import Path
@@ -29,20 +29,26 @@ def generate_mock_excel(output_path: Path) -> None:
         base_sim = float(np.random.uniform(45.0, 95.0))
 
         for idx, pipe_name in enumerate(pipelines):
-            # Realistic execution time based on tool complexity
+            # Realistic execution time and peak memory footprint based on tool complexity
             if pipe_name in ("mafft_qinsi", "mafft_xinsi"):
                 exec_time = float(np.random.uniform(3.5, 12.0))
+                peak_mem = float(np.random.uniform(180.0, 450.0))
             elif pipe_name == "rcoffee":
                 exec_time = float(np.random.uniform(2.0, 8.0))
+                peak_mem = float(np.random.uniform(120.0, 320.0))
+            elif pipe_name == "muscle5":
+                exec_time = float(np.random.uniform(0.3, 1.8))
+                peak_mem = float(np.random.uniform(60.0, 150.0))
             else:
                 exec_time = float(np.random.uniform(0.2, 1.5))
+                peak_mem = float(np.random.uniform(40.0, 110.0))
 
             if failing_pipe_idx is not None and idx == failing_pipe_idx:
-                # Aligner failure: penalized metric values
                 penalized = EvaluationMetrics.create_penalized(
                     dataset_name=cluster_id,
                     pipeline_name=pipe_name,
-                    execution_time_seconds=exec_time
+                    execution_time_seconds=exec_time,
+                    memory_peak_mb=peak_mem
                 )
                 records.append(penalized.to_dict())
                 continue
@@ -66,6 +72,7 @@ def generate_mock_excel(output_path: Path) -> None:
                 dataset_name=cluster_id,
                 pipeline_name=pipe_name,
                 execution_time_seconds=exec_time,
+                memory_peak_mb=peak_mem,
                 structure_conservation_index_sci=sci,
                 transitive_consistency_score_tcs=tcs,
                 mean_mi_apc_covariation=mi_apc,

@@ -126,12 +126,14 @@ def run_benchmark_workflow(
             pipe_name = pipeline.name
             result = alignment_results.get(pipe_name)
             exec_time = result.execution_time_seconds if result else 0.0
+            peak_mb = result.memory_peak_mb if result else 0.0
 
             if not result or not result.is_successful or not result.aligned_fasta_path or not result.aligned_fasta_path.exists():
                 penalized_metrics = EvaluationMetrics.create_penalized(
                     dataset_name=dataset_id,
                     pipeline_name=pipe_name,
-                    execution_time_seconds=exec_time
+                    execution_time_seconds=exec_time,
+                    memory_peak_mb=peak_mb
                 )
                 metrics_list.append(penalized_metrics)
                 continue
@@ -149,6 +151,7 @@ def run_benchmark_workflow(
                     dataset_name=dataset_id,
                     pipeline_name=pipe_name,
                     execution_time_seconds=exec_time,
+                    memory_peak_mb=peak_mb,
                     structure_conservation_index_sci=sci_val,
                     transitive_consistency_score_tcs=tcs_val,
                     mean_mi_apc_covariation=cov_dict["mean_mi_apc_covariation"],
@@ -163,7 +166,9 @@ def run_benchmark_workflow(
                 )
                 metrics_list.append(metrics)
             except Exception:
-                metrics_list.append(EvaluationMetrics.create_penalized(dataset_id, pipe_name, execution_time_seconds=exec_time))
+                metrics_list.append(EvaluationMetrics.create_penalized(
+                    dataset_id, pipe_name, execution_time_seconds=exec_time, memory_peak_mb=peak_mb
+                ))
 
     # Step 4: Export to Excel
     records: List[Dict[str, Union[str, float]]] = [m.to_dict() for m in metrics_list]

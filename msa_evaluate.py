@@ -5,7 +5,7 @@ Evaluation module providing scientific quality metrics for non-coding RNA multip
 Calculates Structure Conservation Index (SCI), Transitive Consistency Score (TCS),
 mutual information with APC covariation (MI-APC), consensus base-pair covariation scores,
 normalized Shannon entropy (H_N), Mean Overlap Score (MOS), pairwise sequence identity statistics,
-and records aligner execution time.
+and records aligner execution time and peak memory footprint.
 """
 
 import math
@@ -41,6 +41,7 @@ class EvaluationMetrics:
     min_sequence_similarity: float
     max_sequence_similarity: float
     execution_time_seconds: float = 0.0
+    memory_peak_mb: float = 0.0
 
     def to_dict(self) -> Dict[str, Union[str, float]]:
         """
@@ -52,6 +53,7 @@ class EvaluationMetrics:
             "dataset": self.dataset_name,
             "pipeline": self.pipeline_name,
             "execution_time_seconds": self.execution_time_seconds,
+            "memory_peak_mb": self.memory_peak_mb,
             "structure_conservation_index_sci": self.structure_conservation_index_sci,
             "transitive_consistency_score_tcs": self.transitive_consistency_score_tcs,
             "mean_mi_apc_covariation": self.mean_mi_apc_covariation,
@@ -66,7 +68,13 @@ class EvaluationMetrics:
         }
 
     @classmethod
-    def create_penalized(cls, dataset_name: str, pipeline_name: str, execution_time_seconds: float = 0.0) -> "EvaluationMetrics":
+    def create_penalized(
+        cls,
+        dataset_name: str,
+        pipeline_name: str,
+        execution_time_seconds: float = 0.0,
+        memory_peak_mb: float = 0.0
+    ) -> "EvaluationMetrics":
         """
         Creates an EvaluationMetrics instance with penalized worst-case metric values
         representing aligner or evaluation failure.
@@ -74,12 +82,14 @@ class EvaluationMetrics:
         :param dataset_name: Name of the sequence dataset.
         :param pipeline_name: Name of the alignment pipeline.
         :param execution_time_seconds: Elapsed execution time before failure.
+        :param memory_peak_mb: Peak memory usage in MB before failure.
         :return: EvaluationMetrics instance with penalized metric values.
         """
         return cls(
             dataset_name=dataset_name,
             pipeline_name=pipeline_name,
             execution_time_seconds=execution_time_seconds,
+            memory_peak_mb=memory_peak_mb,
             structure_conservation_index_sci=0.0,
             transitive_consistency_score_tcs=0.0,
             mean_mi_apc_covariation=0.0,
