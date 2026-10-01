@@ -4,13 +4,12 @@ test_msa_benchmark.py
 Comprehensive test suite for msa.py, msa_evaluate.py, gff_sequence_extractor.py, and benchmark.py.
 """
 
-import tempfile
 from pathlib import Path
 import pandas as pd
 import pytest
 
-from gff_sequence_extractor import GFFSequenceExtractor, extract_and_annotate_sequences
-from msa import RNASequenceDataset, AlignmentResult, Muscle5Pipeline, MafftQinsiPipeline, available_pipelines
+from gff_sequence_extractor import GFFSequenceExtractor
+from msa import RNASequenceDataset, AlignmentResult, Muscle5Pipeline
 from msa_evaluate import EvaluationMetrics, AlignmentEvaluator
 from benchmark import run_benchmark_workflow, convert_fasta_to_stockholm
 
@@ -88,10 +87,11 @@ def test_gff_sequence_extractor(sample_fasta_and_gffs, tmp_path: Path):
 
 
 def test_evaluation_metrics_penalized():
-    penalized = EvaluationMetrics.create_penalized("dataset1", "dummy_pipeline")
+    penalized = EvaluationMetrics.create_penalized("dataset1", "dummy_pipeline", execution_time_seconds=2.5)
     p_dict = penalized.to_dict()
     assert p_dict["dataset"] == "dataset1"
     assert p_dict["pipeline"] == "dummy_pipeline"
+    assert p_dict["execution_time_seconds"] == 2.5
     assert p_dict["normalized_shannon_entropy_hn"] == 1.0
     assert p_dict["structure_conservation_index_sci"] == 0.0
     assert p_dict["transitive_consistency_score_tcs"] == 0.0
@@ -139,14 +139,12 @@ def test_convert_fasta_to_stockholm(tmp_path: Path):
 
 
 def test_pipeline_failure_handling(tmp_path: Path):
-    # Test pipeline returning unsuccessful AlignmentResult when executable is missing/fails
     pipeline = Muscle5Pipeline()
     ds = RNASequenceDataset("test", {"s1": "ACGU", "s2": "ACGU"})
     out_path = tmp_path / "out.fna"
 
     result = pipeline.align(ds, out_path)
     assert isinstance(result, AlignmentResult)
-    # Muscle might or might not be installed in the test env, but result.is_successful must be boolean
     assert isinstance(result.is_successful, bool)
 
 
@@ -165,6 +163,7 @@ def test_run_benchmark_workflow(sample_fasta_and_gffs, tmp_path: Path):
     assert not df.empty
     assert "dataset" in df.columns
     assert "pipeline" in df.columns
+    assert "execution_time_seconds" in df.columns
     assert "normalized_shannon_entropy_hn" in df.columns
 
     excel_file = out_dir / "benchmark_results.xlsx"

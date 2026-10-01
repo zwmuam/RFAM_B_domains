@@ -2,7 +2,7 @@
 generate_mock_results.py
 
 Generates a realistic mock_results.xlsx file simulating 100-cluster alignment evaluation output
-across all 6 alignment pipelines and 13 metrics.
+across all 6 alignment pipelines and 14 metrics (including execution_time_seconds).
 """
 
 from pathlib import Path
@@ -26,18 +26,27 @@ def generate_mock_excel(output_path: Path) -> None:
         # Determine if one pipeline fails for this cluster (~5% probability)
         failing_pipe_idx = np.random.choice(len(pipelines)) if np.random.rand() < 0.05 else None
 
-        # Base similarity for cluster
         base_sim = float(np.random.uniform(45.0, 95.0))
 
         for idx, pipe_name in enumerate(pipelines):
+            # Realistic execution time based on tool complexity
+            if pipe_name in ("mafft_qinsi", "mafft_xinsi"):
+                exec_time = float(np.random.uniform(3.5, 12.0))
+            elif pipe_name == "rcoffee":
+                exec_time = float(np.random.uniform(2.0, 8.0))
+            else:
+                exec_time = float(np.random.uniform(0.2, 1.5))
+
             if failing_pipe_idx is not None and idx == failing_pipe_idx:
                 # Aligner failure: penalized metric values
-                penalized = EvaluationMetrics.create_penalized(dataset_name=cluster_id, pipeline_name=pipe_name)
+                penalized = EvaluationMetrics.create_penalized(
+                    dataset_name=cluster_id,
+                    pipeline_name=pipe_name,
+                    execution_time_seconds=exec_time
+                )
                 records.append(penalized.to_dict())
                 continue
 
-            # Simulate realistic performance differences
-            # Structural aligners (mafft_qinsi, mafft_xinsi, rcoffee) get slightly higher SCI and covariation
             is_structural = pipe_name in ("mafft_qinsi", "mafft_xinsi", "rcoffee", "structural_encoding")
 
             sci = float(np.clip(np.random.normal(0.85 if is_structural else 0.65, 0.1), 0.0, 1.3))
@@ -56,6 +65,7 @@ def generate_mock_excel(output_path: Path) -> None:
             metrics = EvaluationMetrics(
                 dataset_name=cluster_id,
                 pipeline_name=pipe_name,
+                execution_time_seconds=exec_time,
                 structure_conservation_index_sci=sci,
                 transitive_consistency_score_tcs=tcs,
                 mean_mi_apc_covariation=mi_apc,

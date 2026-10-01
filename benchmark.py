@@ -37,7 +37,6 @@ def convert_fasta_to_stockholm(fasta_path: Path, sto_path: Path) -> bool:
         records = list(SeqIO.parse(str(fasta_path), "fasta"))
         if not records:
             return False
-        # Ensure all records have valid sequence objects
         sto_records = []
         for rec in records:
             sto_records.append(SeqRecord(Seq(str(rec.seq)), id=rec.id, description=""))
@@ -102,7 +101,6 @@ def run_benchmark_workflow(
         dataset_id = dataset.dataset_name
 
         if not dataset.sequences or len(dataset.sequences) < 2:
-            # Skip datasets with fewer than 2 sequences
             continue
 
         cluster_alignments_dir = alignments_dir / dataset_id
@@ -120,21 +118,20 @@ def run_benchmark_workflow(
 
             if result.is_successful and result.aligned_sequences and fna_path.exists():
                 alignments_map[pipeline.name] = result.aligned_sequences
-                # Convert FASTA alignment to Stockholm format for manual inspection
                 convert_fasta_to_stockholm(fna_path, sto_path)
 
-        # Calculate Mean Overlap Score across successful alignments for this dataset/cluster
         mos_score: float = evaluator.calculate_mean_overlap_score(alignments_map)
 
         for pipeline in available_pipelines:
             pipe_name = pipeline.name
             result = alignment_results.get(pipe_name)
+            exec_time = result.execution_time_seconds if result else 0.0
 
             if not result or not result.is_successful or not result.aligned_fasta_path or not result.aligned_fasta_path.exists():
-                # Penalize failed aligner with worst possible metric values
                 penalized_metrics = EvaluationMetrics.create_penalized(
                     dataset_name=dataset_id,
-                    pipeline_name=pipe_name
+                    pipeline_name=pipe_name,
+                    execution_time_seconds=exec_time
                 )
                 metrics_list.append(penalized_metrics)
                 continue
@@ -151,6 +148,7 @@ def run_benchmark_workflow(
                 metrics = EvaluationMetrics(
                     dataset_name=dataset_id,
                     pipeline_name=pipe_name,
+                    execution_time_seconds=exec_time,
                     structure_conservation_index_sci=sci_val,
                     transitive_consistency_score_tcs=tcs_val,
                     mean_mi_apc_covariation=cov_dict["mean_mi_apc_covariation"],
@@ -165,8 +163,7 @@ def run_benchmark_workflow(
                 )
                 metrics_list.append(metrics)
             except Exception:
-                # In case evaluation fails unexpectedly for a pipeline, penalize
-                metrics_list.append(EvaluationMetrics.create_penalized(dataset_id, pipe_name))
+                metrics_list.append(EvaluationMetrics.create_penalized(dataset_id, pipe_name, execution_time_seconds=exec_time))
 
     # Step 4: Export to Excel
     records: List[Dict[str, Union[str, float]]] = [m.to_dict() for m in metrics_list]
@@ -182,7 +179,6 @@ def run_benchmark_workflow(
                 summary_df = df.groupby("pipeline").mean(numeric_only=True).reset_index()
                 summary_df.to_excel(writer, sheet_name="Pipeline Means Summary", index=False)
     except Exception:
-        # Fallback to CSV if Excel writer fails
         csv_path = excel_path.with_suffix(".csv")
         df.to_csv(csv_path, index=False)
 
