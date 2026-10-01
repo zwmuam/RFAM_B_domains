@@ -2,17 +2,18 @@
 
 A modern, production-grade Python 3.10+ framework for benchmarking non-coding RNA (ncRNA) Multiple Sequence Alignment (MSA) tools.
 
-The framework integrates genomic feature extraction, alignment execution across structural and sequence-based aligners, rigorous bioinformatic metric evaluations, and automated Excel reporting.
+The framework integrates genomic feature extraction, alignment execution across structural and sequence-based aligners, rigorous bioinformatic metric evaluations, automated Excel reporting, and publication-quality visualization routines.
 
 ---
 
 ## Table of Contents
 1. [Overview & Workflow](#overview--workflow)
-2. [Installation](#installation)
+2. [Installation & Environment Setup](#installation--environment-setup)
 3. [Usage](#usage)
-4. [Theoretical Breakdown of Alignment Methods](#theoretical-breakdown-of-alignment-methods)
-5. [Theoretical Breakdown of Evaluation Metrics](#theoretical-breakdown-of-evaluation-metrics)
-6. [References & Citations](#references--citations)
+4. [Visualization & Analysis](#visualization--analysis)
+5. [Theoretical Breakdown of Alignment Methods](#theoretical-breakdown-of-alignment-methods)
+6. [Theoretical Breakdown of Evaluation Metrics](#theoretical-breakdown-of-evaluation-metrics)
+7. [References & Citations](#references--citations)
 
 ---
 
@@ -25,42 +26,44 @@ The framework operates via a 4-step benchmarking workflow:
 2. **Multiple Sequence Alignment (`msa.py`)**:
    Aligns extracted sequence datasets across all configured aligners (`Muscle5`, `MAFFT Q-INS-i`, `MAFFT L-INS-i`, `MAFFT X-INS-i`, `R-Coffee`, `Structural Encoding`). Exports aligned sequences in FASTA (`.fna`) and Stockholm (`.sto`) formats for manual inspection.
 3. **Scientific Quality Evaluation (`msa_evaluate.py`)**:
-   Evaluates each alignment output across structural conservation, covariation, consistency, entropy, overlap, and sequence identity metrics. Aligner failures or missing CLI dependencies are caught and assigned penalized worst-case metric values (maximum entropy $H_N = 1.0$, all other metrics $= 0.0$).
-4. **Data Export & Summary (`benchmark.py`)**:
-   Aggregates per-alignment evaluation metrics into a pandas DataFrame and exports a multi-sheet Excel workbook (`benchmark_results.xlsx`) containing raw metrics and pipeline summary averages.
+   Evaluates each alignment output across structural conservation, covariation, consistency, entropy, overlap, sequence identity, and resource utilization metrics (wall-clock runtime and peak memory footprint via `psutil`). Aligner failures or missing CLI dependencies are caught and assigned penalized worst-case metric values (maximum entropy $H_N = 1.0$, all other metrics $= 0.0$).
+4. **Data Export & Visualization (`benchmark.py`, `visualize_benchmark.py`)**:
+   Aggregates per-alignment evaluation metrics into a pandas DataFrame and exports a multi-sheet Excel workbook (`benchmark_results.xlsx`). Generates violin distribution plots, performance heatmaps, and runtime vs. memory scatter plots.
 
 ---
 
-## Installation
+## Installation & Environment Setup
 
 ### Prerequisites
 * Linux / macOS system environment
 * Conda or Mamba package manager
 
-### 1. Environment Setup via Conda
-Clone the repository and create the Conda environment using `msa_benchmark.yml`:
+### 1. Environment Setup via Conda / Mamba
+Clone the repository and create the Conda environment using `msa_benchmark.yml` or `environment.yml`:
 
 ```bash
 git clone https://github.com/your-org/RFAM_B_domains.git
 cd RFAM_B_domains
 
-# Create and activate environment
+# Create and activate environment via msa_benchmark.yml or environment.yml
 conda env create -f msa_benchmark.yml
 conda activate msa_benchmark
 ```
 
-### 2. Manual Package Installation (Pip)
-If managing dependencies via `pip`:
+The Conda environment automatically installs both Python dependencies (`numpy`, `pandas`, `openpyxl`, `biopython`, `psutil`, `matplotlib`, `seaborn`, `pytest`) and external CLI tools (`mafft`, `muscle`, `t-coffee`, `viennarna`).
+
+### 2. Manual Installation (Pip)
+If managing Python dependencies via `pip` in an existing environment:
 
 ```bash
-pip install numpy pandas openpyxl biopython psutil pytest
+pip install -r requirements.txt
 ```
 
 ### 3. External Bioinformatic Tool Dependencies
-To enable full aligner and structure evaluation execution, ensure the following CLI tools are available in your system `PATH`:
+Ensure the following CLI tools are available in your system `PATH`:
 * **MAFFT** ($\ge 7.520$): `mafft`, `mafft-qinsi`, `mafft-linsi`, `mafft-xinsi`
 * **MUSCLE** ($\ge 5.1.0$): `muscle`
-* **T-Coffee**: `t_coffee` (required for R-Coffee and TCS evaluation)
+* **T-Coffee** ($\ge 13.45$): `t_coffee` (required for R-Coffee alignment and TCS evaluation)
 * **ViennaRNA Package** ($\ge 2.5.1$): `RNAfold`, `RNAalifold` (required for SCI and structure covariation calculation)
 
 ---
@@ -69,13 +72,13 @@ To enable full aligner and structure evaluation execution, ensure the following 
 
 ### 1. Running the Complete Benchmark Suite
 
-To run the automated benchmark workflow, configure input file paths in `benchmark.py` and run:
+To run the automated benchmark workflow:
 
 ```bash
 python benchmark.py
 ```
 
-#### Code Example (`benchmark.py` interface):
+#### Programmatic Usage Example (`benchmark.py`):
 
 ```python
 from pathlib import Path
@@ -90,7 +93,7 @@ df = run_benchmark_workflow(
 )
 ```
 
-### 2. Using Individual Modules Programmatically
+### 2. Running Individual Modules Programmatically
 
 #### Sequence Extraction (`gff_sequence_extractor.py`)
 ```python
@@ -121,26 +124,25 @@ pipeline = MafftQinsiPipeline()
 result = pipeline.align(dataset, output_path=Path("cluster_1_qinsi.fna"))
 
 if result.is_successful:
-    print(f"Alignment successful in {result.execution_time_seconds:.2f}s")
+    print(f"Alignment successful in {result.execution_time_seconds:.2f}s, Peak RSS: {result.memory_peak_mb:.1f} MB")
 else:
     print(f"Alignment failed: {result.error_message}")
 ```
 
-#### Evaluating Alignment Metrics (`msa_evaluate.py`)
-```python
-from pathlib import Path
-from msa_evaluate import AlignmentEvaluator
+---
 
-evaluator = AlignmentEvaluator()
-aln_path = Path("cluster_1_qinsi.fna")
+## Visualization & Analysis
 
-sci = evaluator.calculate_structure_conservation_index(aln_path)
-tcs = evaluator.calculate_transitive_consistency_score(aln_path)
-cov = evaluator.calculate_structural_covariation_score(aln_path)
-hn = evaluator.calculate_normalized_shannon_entropy(aln_path)
+To generate publication-grade figures (violin plots, heatmaps, scatter plots) from an evaluation Excel file (e.g. `tests/mock_results.xlsx` or `benchmark_results.xlsx`):
 
-print(f"SCI: {sci:.4f}, TCS: {tcs:.2f}, H_N: {hn:.4f}")
+```bash
+python visualize_benchmark.py
 ```
+
+Outputs are saved in `tests/figures/`:
+* `metric_distributions_violin.png`: Violin plot distributions for SCI, TCS, MI-APC, and $H_N$.
+* `pipeline_performance_heatmap.png`: Heatmap matrix comparing mean metrics across pipelines.
+* `runtime_memory_scatter.png`: Scatter plot comparing Wall-Clock Execution Time vs Peak Memory Usage colored by SCI.
 
 ---
 
@@ -149,8 +151,8 @@ print(f"SCI: {sci:.4f}, TCS: {tcs:.2f}, H_N: {hn:.4f}")
 Aligning non-coding RNAs requires methods that consider both primary sequence identity and secondary structure conservation.
 
 ### 1. MUSCLE v5 (`muscle5`)
-* **Theoretical Basis**: Introduces Progressive Perturbed Pairwise (PPP) alignments and ensemble representations. Rather than relying on a single deterministic guide tree, MUSCLE v5 generates an ensemble of perturbed alignments to capture alignment uncertainty.
-* **Mechanism**: Uses k-mer distance estimations combined with profile-profile comparisons, making it effective for sequence-diverse RNA families.
+* **Theoretical Basis**: Introduces Progressive Perturbed Pairwise (PPP) alignments and ensemble representations. Generates an ensemble of perturbed alignments to capture alignment uncertainty.
+* **Mechanism**: Uses k-mer distance estimations combined with profile-profile comparisons.
 
 ### 2. MAFFT Q-INS-i (`mafft_qinsi`)
 * **Theoretical Basis**: Incorporates McCaskill secondary structure base-pairing probability matrices calculated from individual sequences into pairwise alignment algorithms.
@@ -158,65 +160,40 @@ Aligning non-coding RNAs requires methods that consider both primary sequence id
 
 ### 3. MAFFT L-INS-i (`mafft_linsi`)
 * **Theoretical Basis**: Local pairwise alignment algorithm with maximum consistency refinement.
-* **Mechanism**: Constructs local alignment libraries using a Needleman-Wunsch variant with position-specific gap penalties, optimized for sequences sharing conserved local domains flanked by variable regions.
+* **Mechanism**: Constructs local alignment libraries using position-specific gap penalties.
 
 ### 4. MAFFT X-INS-i (`mafft_xinsi`)
 * **Theoretical Basis**: Structural alignment method utilizing pairwise structural alignment algorithms (e.g., MXSCARNA).
-* **Mechanism**: Calculates full stem-candidate pairing matrices across sequence pairs before progressive alignment, making it suitable for complex RNA secondary structures with low primary sequence conservation.
+* **Mechanism**: Calculates full stem-candidate pairing matrices across sequence pairs before progressive alignment.
 
 ### 5. R-Coffee (`rcoffee`)
-* **Theoretical Basis**: Extension of T-Coffee that incorporates secondary structure predictions into consistency libraries.
-* **Mechanism**: Uses RNAfold or pairwise thermodynamic folding estimates to construct an RNA structure library. The objective function maximizes the consistency between alignment columns and predicted base pairs.
+* **Theoretical Basis**: Extension of T-Coffee that incorporates secondary structure folding predictions into consistency libraries.
+* **Mechanism**: Constructs an RNA structure library to maximize consistency between alignment columns and predicted base pairs.
 
 ### 6. Structural Encoding (`structural_encoding`)
 * **Theoretical Basis**: Structure-informed alignment pipeline leveraging explicit structural probability matrices (MAFFT Q-INS-i / globalpair).
-* **Mechanism**: Operates directly on standardized canonical RNA bases (U-encoding) without case-erasure artifacts, preserving thermodynamic probability weighting throughout multi-pass iterative refinement.
+* **Mechanism**: Operates directly on standardized canonical RNA bases (U-encoding) without case-erasure artifacts.
 
 ---
 
 ## Theoretical Breakdown of Evaluation Metrics
 
-The framework evaluates multiple orthogonal dimensions of RNA alignment quality:
-
 ### 1. Structure Conservation Index (SCI)
-* **Definition**: Measures the degree to which individual RNA secondary structures are conserved in the consensus structure.
 * **Formulation**:
   $$\text{SCI} = \frac{E_{\text{consensus}}}{\bar{E}_{\text{single}}}$$
-  where $E_{\text{consensus}}$ is the Minimum Free Energy (MFE) of the consensus alignment predicted by `RNAalifold`, and $\bar{E}_{\text{single}}$ is the mean MFE of individual ungapped sequences predicted by `RNAfold`.
-* **Interpretation**: $\text{SCI} \approx 1.0$ indicates strong structural conservation. $\text{SCI} > 1.0$ indicates compensatory mutations stabilizing the consensus structure. Unsuccessful or unstructured alignments yield $\text{SCI} = 0.0$.
+  where $E_{\text{consensus}}$ is the Minimum Free Energy (MFE) of the consensus structure predicted by `RNAalifold`, and $\bar{E}_{\text{single}}$ is the arithmetic mean MFE of individual ungapped sequences predicted by `RNAfold`.
 
 ### 2. Transitive Consistency Score (TCS)
-* **Definition**: Evaluates the consistency of column residue pairs across all pairwise alignment paths in a multiple sequence alignment.
-* **Mechanism**: Computed via T-Coffee `-evaluate` or vectorized pairwise residue column matching. Measures local column reliability ($0 - 100\%$).
+* **Definition**: Evaluates the consistency of column residue pairs across all pairwise alignment paths in a multiple sequence alignment ($0 - 100\%$).
 
 ### 3. Mutual Information with APC Covariation (MI-APC)
-* **Definition**: Quantifies co-evolutionary base-pairing signal between alignment columns $i$ and $j$, adjusted for background phylogenetic noise.
 * **Formulation**:
-  $$\text{MI}(i, j) = \sum_{x, y \in \{A,C,G,U\}} P(x_i, y_j) \log_2 \frac{P(x_i, y_j)}{P(x_i) P(y_j)}$$
-  $$\text{APC}(i, j) = \frac{\overline{\text{MI}}_i \cdot \overline{\text{MI}}_j}{\overline{\text{MI}}_{\text{overall}}}$$
   $$\text{MI-APC}(i, j) = \max(0, \text{MI}(i, j) - \text{APC}(i, j))$$
-* **Consensus Base-Pair Covariation**: Average MI-APC score computed specifically across base-paired positions defined in the consensus secondary structure (`RNAalifold`).
+  Quantifies co-evolutionary base-pairing signal between alignment columns $i$ and $j$, adjusted for background phylogenetic noise.
 
-### 4. Compensatory Mutation Count
-* **Definition**: Counts the number of consensus base-paired positions $(i, j)$ exhibiting at least two distinct canonical base pairs (e.g., A-U and G-C) across sequences with a positive covariation score ($\text{MI-APC} > 0.01$).
-
-### 5. Normalized Shannon Entropy ($H_N$)
-* **Definition**: Measures positional variability and column disorder across non-gap IUPAC nucleotide positions.
-* **Formulation**:
-  $$H(c) = -\sum_{x \in \mathcal{A}} P(x) \log_2 P(x)$$
-  $$H_N = \frac{1}{L} \sum_{c=1}^{L} \frac{H(c)}{\log_2 |\mathcal{A}|}$$
-  where $|\mathcal{A}|$ is the IUPAC alphabet size.
-* **Interpretation**: $H_N = 0.0$ represents completely conserved columns. $H_N = 1.0$ represents maximum positional disorder (used as the penalty value for failed alignments).
-
-### 6. Mean Overlap Score (MOS)
-* **Definition**: Computes the mean Jaccard overlap index of aligned non-gap residue pairs between distinct alignment pipelines for a dataset.
-* **Formulation**:
-  $$\text{MOS} = \frac{1}{\binom{K}{2}} \sum_{a < b} \frac{|S_a \cap S_b|}{|S_a \cup S_b|}$$
-  where $S_a$ is the set of aligned residue pairs $(seq\_id, pos_i, col_k)$ produced by pipeline $a$.
-
-### 7. Pairwise Sequence Similarity Statistics
-* **Definition**: Calculates mean, median, minimum, and maximum percent sequence identity across all unique sequence pairs in the alignment matrix:
-  $$\text{Identity} = \frac{\text{Matches}}{\text{Aligned Non-Gap Columns}} \times 100\%$$
+### 4. Resource Footprint Metrics
+* **Execution Time**: Wall-clock execution time in seconds required for alignment execution.
+* **Peak Memory Footprint**: Peak Resident Set Size (RSS) memory usage in megabytes (MB) tracked via `psutil` during subprocess execution.
 
 ---
 
@@ -229,4 +206,3 @@ The framework evaluates multiple orthogonal dimensions of RNA alignment quality:
 5. **McCaskill, J. S. (1990)**. The equilibrium partition function and base pairing probabilities of RNA secondary structure. *Biopolymers*, 29(6‐7), 1105-1119.
 6. **Dunn, S. D., Wahl, L. M., & Gloor, G. B. (2008)**. Mutual information without the overhead: adjusting mutual information for coevolution analysis. *Bioinformatics*, 24(3), 333-340.
 7. **Notredame, C., Higgins, D. G., & Heringa, J. (2000)**. T-Coffee: A novel method for fast and accurate multiple sequence alignments. *Journal of Molecular Biology*, 302(1), 205-217.
-8. **Washietl, S., Hofacker, I. L., & Stadler, P. F. (2005)**. Fast and reliable prediction of noncoding RNAs. *Proceedings of the National Academy of Sciences*, 102(7), 2454-2459.
