@@ -15,8 +15,8 @@ from plot_benchmark import load_and_prepare_data, generate_all_plots, create_com
 def mock_excel_file(tmp_path: Path) -> Path:
     excel_path = tmp_path / "mock_benchmark.xlsx"
 
-    # Create 3 mock sheets with 3 datasets each including 'original_sequences'
-    datasets = ["original_sequences", "dataset_A", "dataset_B"]
+    # Create 3 mock sheets with 3 datasets each
+    datasets = ["dataset_A", "dataset_B", "dataset_C"]
 
     def build_mock_dict(ari_vals):
         d = {
@@ -34,9 +34,9 @@ def mock_excel_file(tmp_path: Path) -> Path:
                 d[f"missing_{prefix}_COV_{cov}"] = [10.0, 5.0, 7.0]
         return d
 
-    data1 = build_mock_dict([0.6, 0.2, 0.9])
-    data2 = build_mock_dict([0.7, 0.3, 0.8])
-    data3 = build_mock_dict([0.5, 0.4, 0.7])
+    data1 = build_mock_dict([0.2, 0.8, 0.5])
+    data2 = build_mock_dict([0.3, 0.9, 0.6])
+    data3 = build_mock_dict([0.4, 0.7, 0.7])
 
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
         pd.DataFrame(data1).to_excel(writer, sheet_name="MMseqs2_simweighted", index=False)
@@ -54,10 +54,13 @@ def test_load_and_prepare_data(mock_excel_file: Path):
     assert "pipeline" in df.columns
     assert "full_time_min" in df.columns
 
-    # First dataset in order must explicitly be 'original_sequences'
-    assert dataset_order[0] == "original_sequences"
-    # Followed by dataset_B (mean ARI ~0.8) then dataset_A (mean ARI ~0.3)
-    assert dataset_order == ["original_sequences", "dataset_B", "dataset_A"]
+    # Check execution time in minutes calculation
+    # First row in ordered df is dataset_B (900s / 60 = 15.0 min)
+    assert df.loc[df["dataset"] == "dataset_A", "full_time_min"].iloc[0] == 10.0
+    assert df.loc[df["dataset"] == "dataset_B", "full_time_min"].iloc[0] == 15.0
+
+    # Order should be ['dataset_B', 'dataset_C', 'dataset_A']
+    assert dataset_order == ["dataset_B", "dataset_C", "dataset_A"]
 
 
 def test_generate_all_plots(mock_excel_file: Path, tmp_path: Path):
