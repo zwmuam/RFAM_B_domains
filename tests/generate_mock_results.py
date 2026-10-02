@@ -5,7 +5,12 @@ Generates a realistic mock_results.xlsx file simulating 100-cluster alignment ev
 across all 6 alignment pipelines and 15 metrics (including execution_time_seconds and memory_peak_mb).
 """
 
+import sys
 from pathlib import Path
+
+# Ensure parent directory is in sys.path when running from tests directory or repo root
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import numpy as np
 import pandas as pd
 

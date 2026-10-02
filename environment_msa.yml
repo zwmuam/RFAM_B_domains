@@ -1,0 +1,13 @@
+name: msa_benchmark_msa
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - python>=3.10,<3.13
+  - mafft>=7.520
+  - muscle>=5.1.0
+  - t-coffee>=13.45
+  - viennarna>=2.5.1
+  - biopython>=1.83
+  - psutil>=5.9.0
