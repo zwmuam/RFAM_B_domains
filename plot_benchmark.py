@@ -2,18 +2,19 @@
 plot_benchmark.py
 
 Generates comparative bar charts for pipeline performance metrics
-(MMseqs2_simweighted vs RiboSeek_simweighted vs RiboSeek_None)
-across datasets, arranged by mean Adjusted Rand Index (ARI) in descending order.
+(MMseqs2_simweighted vs RiboSeek_None vs RiboSeek_simweighted)
+across datasets, arranged explicitly starting with 'original_sequences' followed
+by all remaining datasets arranged by mean Adjusted Rand Index (ARI) in descending order.
 
-Color palette:
+Color palette & order:
 - MMseqs2 (simweighted): Mauve (#9370DB)
-- RiboSeek (simweighted): Yellow-Green (#9ACD32)
-- RiboSeek (None): Aquamarine (#66CDAA)
+- RiboSeek (None): Yellow-Green (#9ACD32)
+- RiboSeek (simweighted): Aquamarine (#66CDAA)
 
 Fixed Y-axis limits (Theoretical maximums):
 - ARI / NMI: [0, 1.05]
 - Pairs (percentage %): [0, 105%]
-- Execution Time: [0, 20] minutes
+- Execution Time: [0, 30] minutes
 """
 
 from pathlib import Path
@@ -39,25 +40,31 @@ plt.rcParams.update({
 
 PIPELINE_RENAME_MAP = {
     "MMseqs2_simweighted": "MMseqs2 (simweighted)",
-    "RiboSeek_simweighted": "RiboSeek (simweighted)",
-    "RiboSeek_None": "RiboSeek (None)"
+    "RiboSeek_None": "RiboSeek (None)",
+    "RiboSeek_simweighted": "RiboSeek (simweighted)"
 }
 
+PIPELINE_ORDER = [
+    "MMseqs2 (simweighted)",
+    "RiboSeek (None)",
+    "RiboSeek (simweighted)"
+]
+
 PIPELINE_COLORS = {
-    "MMseqs2 (simweighted)": "#9370DB",   # Mauve / Medium Purple
-    "RiboSeek (simweighted)": "#9ACD32",  # Yellow-Green
-    "RiboSeek (None)": "#66CDAA"          # Aquamarine
+    "MMseqs2 (simweighted)": "#9370DB",   # Mauve
+    "RiboSeek (None)": "#9ACD32",         # Yellow-Green
+    "RiboSeek (simweighted)": "#66CDAA"   # Aquamarine
 }
 
 
 def load_and_prepare_data(excel_path: Path) -> Tuple[pd.DataFrame, List[str]]:
     """
     Loads benchmark dataset sheets from Excel file, calculates dataset order
-    by mean ARI descending, converts full_time from seconds to minutes,
-    and returns the merged DataFrame and dataset order.
+    starting with 'original_sequences' followed by remaining datasets by mean ARI descending,
+    converts full_time from seconds to minutes, and returns the merged DataFrame and dataset order.
 
     :param excel_path: Path to DPC_benchmark.xlsx
-    :return: Tuple of (merged DataFrame, list of dataset names sorted by mean ARI desc)
+    :return: Tuple of (merged DataFrame, list of dataset names)
     """
     xl = pd.ExcelFile(excel_path)
     df_list = []
@@ -80,15 +87,37 @@ def load_and_prepare_data(excel_path: Path) -> Tuple[pd.DataFrame, List[str]]:
         .sort_values(ascending=False)
     )
 
-    dataset_order = mean_ari_per_dataset.index.tolist()
+    all_datasets = mean_ari_per_dataset.index.tolist()
+
+    # Explicitly start with 'original_sequences' if present
+    dataset_order = []
+    if "original_sequences" in all_datasets:
+        dataset_order.append("original_sequences")
+        dataset_order.extend([d for d in all_datasets if d != "original_sequences"])
+    else:
+        dataset_order = all_datasets
 
     # Convert dataset column to Categorical with explicit order
     merged_df["dataset"] = pd.Categorical(
         merged_df["dataset"], categories=dataset_order, ordered=True
     )
-    merged_df = merged_df.sort_values("dataset")
+
+    # Convert pipeline column to Categorical with explicit order
+    merged_df["pipeline"] = pd.Categorical(
+        merged_df["pipeline"], categories=PIPELINE_ORDER, ordered=True
+    )
+
+    merged_df = merged_df.sort_values(["dataset", "pipeline"])
 
     return merged_df, dataset_order
+
+
+def get_ordered_pipelines(df: pd.DataFrame) -> List[str]:
+    """
+    Returns pipeline names ordered according to PIPELINE_ORDER.
+    """
+    present_pipes = df["pipeline"].unique().tolist()
+    return [p for p in PIPELINE_ORDER if p in present_pipes] + [p for p in present_pipes if p not in PIPELINE_ORDER]
 
 
 def create_comparative_bar_chart(
@@ -101,8 +130,7 @@ def create_comparative_bar_chart(
     annotate_values: bool = True
 ) -> Path:
     """
-    Creates a grouped comparative bar chart for a specified metric across datasets
-    arranged by mean ARI descending.
+    Creates a grouped comparative bar chart for a specified metric across datasets.
 
     :param df: Prepared DataFrame
     :param metric_col: Name of the metric column to plot
@@ -115,7 +143,7 @@ def create_comparative_bar_chart(
     """
     fig, ax = plt.subplots(figsize=(14, 7))
 
-    pipelines = df["pipeline"].unique().tolist()
+    pipelines = get_ordered_pipelines(df)
     datasets = df["dataset"].cat.categories.tolist()
 
     x = np.arange(len(datasets))
@@ -161,7 +189,7 @@ def create_comparative_bar_chart(
                     )
 
     ax.set_title(title, pad=15, fontweight="bold")
-    ax.set_xlabel("Dataset (Arranged by Mean ARI Descending)", labelpad=10, fontweight="bold")
+    ax.set_xlabel("Dataset (Starting with Original Sequences, followed by Mean ARI Descending)", labelpad=10, fontweight="bold")
     ax.set_ylabel(ylabel, labelpad=10, fontweight="bold")
     ax.set_xticks(x)
     ax.set_xticklabels(datasets, rotation=45, ha="right")
@@ -209,7 +237,7 @@ def create_pairs_breakdown_figure(
     ]
 
     fig, axes = plt.subplots(1, 3, figsize=(22, 6))
-    pipelines = df["pipeline"].unique().tolist()
+    pipelines = get_ordered_pipelines(df)
     x = np.arange(len(dataset_order))
     n_pipelines = len(pipelines)
     total_width = 0.8
@@ -243,7 +271,7 @@ def create_pairs_breakdown_figure(
             ax.legend(title="Pipeline", fontsize=9, title_fontsize=10)
 
     fig.suptitle(
-        f"{type_title} Comparison at COV {cov_percentage} (Datasets Ordered by Mean ARI Descending)",
+        f"{type_title} Comparison at COV {cov_percentage} (Starting with Original Sequences)",
         fontsize=15,
         fontweight="bold",
         y=1.02
@@ -274,7 +302,7 @@ def create_summary_grid_figure(
         ("n_split_refs", "Split Reference Clusters Count", "Number of Split Refs", None)
     ]
 
-    pipelines = df["pipeline"].unique().tolist()
+    pipelines = get_ordered_pipelines(df)
     x = np.arange(len(dataset_order))
     n_pipelines = len(pipelines)
     total_width = 0.8
@@ -309,7 +337,7 @@ def create_summary_grid_figure(
             ax.legend(title="Pipeline", fontsize=9, title_fontsize=10)
 
     fig.suptitle(
-        "Performance Comparison Across Pipelines (Datasets Ordered by Mean ARI Descending)",
+        "Performance Comparison Across Pipelines (Starting with Original Sequences)",
         fontsize=16,
         fontweight="bold",
         y=0.99
@@ -324,7 +352,7 @@ def create_summary_grid_figure(
 
 def generate_all_plots(excel_path: Path, output_dir: Path) -> List[Path]:
     """
-    Loads data and generates all visual comparative bar chart figures with theoretical scales.
+    Loads data and generates all visual comparative bar chart figures.
 
     :param excel_path: Path to input benchmark Excel file
     :param output_dir: Directory where figures will be saved
@@ -377,14 +405,14 @@ def generate_all_plots(excel_path: Path, output_dir: Path) -> List[Path]:
     )
     generated_files.append(p_split)
 
-    # 5. Comparative bar chart for Execution Time in Minutes (Fixed limit = 20 min)
+    # 5. Comparative bar chart for Execution Time in Minutes (Fixed limit = 30 min)
     p_time = create_comparative_bar_chart(
         df=df,
         metric_col="full_time_min",
         title="Total Execution Time (Minutes) per Pipeline and Dataset",
         ylabel="Full Execution Time (min)",
         output_path=output_dir / "execution_time_comparison.png",
-        y_max=20.0
+        y_max=30.0
     )
     generated_files.append(p_time)
 
