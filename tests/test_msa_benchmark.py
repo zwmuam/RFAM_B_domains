@@ -4,7 +4,12 @@ test_msa_benchmark.py
 Comprehensive test suite for msa.py, msa_evaluate.py, gff_sequence_extractor.py, and benchmark.py.
 """
 
+import sys
 from pathlib import Path
+
+# Ensure parent directory is in sys.path when running tests
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import pandas as pd
 import pytest
 

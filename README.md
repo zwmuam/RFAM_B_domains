@@ -52,7 +52,21 @@ conda activate msa_benchmark
 
 The `environment.yml` specification manages both Python libraries (`numpy`, `pandas`, `openpyxl`, `biopython`, `psutil`, `matplotlib`, `seaborn`, `pytest`) and required external CLI tools (`mafft`, `muscle`, `t-coffee`, `viennarna`).
 
-### 2. Manual Installation (Pip)
+### 2. Modular Stage-Specific Environments
+For stage-wise benchmark execution (e.g. running MSA sequence alignment vs statistical analysis and plotting separately in minimal Ubuntu environments):
+
+* **MSA Execution Stage (`environment_msa.yml`)**: Contains sequence extraction and alignment binaries/libraries (`mafft`, `muscle`, `t-coffee`, `viennarna`, `biopython`, `psutil`).
+  ```bash
+  conda env create -f environment_msa.yml
+  conda activate msa_benchmark_msa
+  ```
+* **Statistical Preprocessing & Plotting Stage (`environment_stats_plot.yml`)**: Contains analysis and visualization libraries (`numpy`, `pandas`, `openpyxl`, `matplotlib`, `seaborn`, `biopython`, `psutil`, `pytest`).
+  ```bash
+  conda env create -f environment_stats_plot.yml
+  conda activate msa_benchmark_stats_plot
+  ```
+
+### 3. Manual Installation (Pip)
 If managing Python dependencies via `pip` in an existing environment with pre-installed CLI tools:
 
 ```bash
@@ -133,9 +147,10 @@ else:
 
 ## Visualization & Analysis
 
-To generate publication-grade figures (violin plots, heatmaps, scatter plots) from an evaluation Excel file (e.g. `tests/mock_results.xlsx` or `benchmark_results.xlsx`):
+To generate mock results and publication-grade figures (violin plots, heatmaps, scatter plots):
 
 ```bash
+python tests/generate_mock_results.py
 python visualize_benchmark.py
 ```
 
