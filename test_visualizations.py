@@ -25,13 +25,13 @@ def mock_excel_file(tmp_path: Path) -> Path:
             "normalized_mutual_info_score": [0.3, 0.85, 0.55],
             "n_glued_refs": [10, 2, 5],
             "n_split_refs": [12, 1, 6],
-            "full_time": [100.0, 200.0, 150.0]
+            "full_time": [600.0, 900.0, 750.0]
         }
         for cov in ["50%", "75%", "90%"]:
             for prefix in ["ref_pairs_in_pred_clusters", "pred_pairs_in_ref_clusters"]:
-                d[f"accurate_{prefix}_COV_{cov}"] = [100, 200, 150]
-                d[f"faulty_{prefix}_COV_{cov}"] = [10, 20, 15]
-                d[f"missing_{prefix}_COV_{cov}"] = [5, 2, 8]
+                d[f"accurate_{prefix}_COV_{cov}"] = [80.0, 90.0, 85.0]
+                d[f"faulty_{prefix}_COV_{cov}"] = [10.0, 5.0, 8.0]
+                d[f"missing_{prefix}_COV_{cov}"] = [10.0, 5.0, 7.0]
         return d
 
     data1 = build_mock_dict([0.2, 0.8, 0.5])
@@ -52,6 +52,12 @@ def test_load_and_prepare_data(mock_excel_file: Path):
     assert isinstance(df, pd.DataFrame)
     assert len(df) == 9  # 3 datasets * 3 sheets
     assert "pipeline" in df.columns
+    assert "full_time_min" in df.columns
+
+    # Check execution time in minutes calculation
+    # First row in ordered df is dataset_B (900s / 60 = 15.0 min)
+    assert df.loc[df["dataset"] == "dataset_A", "full_time_min"].iloc[0] == 10.0
+    assert df.loc[df["dataset"] == "dataset_B", "full_time_min"].iloc[0] == 15.0
 
     # Order should be ['dataset_B', 'dataset_C', 'dataset_A']
     assert dataset_order == ["dataset_B", "dataset_C", "dataset_A"]
@@ -61,7 +67,7 @@ def test_generate_all_plots(mock_excel_file: Path, tmp_path: Path):
     out_dir = tmp_path / "plots"
     files = generate_all_plots(mock_excel_file, out_dir)
 
-    # 6 base charts + (2 pair types * 3 covs * 4 files per cov) = 6 + 24 = 30 files
+    # 6 base charts + (2 pair types * 3 covs * 4 files per cov) = 30 files
     assert len(files) == 30
     for f in files:
         assert f.exists()

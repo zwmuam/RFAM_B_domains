@@ -4,12 +4,20 @@ plot_benchmark.py
 Generates comparative bar charts for pipeline performance metrics
 (MMseqs2_simweighted vs RiboSeek_simweighted vs RiboSeek_None)
 across datasets, arranged by mean Adjusted Rand Index (ARI) in descending order.
-Includes visualizations for glued references, split references, and pair accuracy metrics
-(accurate / faulty / missing pairs) at COV 50%, 75%, and 90% thresholds.
+
+Color palette:
+- MMseqs2 (simweighted): Mauve (#9370DB)
+- RiboSeek (simweighted): Yellow-Green (#9ACD32)
+- RiboSeek (None): Aquamarine (#66CDAA)
+
+Fixed Y-axis limits (Theoretical maximums):
+- ARI / NMI: [0, 1.05]
+- Pairs (percentage %): [0, 105%]
+- Execution Time: [0, 20] minutes
 """
 
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -35,11 +43,18 @@ PIPELINE_RENAME_MAP = {
     "RiboSeek_None": "RiboSeek (None)"
 }
 
+PIPELINE_COLORS = {
+    "MMseqs2 (simweighted)": "#9370DB",   # Mauve / Medium Purple
+    "RiboSeek (simweighted)": "#9ACD32",  # Yellow-Green
+    "RiboSeek (None)": "#66CDAA"          # Aquamarine
+}
+
 
 def load_and_prepare_data(excel_path: Path) -> Tuple[pd.DataFrame, List[str]]:
     """
     Loads benchmark dataset sheets from Excel file, calculates dataset order
-    by mean ARI descending, and returns the merged DataFrame and dataset order.
+    by mean ARI descending, converts full_time from seconds to minutes,
+    and returns the merged DataFrame and dataset order.
 
     :param excel_path: Path to DPC_benchmark.xlsx
     :return: Tuple of (merged DataFrame, list of dataset names sorted by mean ARI desc)
@@ -53,6 +68,10 @@ def load_and_prepare_data(excel_path: Path) -> Tuple[pd.DataFrame, List[str]]:
         df_list.append(df_sheet)
 
     merged_df = pd.concat(df_list, ignore_index=True)
+
+    # Convert execution time from seconds to minutes
+    if "full_time" in merged_df.columns:
+        merged_df["full_time_min"] = merged_df["full_time"] / 60.0
 
     # Calculate mean ARI per dataset across all pipelines
     mean_ari_per_dataset = (
@@ -78,6 +97,7 @@ def create_comparative_bar_chart(
     title: str,
     ylabel: str,
     output_path: Path,
+    y_max: Optional[float] = None,
     annotate_values: bool = True
 ) -> Path:
     """
@@ -89,6 +109,7 @@ def create_comparative_bar_chart(
     :param title: Figure title
     :param ylabel: Y-axis label
     :param output_path: Destination PNG file path
+    :param y_max: Theoretical maximum for y-axis range limit
     :param annotate_values: Whether to add numerical labels above bars
     :return: Path to saved figure
     """
@@ -102,20 +123,19 @@ def create_comparative_bar_chart(
     total_width = 0.8
     bar_width = total_width / n_pipelines
 
-    # Colors for pipelines
-    colors = ["#2b5c8f", "#d95f02", "#7570b3"]
-
     for idx, pipeline in enumerate(pipelines):
         pipe_df = df[df["pipeline"] == pipeline].set_index("dataset")
         values = [pipe_df.loc[d, metric_col] if d in pipe_df.index else 0 for d in datasets]
 
         offset = x - (total_width / 2) + (idx + 0.5) * bar_width
+        bar_color = PIPELINE_COLORS.get(pipeline, "#7570b3")
+
         bars = ax.bar(
             offset,
             values,
             width=bar_width,
             label=pipeline,
-            color=colors[idx % len(colors)],
+            color=bar_color,
             edgecolor="black",
             linewidth=0.5
         )
@@ -148,10 +168,13 @@ def create_comparative_bar_chart(
     ax.legend(title="Pipeline", frameon=True, facecolor="white", edgecolor="none")
     ax.grid(axis="y", linestyle="--", alpha=0.7)
 
-    # Adjust y limits to make room for annotations if enabled
-    y_max = df[metric_col].max()
-    if not np.isnan(y_max):
-        ax.set_ylim(0, y_max * 1.18 if y_max > 0 else 1.0)
+    # Set y limits to theoretical maximum if provided, otherwise scale to observed max
+    if y_max is not None:
+        ax.set_ylim(0, y_max)
+    else:
+        observed_max = df[metric_col].max()
+        if not np.isnan(observed_max):
+            ax.set_ylim(0, observed_max * 1.18 if observed_max > 0 else 1.0)
 
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -170,14 +193,7 @@ def create_pairs_breakdown_figure(
 ) -> Path:
     """
     Creates a 1x3 panel figure comparing Accurate (Right), Faulty (Wrong), and Missing pairs
-    at a specific COV coverage threshold (e.g. '50%', '75%', '90%').
-
-    :param df: Prepared DataFrame
-    :param dataset_order: Datasets ordered by mean ARI desc
-    :param cov_percentage: Coverage threshold string e.g. '50%'
-    :param pair_type: 'ref_pairs_in_pred' or 'pred_pairs_in_ref'
-    :param output_path: Destination PNG path
-    :return: Saved file path
+    at a specific COV coverage threshold (e.g. '50%', '75%', '90%'). Set to theoretical max (105%).
     """
     if pair_type == "ref_pairs_in_pred":
         prefix = "ref_pairs_in_pred_clusters"
@@ -187,9 +203,9 @@ def create_pairs_breakdown_figure(
         type_title = "Predicted Pairs in Reference Clusters"
 
     metric_cols = [
-        (f"accurate_{prefix}_COV_{cov_percentage}", "Accurate (Right) Pairs", "#2ca02c"),
-        (f"faulty_{prefix}_COV_{cov_percentage}", "Faulty (Wrong) Pairs", "#d62728"),
-        (f"missing_{prefix}_COV_{cov_percentage}", "Missing Pairs", "#ff7f0e")
+        (f"accurate_{prefix}_COV_{cov_percentage}", "Accurate (Right) Pairs (%)"),
+        (f"faulty_{prefix}_COV_{cov_percentage}", "Faulty (Wrong) Pairs (%)"),
+        (f"missing_{prefix}_COV_{cov_percentage}", "Missing Pairs (%)")
     ]
 
     fig, axes = plt.subplots(1, 3, figsize=(22, 6))
@@ -198,30 +214,31 @@ def create_pairs_breakdown_figure(
     n_pipelines = len(pipelines)
     total_width = 0.8
     bar_width = total_width / n_pipelines
-    colors = ["#2b5c8f", "#d95f02", "#7570b3"]
 
-    for ax_idx, (col_name, status_title, status_color) in enumerate(metric_cols):
+    for ax_idx, (col_name, status_title) in enumerate(metric_cols):
         ax = axes[ax_idx]
         for idx, pipeline in enumerate(pipelines):
             pipe_df = df[df["pipeline"] == pipeline].set_index("dataset")
             values = [pipe_df.loc[d, col_name] if (d in pipe_df.index and col_name in pipe_df.columns) else 0 for d in dataset_order]
             offset = x - (total_width / 2) + (idx + 0.5) * bar_width
+            bar_color = PIPELINE_COLORS.get(pipeline, "#7570b3")
 
             ax.bar(
                 offset,
                 values,
                 width=bar_width,
                 label=pipeline,
-                color=colors[idx % len(colors)],
+                color=bar_color,
                 edgecolor="black",
                 linewidth=0.5
             )
 
         ax.set_title(f"{status_title} ({cov_percentage} Coverage)", fontweight="bold", fontsize=12)
-        ax.set_ylabel("Pair Count", fontweight="bold", fontsize=10)
+        ax.set_ylabel("Percentage (%)", fontweight="bold", fontsize=10)
         ax.set_xticks(x)
         ax.set_xticklabels(dataset_order, rotation=45, ha="right", fontsize=8)
         ax.grid(axis="y", linestyle="--", alpha=0.7)
+        ax.set_ylim(0, 105)  # Theoretical maximum for percentage pairs
         if ax_idx == 0:
             ax.legend(title="Pipeline", fontsize=9, title_fontsize=10)
 
@@ -251,10 +268,10 @@ def create_summary_grid_figure(
     axes = axes.flatten()
 
     metrics = [
-        ("adjusted_rand_score", "Adjusted Rand Index (ARI)", "ARI Score"),
-        ("normalized_mutual_info_score", "Normalized Mutual Information (NMI)", "NMI Score"),
-        ("n_glued_refs", "Glued Reference Clusters Count", "Number of Glued Refs"),
-        ("n_split_refs", "Split Reference Clusters Count", "Number of Split Refs")
+        ("adjusted_rand_score", "Adjusted Rand Index (ARI)", "ARI Score", 1.05),
+        ("normalized_mutual_info_score", "Normalized Mutual Information (NMI)", "NMI Score", 1.05),
+        ("n_glued_refs", "Glued Reference Clusters Count", "Number of Glued Refs", None),
+        ("n_split_refs", "Split Reference Clusters Count", "Number of Split Refs", None)
     ]
 
     pipelines = df["pipeline"].unique().tolist()
@@ -262,21 +279,21 @@ def create_summary_grid_figure(
     n_pipelines = len(pipelines)
     total_width = 0.8
     bar_width = total_width / n_pipelines
-    colors = ["#2b5c8f", "#d95f02", "#7570b3"]
 
-    for ax_idx, (metric_col, title, ylabel) in enumerate(metrics):
+    for ax_idx, (metric_col, title, ylabel, y_max) in enumerate(metrics):
         ax = axes[ax_idx]
         for idx, pipeline in enumerate(pipelines):
             pipe_df = df[df["pipeline"] == pipeline].set_index("dataset")
             values = [pipe_df.loc[d, metric_col] if d in pipe_df.index else 0 for d in dataset_order]
             offset = x - (total_width / 2) + (idx + 0.5) * bar_width
+            bar_color = PIPELINE_COLORS.get(pipeline, "#7570b3")
 
             ax.bar(
                 offset,
                 values,
                 width=bar_width,
                 label=pipeline,
-                color=colors[idx % len(colors)],
+                color=bar_color,
                 edgecolor="black",
                 linewidth=0.5
             )
@@ -286,6 +303,8 @@ def create_summary_grid_figure(
         ax.set_xticks(x)
         ax.set_xticklabels(dataset_order, rotation=40, ha="right", fontsize=8)
         ax.grid(axis="y", linestyle="--", alpha=0.7)
+        if y_max is not None:
+            ax.set_ylim(0, y_max)
         if ax_idx == 0:
             ax.legend(title="Pipeline", fontsize=9, title_fontsize=10)
 
@@ -305,7 +324,7 @@ def create_summary_grid_figure(
 
 def generate_all_plots(excel_path: Path, output_dir: Path) -> List[Path]:
     """
-    Loads data and generates all visual comparative bar chart figures.
+    Loads data and generates all visual comparative bar chart figures with theoretical scales.
 
     :param excel_path: Path to input benchmark Excel file
     :param output_dir: Directory where figures will be saved
@@ -316,23 +335,25 @@ def generate_all_plots(excel_path: Path, output_dir: Path) -> List[Path]:
 
     generated_files = []
 
-    # 1. Comparative bar chart for ARI
+    # 1. Comparative bar chart for ARI (Theoretical max = 1.0)
     p_ari = create_comparative_bar_chart(
         df=df,
         metric_col="adjusted_rand_score",
         title="Adjusted Rand Index (ARI) Performance per Pipeline and Dataset",
         ylabel="Adjusted Rand Index (ARI)",
-        output_path=output_dir / "ari_comparison.png"
+        output_path=output_dir / "ari_comparison.png",
+        y_max=1.05
     )
     generated_files.append(p_ari)
 
-    # 2. Comparative bar chart for NMI
+    # 2. Comparative bar chart for NMI (Theoretical max = 1.0)
     p_nmi = create_comparative_bar_chart(
         df=df,
         metric_col="normalized_mutual_info_score",
         title="Normalized Mutual Information (NMI) Performance per Pipeline and Dataset",
         ylabel="Normalized Mutual Information (NMI)",
-        output_path=output_dir / "nmi_comparison.png"
+        output_path=output_dir / "nmi_comparison.png",
+        y_max=1.05
     )
     generated_files.append(p_nmi)
 
@@ -356,13 +377,14 @@ def generate_all_plots(excel_path: Path, output_dir: Path) -> List[Path]:
     )
     generated_files.append(p_split)
 
-    # 5. Comparative bar chart for Execution Time
+    # 5. Comparative bar chart for Execution Time in Minutes (Fixed limit = 20 min)
     p_time = create_comparative_bar_chart(
         df=df,
-        metric_col="full_time",
-        title="Total Execution Time (Seconds) per Pipeline and Dataset",
-        ylabel="Full Execution Time (s)",
-        output_path=output_dir / "execution_time_comparison.png"
+        metric_col="full_time_min",
+        title="Total Execution Time (Minutes) per Pipeline and Dataset",
+        ylabel="Full Execution Time (min)",
+        output_path=output_dir / "execution_time_comparison.png",
+        y_max=20.0
     )
     generated_files.append(p_time)
 
@@ -374,7 +396,7 @@ def generate_all_plots(excel_path: Path, output_dir: Path) -> List[Path]:
     )
     generated_files.append(p_summary)
 
-    # 7-12. Pair accuracy breakdown figures at COV 50%, 75%, and 90%
+    # 7-12. Pair accuracy breakdown figures at COV 50%, 75%, and 90% (Theoretical max = 100%)
     cov_thresholds = ["50%", "75%", "90%"]
     pair_types = [
         ("ref_pairs_in_pred", "ref_pairs"),
@@ -393,14 +415,15 @@ def generate_all_plots(excel_path: Path, output_dir: Path) -> List[Path]:
             )
             generated_files.append(fig_path)
 
-            # Standalone charts for accurate (right), faulty (wrong), missing pairs
+            # Standalone charts for accurate (right), faulty (wrong), missing pairs (Max = 105%)
             prefix = "ref_pairs_in_pred_clusters" if pair_type == "ref_pairs_in_pred" else "pred_pairs_in_ref_clusters"
             p_acc = create_comparative_bar_chart(
                 df=df,
                 metric_col=f"accurate_{prefix}_COV_{cov}",
                 title=f"Accurate Pairs ({label.replace('_', ' ').title()}) at COV {cov}",
-                ylabel="Accurate Pairs Count",
-                output_path=output_dir / f"{label}_accurate_cov_{clean_cov}.png"
+                ylabel="Accurate Pairs (%)",
+                output_path=output_dir / f"{label}_accurate_cov_{clean_cov}.png",
+                y_max=105.0
             )
             generated_files.append(p_acc)
 
@@ -408,8 +431,9 @@ def generate_all_plots(excel_path: Path, output_dir: Path) -> List[Path]:
                 df=df,
                 metric_col=f"faulty_{prefix}_COV_{cov}",
                 title=f"Faulty (Wrong) Pairs ({label.replace('_', ' ').title()}) at COV {cov}",
-                ylabel="Faulty Pairs Count",
-                output_path=output_dir / f"{label}_faulty_cov_{clean_cov}.png"
+                ylabel="Faulty Pairs (%)",
+                output_path=output_dir / f"{label}_faulty_cov_{clean_cov}.png",
+                y_max=105.0
             )
             generated_files.append(p_fault)
 
@@ -417,8 +441,9 @@ def generate_all_plots(excel_path: Path, output_dir: Path) -> List[Path]:
                 df=df,
                 metric_col=f"missing_{prefix}_COV_{cov}",
                 title=f"Missing Pairs ({label.replace('_', ' ').title()}) at COV {cov}",
-                ylabel="Missing Pairs Count",
-                output_path=output_dir / f"{label}_missing_cov_{clean_cov}.png"
+                ylabel="Missing Pairs (%)",
+                output_path=output_dir / f"{label}_missing_cov_{clean_cov}.png",
+                y_max=105.0
             )
             generated_files.append(p_miss)
 
