@@ -1,13 +1,5 @@
 # Comprehensive Scientific Breakdown, Critique, and Evaluation of the ncRNA Alignment & Benchmarking Suite
 
-## Executive Summary
-
-This document provides a rigorous, inquisitive, and comprehensive scientific critique of the methods, alignment algorithms, parameter configurations, quality metrics, edge-case vulnerabilities, and potential theoretical caveats present in the non-coding RNA (ncRNA) benchmarking framework.
-
-The codebase was evaluated against state-of-the-art bioinformatic literature in structural RNA evolution, partition function thermodynamics, covariation modeling, and comparative alignment benchmarks.
-
----
-
 ## Table of Contents
 1. [Evaluation of Alignment Pipelines & CLI Configurations](#1-evaluation-of-alignment-pipelines--cli-configurations)
 2. [Scientific Evaluation of Quality Metrics](#2-scientific-evaluation-of-quality-metrics)
@@ -19,47 +11,47 @@ The codebase was evaluated against state-of-the-art bioinformatic literature in 
 
 ## 1. Evaluation of Alignment Pipelines & CLI Configurations
 
-The framework integrates six alignment pipeline configurations representing different algorithmic paradigms for sequence- and structure-aware multiple sequence alignment.
+The framework integrates six alignment pipelines representing different algorithmic paradigms for sequence- and structure-aware multiple sequence alignment of structured RNA sequences (e.g. ncRNA)
 
 ### 1.1 MUSCLE v5 (`Muscle5Pipeline`)
-* **Implemented CLI Invocation**: `muscle -align input.fasta -output output.aln [-stratified/-diversified]`
+* **Implemented Invocation**: `muscle -align input.fasta -output output.aln [-stratified/-diversified]`
 * **Algorithmic Mechanics**: MUSCLE v5 utilizes Progressive Perturbed Pairwise (PPP) alignment and ensemble representations. It constructs guide trees based on k-mer distance estimations and refines alignments via profile-profile dynamic programming.
 * **Critique & Biological Alignment**:
   * **Strengths**: High computational efficiency and accuracy for sequence-conserved regions; ensemble sampling provides a measure of alignment uncertainty.
   * **Caveats & Limitations**: MUSCLE v5 operates as a primary sequence aligner. It does **not** incorporate RNA secondary structure folding thermodynamics or McCaskill base-pairing probability matrices during alignment construction. For fast-evolving ncRNA families (e.g., lncRNAs or highly diverged Rfam families with $< 60\%$ sequence identity), primary sequence conservation is often lost while secondary structure is maintained. Consequently, MUSCLE v5 may misalign homologous stem-loop regions by prioritizing primary sequence matches over secondary structure conservation.
 
 ### 1.2 MAFFT Q-INS-i (`MafftQinsiPipeline`)
-* **Implemented CLI Invocation**: `mafft --qinsi --maxiterate 1000 input.fasta`
+* **Implemented Invocation**: `mafft --qinsi --maxiterate 1000 input.fasta`
 * **Algorithmic Mechanics**: Integrates the McCaskill partition function algorithm (McCaskill, 1990) to calculate individual sequence base-pairing probability matrices $P_{ij}$. Pairwise alignments incorporate structural consensus scores derived from structural probabilities.
 * **Critique & Biological Alignment**:
   * **Strengths**: Represents the gold standard for structural RNA alignment when sequence homology is moderate ($50\% - 70\%$). It balances primary sequence substitution scores with secondary structure base-pair probabilities.
   * **Caveats & Limitations**: Computational complexity scales as $\mathcal{O}(N^2 \cdot L^3)$ due to repeated partition function calculations across all sequences. For large sequence datasets ($N > 100$) or long RNA sequences ($L > 1000$ nt), execution times increase substantially.
 
 ### 1.3 MAFFT L-INS-i (`MafftLinsiPipeline`)
-* **Implemented CLI Invocation**: `mafft --localpair --maxiterate 1000 input.fasta`
+* **Implemented Invocation**: `mafft --localpair --maxiterate 1000 input.fasta`
 * **Algorithmic Mechanics**: A local pairwise alignment method with iterative consistency refinement.
 * **Critique & Biological Alignment**:
   * **Strengths**: Highly accurate for sequences containing conserved local motifs flanked by variable terminal or internal regions (e.g., snoRNA box C/D elements).
   * **Caveats & Limitations**: Purely sequence-based; does not account for secondary structure base pairing or RNA-specific substitution matrices.
 
 ### 1.4 MAFFT X-INS-i (`MafftXinsiPipeline`)
-* **Implemented CLI Invocation**: `mafft --xinsi --maxiterate 1000 input.fasta`
+* **Implemented Invocation**: `mafft --xinsi --maxiterate 1000 input.fasta`
 * **Algorithmic Mechanics**: Incorporates pairwise structural alignment algorithms (such as MXSCARNA) to align stem candidates directly.
 * **Critique & Biological Alignment**:
   * **Strengths**: Suitable for highly diverged RNA sequences where primary sequence identity drops below the "twilight zone" ($< 40\%$), but secondary structure topology remains conserved.
   * **Caveats & Limitations**: MXSCARNA structural pair matching relies heavily on predicted stem structures; false-positive stem predictions in unconstrained single-stranded regions can introduce structural alignment errors.
 
 ### 1.5 R-Coffee (`RCoffeePipeline`)
-* **Implemented CLI Invocation**: `t_coffee -seq input.fasta -mode rcoffee -output fasta_aln -outfile rcoffee_out.aln`
+* **Implemented Invocation**: `t_coffee -seq input.fasta -mode rcoffee -output fasta_aln -outfile rcoffee_out.aln`
 * **Algorithmic Mechanics**: Combines secondary structure folding predictions (via RNAfold / RNAalifold) with the T-Coffee consistency library framework.
 * **Critique & Biological Alignment**:
   * **Strengths**: Outstanding alignment accuracy across structurally conserved non-coding RNA seed families.
   * **Caveats & Limitations**: T-Coffee library construction requires significant computational memory and runtime for large datasets ($N > 50$).
 
 ### 1.6 Structural Encoding (`StructuralEncodingPipeline`)
-* **Implemented CLI Invocation**: Fallback to `mafft --qinsi` or `mafft --globalpair --maxiterate 1000`.
+* **Implemented Invocation**: XXX
 * **Critique & Biological Alignment**:
-  * **Strengths**: Resolves historical case-erasure bugs where custom case-encoded structural strings were automatically converted to uppercase by MAFFT.
+  * **Strengths**: XXX
   * **Caveats & Limitations**: When falling back to `--globalpair`, the pipeline defaults to global sequence-based alignment, losing explicit structural probability modeling.
 
 ---
@@ -70,7 +62,7 @@ The evaluation module (`msa_evaluate.py`) computes seven core metric categories.
 
 ### 2.1 Structure Conservation Index (SCI)
 * **Formulation**:
-  $$\text{SCI} = \frac{E_{\text{consensus}}}{\bar{E}_{\text{single}}}$$
+  $$\text{SCI} = \frac{E_{\text{consensus}}}{\bar{E}_{\text{single}}}$$ # faulty equation (not properly displayed)
   where $E_{\text{consensus}}$ is the Minimum Free Energy (MFE) of the consensus structure predicted by `RNAalifold`, and $\bar{E}_{\text{single}}$ is the arithmetic mean of individual ungapped sequence MFEs predicted by `RNAfold`.
 * **Biological Critique**:
   * **Validity**: SCI directly quantifies whether alignment columns preserve a common thermodynamically stable fold. If the consensus MFE is comparable to or lower than the individual sequence MFEs, $\text{SCI} \ge 1.0$, indicating strong structural conservation or compensatory base changes.
@@ -124,7 +116,7 @@ The evaluation module (`msa_evaluate.py`) computes seven core metric categories.
 ## 3. Biological & Evolutionary Alignment Integrity
 
 ### 3.1 Substitution Matrices: RIBOSUM vs. BLOSUM
-A key consideration in structural RNA alignment is the substitution matrix used during profile dynamic programming:
+A key consideration in structural RNA alignment is the substitution matrix:
 * **Sequence-based Aligners (BLOSUM / EDNAFULL)**: Standard DNA/protein substitution matrices treat nucleotide transitions ($A \leftrightarrow G, C \leftrightarrow T/U$) uniformly without structural context.
 * **Structure-based Aligners (RIBOSUM)**: RIBOSUM matrices (Klein et al., 2004) incorporate base-pairing preferences and stem-loop substitution frequencies derived from Rfam structural alignments. MAFFT Q-INS-i and R-Coffee utilize structure-aware scoring matrices, significantly improving alignment accuracy for low-identity ncRNA families.
 
@@ -136,10 +128,6 @@ Single minimum free energy structure predictions (e.g., classical Zuker mfold) o
 ## 4. Potential Implementation Problems, Biases & Edge-Case Caveats
 
 During inquisitive code evaluation, the following implementation behaviors and edge cases were identified:
-
-### 4.1 Dependency Handling & Metric Penalization
-* **Mechanism**: If an external CLI binary (e.g., `RNAfold`, `t_coffee`) is absent from the system `PATH`, evaluation methods return $0.0$ for structural metrics (SCI, TCS, MI-APC) rather than raising an unhandled exception.
-* **Caveat**: Users running benchmarks in incomplete CLI environments may observe $0.0$ scores that reflect missing dependencies rather than poor alignment quality. System requirements should be verified prior to running benchmark suites.
 
 ### 4.2 Sequence Identity Denominator Sensitivity
 * **Mechanism**: Pairwise similarity is computed across columns where at least one sequence contains a non-gap character.
