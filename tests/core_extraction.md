@@ -2,41 +2,35 @@
 
 ## Executive Summary
 
-Non-coding RNA (ncRNA) sequences across genomic loci frequently possess a conserved, structurally constraint core motif (such as a catalytic core, protein-binding stem-loop, or riboswitch structure) flanked by terminal regions of high length heterogeneity, sequence divergence, and lineage-specific insertion/deletion dynamics. Standard global multiple sequence alignment (MSA) algorithms and naïve gap-trimming heuristics struggle in this regime. Global aligners force variable flanks into misaligned columns, disrupting the downstream structural covariance signal (e.g., Mutual Information with Average Product Correction, MI-APC) and artificially lowering Structure Conservation Indices (SCI). Conversely, standard entropy- or gap-density trimming tools (such as trimAl or BMGE) often aggressively shear single-stranded structural loops or fail to recognize variable-length terminal flanks due to improper thresholding.
-
-This document establishes a rigorous theoretical and analytical framework for extracting and preserving structurally conserved RNA cores while filtering poorly aligned variable flanks. We critically evaluate alignment paradigms, gap-penalty models, biological mechanics (IUPAC ambiguity, $T \leftrightarrow U$ interchangeability, strand directionality), alignment trimming methodologies, computational scalability, and multi-criteria trade-offs.
+Non-coding RNA (ncRNA) sequences across genomic loci frequently possess a conserved, structurally constraint core motif (such as a catalytic core, protein-binding stem-loop, or riboswitch structure) flanked by terminal regions of high length heterogeneity, sequence divergence, and lineage-specific insertion/deletion dynamics. Standard global multiple sequence alignment (MSA) algorithms and naïve gap-trimming heuristics struggle in this regime. Global aligners force variable flanks into misaligned columns, disrupting the downstream structural covariance signal (e.g., Mutual Information with Average Product Correction, MI-APC) and lowering Structure Conservation Indices (SCI). Conversely, standard entropy- or gap-density trimming tools (such as trimAl or BMGE) often aggressively shear less-conserved single-stranded loops or fail to recognize variable-length terminal flanks due to improper thresholding.
 
 ---
 
 ## 1. Biological & Evolutionary Mechanics of Heterogeneous Flanks vs. Conserved Cores
 
 ### 1.1 Genomic Flank Length Heterogeneity & Terminal Indels
-Genomic feature extraction of ncRNAs from primary genome annotations often captures non-coding transcripts surrounded by variable genomic context (e.g., untranslated regions, intergenic spacers, or variable-length transcription start/termination sites).
-* **Evolutionary Rate Heterogeneity**: Core secondary structure elements (stem-loops, pseudoknots) evolve under strict purifying selection to preserve base-pairing interactions ($A-U$, $G-C$, $G-U$). In contrast, flanking regions evolve near neutral rates, subject to frequent insertions, deletions, and nucleotide substitutions.
-* **Alignment Artifacts**: When global alignment algorithms attempt to maximize similarity across the entire transcript length, high flank heterogeneity causes internal core stems to shift, creating artificial internal gaps (over-gapping) or misaligning homologous stems across different sequences.
+Genomic feature extraction of ncRNAs from primary genome annotations often fails to delineate conserved structured motifs from the surrounding variable genomic context (e.g., untranslated regions, variable-length intergenic spacers).
+* **Evolutionary Rate Heterogeneity**: Core secondary structure elements (stem-loops, catalytic cores of GpI/GpII intron ribosymes, pseudoknots) evolve under strict purifying selection to preserve base-pairing interactions ($A-U$, $G-C$, $G-U$). In contrast, flanking regions evolve near neutral rates, subject to frequent insertions, deletions, and nucleotide substitutions.
+* **Alignment Artifacts**: When global alignment algorithms attempt to maximize similarity across the entire transcript length, flank heterogeneity causes misalignments and hinders proper modeling of the functional structured "core" of the RNA.
 
 ### 1.2 IUPAC Degenerate Base Preservation
-Genomic sequences from unrefined assemblies or populational datasets contain IUPAC ambiguous nucleotide codes ($R, Y, S, W, K, M, B, D, H, V, N$).
-* **Biological Significance**: Degenerate codes represent single nucleotide polymorphisms (SNPs) or sequencing uncertainty. In RNA secondary structure modeling, $R$ ($A$ or $G$) paired with $Y$ ($C$ or $U$) represents a structurally compatible canonical base-pairing set.
-* **Algorithmic Handling**: Aligners and trimming tools must not convert IUPAC codes to $N$ or strip them during alignment. Substitution matrices must handle degenerate match probabilities (e.g., $R-Y$ base-pairing scores) without inflating column entropy ($H_N$).
+Genomic sequences and some RNA datasets may contain IUPAC ambiguous nucleotide codes ($R, Y, S, W, K, M, B, D, H, V, N$).
+* **Biological Significance**: Degenerate codes usually represent sequencing uncertainty. In RNA secondary structure modeling, $R$ ($A$ or $G$) paired with $Y$ ($C$ or $U$) represents a structurally compatible canonical base-pairing set.
+* **Algorithmic Handling**: Many bioinformatic algorithms implicitly convert IUPAC codes to $N$ or strip them during alignment. This may be suboptimal compared to explicit handling degenerate match probabilities (e.g., $R-Y$ base-pairing scores).
 
 ### 1.3 DNA/RNA Conversion Flexibility ($T \leftrightarrow U$ Interchangeability)
-In genomic repositories (FASTA files from NCBI/Ensembl), ncRNA sequences are stored using DNA alphabets ($T$), whereas secondary structure folding engines (ViennaRNA, Infernal) utilize RNA alphabets ($U$).
+In genomic many repositories (FASTA files from NCBI/Ensembl), ncRNA sequences are stored using DNA alphabets ($T$), whereas many RNA specific tools often utilize RNA alphabets ($U$).
 * **Thermodynamic Equivalence**: Thymine ($T$, 5-methyluracil) shares identical Watson-Crick base-pairing geometry with Uracil ($U$) ($A-T \equiv A-U$).
-* **Canonical & Non-Canonical Wobble**: $G-U$ (or $G-T$) wobble base pairs contribute significant thermodynamic stability ($\Delta G^\circ \approx -1.3 \text{ kcal/mol}$) to RNA stems. Alignment algorithms and structure prediction tools must explicitly recognize $G-T$ and $G-U$ pairs as thermodynamically stable non-canonical matches rather than sequence mismatches.
+* **Canonical & Non-Canonical Wobble**: $G-U$ (or $G-T$) wobble base pairs contribute significant thermodynamic stability ($\Delta G^\circ \approx -1.3 \text{ kcal/mol}$) to RNA stems. Alignment algorithms and structure prediction tools must explicitly recognize $G-T$ and $G-U$ pairs as thermodynamically stable non-canonical matches rather than sequence mismatches. This call either for  standardization during initial extraction step or explicit formatting for needs of a specific tool.
 
 ### 1.4 Sequence Orientation & Strand Awareness
-Genomic extraction pipelines frequently yield sequences in mixed orientations ($5' \to 3'$ vs. $3' \to 5'$) if secondary feature annotation strands are misassigned.
-* **Secondary Structure Asymmetry**: Unlike double-stranded DNA, single-stranded RNA secondary structure folding is inherently direction-dependent. Reversing an RNA sequence ($3' \to 5'$) radically alters predicted minimum free energy (MFE) structures and McCaskill base-pairing probability matrices ($P_{ij}$).
-* **Strand Orientation Detection**: Aligners lacking built-in strand detection will fail completely on reverse-complemented sequences. Tools capable of automatically determining strand directionality (or structural covariance model alignment like Infernal) are essential for mixed-orientation datasets.
+Genomic extraction pipelines frequently yield sequences in mixed orientations ($5' \to 3'$ vs. $3' \to 5'$) if secondary feature annotation strands are missing or faulty.
+* **Secondary Structure Asymmetry**: secondary structure of RNA is inherently direction-dependent. Reversing an RNA sequence ($3' \to 5'$) may scramble the alignment entirely and radically alters predicted folding of the single stranded RNA molecule.
+* **Strand Orientation Detection**: Aligners lacking built-in strand detection will fail completely on reverse-complemented sequences (e.g. XXX). Tools capable of automatically determining strand directionality (e.g. XXX) are essential for mixed-orientation datasets.
 
 ---
 
 ## 2. Critical Evaluation & Parameter Optimization of Alignment Strategies
-
-### 2.1 Global vs. Local Alignment Paradigms
-* **Global Alignment (Needleman-Wunsch derivatives)**: Forces alignment end-to-end. Suboptimal for flanked core extraction because terminal length variations distort the global score maximization, causing gaps to be inserted into the conserved core to balance flank alignments.
-* **Local Alignment (Smith-Waterman derivatives)**: Identifies high-scoring local sub-alignments. Excels at identifying the conserved core while leaving unaligned variable terminal flanks outside the primary alignment block.
 
 ### 2.2 Secondary Structure-Aware & Covariance Alignment Engines
 Structural RNA alignment requires scoring systems that evaluate pairwise base-pairing probabilities ($P_{ij}$) alongside primary sequence substitution matrices (e.g., RIBOSUM60).
@@ -187,7 +181,7 @@ Let $N$ = number of sequences, $L$ = sequence length, $M$ = CM state size ($M \a
 
 ---
 
-## 6. Roadmap & Theoretical Guidelines for Future Core Extraction Pipelines
+## 6. Roadmap & Theoretical Guidelines for Core Extraction Pipelines
 
 To achieve optimal ncRNA core extraction and alignment trimming, future pipeline implementations should adopt a two-phase architecture:
 
