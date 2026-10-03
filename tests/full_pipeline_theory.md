@@ -14,19 +14,19 @@ This document provides a comprehensive theoretical breakdown, rigorous scientifi
 
 ### 1.1 Evolutionary Rate Asymmetry: Conserved Cores vs. Variable Flanks
 The primary driving force in ncRNA evolution is selection to maintain RNA secondary and tertiary structural geometry.
-* **Core Preservation via Purifying Selection**: Secondary structure stems are maintained under strong negative selection. While individual sequence positions within a stem may mutate over evolutionary time, structural viability is preserved through compensatory base pair mutations ($G-C \leftrightarrow A-U$) or semi-compensatory mutations ($G-C \leftrightarrow G-U$). Hairpin, internal, and multi-branch loop regions defining the core topology are similarly constrained by tertiary interactions (e.g., tetraloop-receptor motifs, A-minors) or protein binding interfaces.
+* **Core Preservation via Purifying Selection**: Secondary structure stems are maintained under strong negative selection. While individual sequence positions within a stem may mutate over evolutionary time, structural viability is preserved through compensatory base pair mutations ($\mathrm{G-C} \leftrightarrow \mathrm{A-U}$) or semi-compensatory mutations ($\mathrm{G-C} \leftrightarrow \mathrm{G-U}$). Hairpin, internal, and multi-branch loop regions defining the core topology are similarly constrained by tertiary interactions (e.g., tetraloop-receptor motifs, A-minors) or protein binding interfaces.
 * **Flank Neutrality and Indel Dynamics**: Flanking sequence context (such as extended genomic spacers or untranslated regions) evolves near neutral rates. Consequently, flanking regions accumulate unaligned insertion/deletion events and extreme length variance across species.
 * **Alignment Consequence**: Global alignment algorithms that optimize total sequence similarity force divergent flanks into column matches. This forces gap insertion into adjacent structural stems, altering base-pair alignment columns and masking true evolutionary covariation.
 
 ### 1.2 IUPAC Degenerate Base Code Mechanics
-Genomic extraction pipelines and sequencing datasets frequently retain IUPAC ambiguous nucleotide codes ($R, Y, S, W, K, M, B, D, H, V, N$).
-* **Biological Significance**: IUPAC codes encode single-nucleotide polymorphisms (SNPs) or sequencing ambiguity. In structural RNA modeling, degenerate codes retain structural compatibility. For example, an $R$ ($A$ or $G$) at position $i$ paired with a $Y$ ($C$ or $U$) at position $j$ represents a structurally compatible canonical base-pairing interaction ($A-U$ or $G-C$).
-* **Algorithmic Handling**: Naïve alignment pipelines often erase IUPAC codes or convert them to $N$, destroying base-pairing information. Optimal ncRNA pipelines must preserve IUPAC codes and utilize alignment scoring matrices that evaluate probabilistic degenerate match scores.
+Genomic extraction pipelines and sequencing datasets frequently retain IUPAC ambiguous nucleotide codes ($\mathrm{R, Y, S, W, K, M, B, D, H, V, N}$).
+* **Biological Significance**: IUPAC codes encode single-nucleotide polymorphisms (SNPs) or sequencing ambiguity. In structural RNA modeling, degenerate codes retain structural compatibility. For example, an $\mathrm{R}$ ($\mathrm{A}$ or $\mathrm{G}$) at position $i$ paired with a $\mathrm{Y}$ ($\mathrm{C}$ or $\mathrm{U}$) at position $j$ represents a structurally compatible canonical base-pairing interaction ($\mathrm{A-U}$ or $\mathrm{G-C}$).
+* **Algorithmic Handling**: Naïve alignment pipelines often erase IUPAC codes or convert them to $\mathrm{N}$, destroying base-pairing information. Optimal ncRNA pipelines must preserve IUPAC codes and utilize alignment scoring matrices that evaluate probabilistic degenerate match scores.
 
-### 1.3 DNA/RNA Alphabet Flexibility ($T \leftrightarrow U$ Interchangeability)
-Genomic repositories (such as NCBI or Ensembl FASTA files) store ncRNA genes using DNA alphabets ($T$), whereas RNA structural modeling tools (such as ViennaRNA or Infernal) expect RNA alphabets ($U$).
-* **Thermodynamic Equivalence**: Thymine ($T$, 5-methyluracil) and Uracil ($U$) share identical Watson-Crick hydrogen bonding geometry with Adenine ($A$).
-* **Canonical & Wobble Base Pairing**: $G-U$ (or $G-T$) wobble base pairs contribute significant thermodynamic stability ($\Delta G^\circ \approx -1.3\text{ kcal/mol}$) to RNA helices. Alignment scoring systems must recognize $G-T$ and $G-U$ interactions as structurally valid match states rather than mismatches. Sequence extraction workflows must perform standardization without case erasure or alphabet corruption.
+### 1.3 DNA/RNA Alphabet Flexibility ($\mathrm{T} \leftrightarrow \mathrm{U}$ Interchangeability)
+Genomic repositories (such as NCBI or Ensembl FASTA files) store ncRNA genes using DNA alphabets ($\mathrm{T}$), whereas RNA structural modeling tools (such as ViennaRNA or Infernal) expect RNA alphabets ($\mathrm{U}$).
+* **Thermodynamic Equivalence**: Thymine ($\mathrm{T}$, 5-methyluracil) and Uracil ($\mathrm{U}$) share identical Watson-Crick hydrogen bonding geometry with Adenine ($\mathrm{A}$).
+* **Canonical & Wobble Base Pairing**: $\mathrm{G-U}$ (or $\mathrm{G-T}$) wobble base pairs contribute significant thermodynamic stability ($\Delta G^\circ \approx -1.3\text{ kcal/mol}$) to RNA helices. Alignment scoring systems must recognize $\mathrm{G-T}$ and $\mathrm{G-U}$ interactions as structurally valid match states rather than mismatches. Sequence extraction workflows must perform standardization without case erasure or alphabet corruption.
 
 ### 1.4 Sequence Orientation & Strand Awareness
 Genomic annotations frequently extract ncRNA features from mixed strand orientations ($5' \to 3'$ vs. $3' \to 5'$) if strand orientation is misannotated.
@@ -66,7 +66,7 @@ Multiple sequence alignment tools operate under distinct algorithmic paradigms. 
 ### 2.4 MAFFT X-INS-i (`MafftXinsiPipeline`)
 * **Theoretical Foundation**: Incorporates framework structural alignment algorithms (such as MXSCARNA) to calculate stem-candidate pairing matrices across sequence pairs before progressive alignment [(Katoh et al. 2013)](https://doi.org/10.1093/molbev/mst010).
 * **Evaluation for Structured ncRNA**: Effective for highly diverged RNA sequences below the twilight zone ($< 40\%$ sequence identity). However, false-positive stem predictions in unconstrained single-stranded regions can introduce structural misalignments.
-* **Computational Footprint & Scalability**: Time complexity is $\mathcal{O}(N^2 \cdot L^3 + N^2 \cdot \text{MXSCARNA})$ and memory requirement is high. Scalability is limited for $N > 50$.
+* **Computational Footprint & Scalability**: Time complexity is $\mathcal{O}(N^2 \cdot L^3 + N^2 \cdot \mathrm{MXSCARNA})$ and memory requirement is high. Scalability is limited for $N > 50$.
 * **Recommendations**:
   * *Optimized Parameters*: `mafft --xinsi --ep 0.0 --maxiterate 1000 input.fasta`.
 
@@ -96,41 +96,51 @@ Evaluating multiple sequence alignments requires metrics that measure structural
 
 ### 3.1 Structure Conservation Index (SCI)
 * **Mathematical Formulation**:
-  $$\text{SCI} = \frac{E_{\text{consensus}}}{\bar{E}_{\text{single}}}$$
-  where $E_{\text{consensus}}$ is the Minimum Free Energy (MFE) of the consensus secondary structure predicted by `RNAalifold` [(Bernhart et al. 2008)](https://doi.org/10.1186/1471-2105-9-474), and $\bar{E}_{\text{single}}$ is the arithmetic mean MFE of individual ungapped sequences predicted by `RNAfold`.
+
+$$\mathrm{SCI} = \frac{E_{\mathrm{consensus}}}{\bar{E}_{\mathrm{single}}}$$
+
+  where $E_{\mathrm{consensus}}$ is the Minimum Free Energy (MFE) of the consensus secondary structure predicted by `RNAalifold` [(Bernhart et al. 2008)](https://doi.org/10.1186/1471-2105-9-474), and $\bar{E}_{\mathrm{single}}$ is the arithmetic mean MFE of individual ungapped sequences predicted by `RNAfold`.
 * **Biological Critique & Biases**:
-  * **Validity**: SCI measures whether aligned sequences fold into a thermodynamically stable common structure. An $\text{SCI} \ge 1.0$ indicates strong structural conservation and compensatory base changes.
-  * **Zero-Denominator Division**: If individual ungapped sequences lack secondary structure ($\bar{E}_{\text{single}} = 0.0$), division by zero must be guarded against (assigning $\text{SCI} = 0.0$).
-  * **`RNAalifold` Invocation Parameters**: Calculating $E_{\text{consensus}}$ using default `RNAalifold` settings without flags can inflate consensus energy estimates. `RNAalifold` should be executed with `--noLP` (disallowing isolated, thermodynamic-unstable base pairs) and `--noPS` (suppressing postscript output clutter).
+  * **Validity**: SCI measures whether aligned sequences fold into a thermodynamically stable common structure. An $\mathrm{SCI} \ge 1.0$ indicates strong structural conservation and compensatory base changes.
+  * **Zero-Denominator Division**: If individual ungapped sequences lack secondary structure ($\bar{E}_{\mathrm{single}} = 0.0$), division by zero must be guarded against (assigning $\mathrm{SCI} = 0.0$).
+  * **`RNAalifold` Invocation Parameters**: Calculating $E_{\mathrm{consensus}}$ using default `RNAalifold` settings without flags can inflate consensus energy estimates. `RNAalifold` should be executed with `--noLP` (disallowing isolated, thermodynamic-unstable base pairs) and `--noPS` (suppressing postscript output clutter).
 
 ### 3.2 Transitive Consistency Score (TCS)
 * **Mathematical Formulation**: Evaluates the consistency of column residue pairs across all pairwise alignment paths [(Notredame et al. 2000)](https://doi.org/10.1006/jmbi.2000.4042), [(Chang et al. 2014)](https://doi.org/10.1093/molbev/msu084):
-  $$\text{TCS} = \frac{\sum_{c=1}^L \text{Pairs}_{\text{consistent}}(c)}{\sum_{c=1}^L \text{Pairs}_{\text{valid}}(c)} \times 100$$
+
+$$\mathrm{TCS} = \frac{\sum_{c=1}^L \mathrm{Pairs}_{\mathrm{consistent}}(c)}{\sum_{c=1}^L \mathrm{Pairs}_{\mathrm{valid}}(c)} \times 100$$
+
 * **Biological Critique & Biases**:
   * **Validity**: Identifies stable alignment columns reliable for downstream phylogenetic or structural inference.
   * **Gap Density Exclusion Bias**: In vectorized implementations where gap characters (`-`, `.`) are excluded from pair counts, a column dominated by $98\%$ gaps with only two valid residues will score $100\%$ consistency if those two residues match. This inflates consistency scores in sparse flanking regions.
 
 ### 3.3 Mutual Information with Average Product Correction (MI-APC)
 * **Mathematical Formulation**:
-  $$\text{MI}(i, j) = \sum_{x, y \in \{A,C,G,U\}} P(x_i, y_j) \log_2 \frac{P(x_i, y_j)}{P(x_i) P(y_j)}$$
-  $$\text{APC}(i, j) = \frac{\overline{\text{MI}}_i \cdot \overline{\text{MI}}_j}{\overline{\text{MI}}_{\text{overall}}}$$
-  $$\text{MI-APC}(i, j) = \max\left(0, \text{MI}(i, j) - \text{APC}(i, j)\right)$$
+
+$$\mathrm{MI}(i, j) = \sum_{x, y \in \{\mathrm{A,C,G,U}\}} P(x_i, y_j) \log_2 \left( \frac{P(x_i, y_j)}{P(x_i) P(y_j)} \right)$$
+
+$$\mathrm{APC}(i, j) = \frac{\overline{\mathrm{MI}}_i \cdot \overline{\mathrm{MI}}_j}{\overline{\mathrm{MI}}_{\mathrm{overall}}}$$
+
+$$\mathrm{MI\text{-}APC}(i, j) = \max\left(0, \mathrm{MI}(i, j) - \mathrm{APC}(i, j)\right)$$
+
 * **Biological Critique**:
   * **Validity**: Standard Mutual Information (MI) is biased by entropy and background phylogenetic signal. Average Product Correction (APC) [(Dunn et al. 2008)](https://doi.org/10.1093/bioinformatics/btm604) subtracts background co-variation, isolating structural co-evolution between base-paired positions.
-  * **Consensus Base-Pair Covariation**: Evaluating $\text{MI-APC}(i, j)$ specifically across base pairs defined in the `RNAalifold` consensus structure quantifies direct structural support for the predicted fold.
+  * **Consensus Base-Pair Covariation**: Evaluating $\mathrm{MI\text{-}APC}(i, j)$ specifically across base pairs defined in the `RNAalifold` consensus structure quantifies direct structural support for the predicted fold.
 
 ### 3.4 Compensatory Mutation Count
-* **Mathematical Formulation**: Counts consensus base-paired columns $(i, j)$ exhibiting at least two distinct canonical base pairs across aligned sequences (e.g., $G-C \leftrightarrow A-U$ or $G-C \leftrightarrow G-U$) with $\text{MI-APC}(i, j) > 0.01$.
+* **Mathematical Formulation**: Counts consensus base-paired columns $(i, j)$ exhibiting at least two distinct canonical base pairs across aligned sequences (e.g., $\mathrm{G-C} \leftrightarrow \mathrm{A-U}$ or $\mathrm{G-C} \leftrightarrow \mathrm{G-U}$) with $\mathrm{MI\text{-}APC}(i, j) > 0.01$.
 * **Biological Critique**:
   * **Validity**: Provides structural proof of selection maintaining secondary structure despite primary sequence divergence.
-  * **Scope**: Canonical pairs are defined as Watson-Crick ($A-U$, $G-C$) and Wobble ($G-U$). Non-canonical pairs ($A-G$, $U-U$) in internal loops or tertiary contacts are excluded.
+  * **Scope**: Canonical pairs are defined as Watson-Crick ($\mathrm{A-U, G-C}$) and Wobble ($\mathrm{G-U}$). Non-canonical pairs ($\mathrm{A-G, U-U}$) in internal loops or tertiary contacts are excluded.
 
 ### 3.5 Normalized Shannon Entropy ($H_N$)
 * **Mathematical Formulation**:
-  $$H_N = \frac{1}{L_{\text{valid}}} \sum_{c=1}^{L} \left( \frac{-\sum_{x \in \mathcal{A}} P(x) \log_2 P(x)}{\log_2 |\mathcal{A}|} \right)$$
+
+$$H_N = \frac{1}{L_{\mathrm{valid}}} \sum_{c=1}^{L} \left( \frac{-\sum_{x \in \mathcal{A}} P(x) \log_2 P(x)}{\log_2 |\mathcal{A}|} \right)$$
+
 * **Biological Critique**:
   * **Validity**: Quantifies sequence diversity across non-gap positions.
-  * **Alphabet Preservation**: Preserves IUPAC degenerate codes ($R, Y, S, W, K, M, B, D, H, V, N$) within alphabet $\mathcal{A}$, preventing artificial variance reduction.
+  * **Alphabet Preservation**: Preserves IUPAC degenerate codes ($\mathrm{R, Y, S, W, K, M, B, D, H, V, N}$) within alphabet $\mathcal{A}$, preventing artificial variance reduction.
   * **Penalty Value**: $H_N = 1.0$ represents complete random disorder, serving as the penalized score for alignment failures.
 
 ### 3.6 Mean Overlap Score (MOS) & Pairwise Identity
@@ -214,7 +224,7 @@ Infernal [(Nawrocki et al. 2013)](https://doi.org/10.1093/bioinformatics/btt509)
 ## 6. Biological Problems to Consider and Solve
 
 1. **Pseudoknot Modeling Limitations**: Standard folding engines (`RNAalifold`) and pSCFG implementations (`cmbuild`) assume nested secondary structure topologies and cannot model non-nested pseudoknot interactions directly. Incorporating pseudoknot-aware covariation algorithms (such as R-scape with `--nonested` options) is required for pseudoknot-containing ncRNAs (e.g., viral IRES elements, riboswitches).
-2. **Non-Canonical Base Pairing in Structural Cores**: Non-canonical base pairs ($A-G, U-U, C-A$) often stabilize internal loops and tertiary motifs. Traditional structural aligners penalize non-canonical matches as mismatches. Downstream covariance models handle non-canonical emissions via 16-state pair emission matrices, but initial alignment steps require scoring matrices (e.g., RIBOSUM60 [(Klein et al. 2004)](https://doi.org/10.1186/1471-2105-4-44)) that accommodate non-canonical pair preferences.
+2. **Non-Canonical Base Pairing in Structural Cores**: Non-canonical base pairs ($\mathrm{A-G, U-U, C-A}$) often stabilize internal loops and tertiary motifs. Traditional structural aligners penalize non-canonical matches as mismatches. Downstream covariance models handle non-canonical emissions via 16-state pair emission matrices, but initial alignment steps require scoring matrices (e.g., RIBOSUM60 [(Klein et al. 2004)](https://doi.org/10.1186/1471-2105-4-44)) that accommodate non-canonical pair preferences.
 3. **Genomic Contamination & Decoy Sequences**: Homology searches in unannotated genomic loci may collect spurious non-homologous sequences or pseudogenes. Integrating sequence decontamination filters (e.g., DecoyFinder [(Zhu et al. 2024)](https://doi.org/10.1101/2024.10.12.618037)) prior to alignment prevents sequence corruption.
 4. **Lineage-Specific Structural Insertions**: Certain clades possess extended stem-loop insertions within an otherwise conserved core. Pure gap-density trimming tools excise these insertions, destroying lineage-specific structural information. Structure-aware masking retains structural insertions if they form closed stem-loop topologies.
 
