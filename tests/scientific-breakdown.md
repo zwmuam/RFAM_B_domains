@@ -1,15 +1,15 @@
 # Comprehensive Scientific Breakdown, Critique, and Evaluation of the ncRNA Alignment & Benchmarking Suite
 
 ## Table of Contents
-1. [Evaluation of Alignment Pipelines & CLI Configurations](#1-evaluation-of-alignment-pipelines--cli-configurations)
+1. [Evaluation of Alignment Pipelines & Configurations](#1-evaluation-of-alignment-pipelines--cli-configurations)
 2. [Scientific Evaluation of Quality Metrics](#2-scientific-evaluation-of-quality-metrics)
 3. [Biological & Evolutionary Alignment Integrity](#3-biological--evolutionary-alignment-integrity)
-4. [Potential Implementation Problems, Biases & Edge-Case Caveats](#4-potential-implementation-problems-biases--edge-case-caveats)
+4. [Problems to consider](#4-potential-implementation-problems-biases--edge-case-caveats)
 5. [Summary of Recommendations & Future Directions](#5-summary-of-recommendations--future-directions)
 
 ---
 
-## 1. Evaluation of Alignment Pipelines & CLI Configurations
+## 1. Evaluation of Alignment Pipelines & Configurations
 
 The framework integrates six alignment pipelines representing different algorithmic paradigms for sequence- and structure-aware multiple sequence alignment of structured RNA sequences (e.g. ncRNA)
 
@@ -125,7 +125,7 @@ Single minimum free energy structure predictions (e.g., classical Zuker mfold) o
 
 ---
 
-## 4. Potential Implementation Problems, Biases & Edge-Case Caveats
+## 4. Problems to consider
 
 During inquisitive code evaluation, the following implementation behaviors and edge cases were identified:
 
