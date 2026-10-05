@@ -30,7 +30,7 @@ Genomic annotations frequently extract ncRNA features from uncharacterized or re
 
 ---
 
-## 2. Critical Evaluation of Alignment Pipelines & Flag Configurations
+## 2. Alignment Pipelines
 
 Multiple sequence alignment tools rely on distinct algorithmic frameworks. Below is a critical breakdown of current pipelines, theoretical foundations, computational complexities, and recommended CLI configurations.
 
@@ -92,11 +92,9 @@ Multiple sequence alignment tools rely on distinct algorithmic frameworks. Below
 
 ---
 
-## 3. Evaluation & Multi-Criteria Decision Matrix Ranking of Alignment Trimming Strategies
+## 3. Alignment Trimming Strategies
 
-Alignment trimming aims to remove poorly aligned or non-homologous flanking regions while preserving structurally conserved cores (stems and loop boundaries).
-
-### 3.1 Detailed Analysis of Trimming Methodologies
+Alignment trimming aims to remove poorly aligned or non-homologous flanking regions while preserving structurally conserved cores.
 
 #### 1. BMGE (Block Mapping and Gathering with Entropy)
 * **Mechanism**: Evaluates sliding-window normalized Shannon entropy ($H_N$) and gap proportions [(Criscuolo et al. 2010)](https://doi.org/10.1186/1471-2148-10-210).
@@ -130,8 +128,6 @@ Alignment trimming aims to remove poorly aligned or non-homologous flanking regi
 
 ---
 
-### 3.2 Multi-Criteria Decision Matrix & Trimming Tool Ranking
-
 | Trimming Strategy | Information Theory Integrity | SCI Preservation | MI-APC Signal Recovery | FP Gap Deletion (Lower is Better) | Loop Boundary Retention | Computational Speed & Scalability | Overall Score (1-10) | Rank |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Infernal Match-State Truncation** | 9.5 | 9.8 | 9.7 | **0.1** (Extremely Low) | 9.9 | 9.5 | **9.75** | **1** |
@@ -145,7 +141,7 @@ Alignment trimming aims to remove poorly aligned or non-homologous flanking regi
 
 ## 4. Three Optimal Candidate Paths for De Novo Motif Discovery
 
-To analyze tens of thousands of alignments spanning thousands of 50–500 nt sequences extracted from unannotated genomic settings, pipelines must balance structural accuracy, throughput, and memory consumption. Below are three candidate pathways designed for distinct operational objectives.
+To analyze tens of thousands of alignments spanning thousands of 50–500 nt sequences extracted from genomic and transcriptomic settings, pipelines must balance structural accuracy, throughput, and memory consumption. Below are three candidate pathways designed for distinct operational objectives.
 
 ```
 ====================================================================================================
@@ -213,7 +209,7 @@ Execution Time: ~10.0 - 45.0 sec/MSA | RAM: < 1 GB | Purpose: Publication-grade 
 
 ---
 
-## 5. Alignment Quality Evaluation Metrics & Downstream R-scape / Infernal Integration
+## 5. Evaluation Metrics and adaptation for downstream analyses
 
 ### 5.1 Critical Evaluation of Alignment Quality Metrics
 
