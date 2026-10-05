@@ -139,7 +139,7 @@ Alignment trimming aims to remove poorly aligned or non-homologous flanking regi
 
 ---
 
-## 4. Three Optimal Candidate Paths for De Novo Motif Discovery
+## 4. Paths to optimised core-sequence alignment
 
 To analyze tens of thousands of alignments spanning thousands of 50–500 nt sequences extracted from genomic and transcriptomic settings, pipelines must balance structural accuracy, throughput, and memory consumption. Below are three candidate pathways designed for distinct operational objectives.
 
