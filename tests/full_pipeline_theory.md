@@ -6,7 +6,7 @@ Non-coding RNAs (ncRNAs) extracted from genomic loci—such (tRNAs, ribosomal RN
 
 ---
 
-## 1. Molecular & Evolutionary Mechanics of Structured ncRNA Sequences
+## 1. Theoretical considerations
 
 ### 1.1 Evolutionary Rate Asymmetry: Conserved Cores vs. Variable Flanks
 The primary evolutionary force shaping functional ncRNAs is purifying selection maintaining RNA secondary and tertiary structural geometry [(Washietl et al. 2005)](https://doi.org/10.1073/pnas.0409169102).
