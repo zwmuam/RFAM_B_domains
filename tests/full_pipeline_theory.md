@@ -26,7 +26,7 @@ Genomic repositories (NCBI, Ensembl) store ncRNA genes using DNA alphabets ($\ma
 ### 1.4 Sequence Orientation and Automated Strand Adjustment
 Genomic annotations frequently extract ncRNA features from uncharacterized or reverse-strand genomic settings ($5' \to 3'$ vs. $3' \to 5'$).
 * **Directional Energetics of Folding**: Secondary structure thermodynamics are inherently directional due to nearest-neighbor base-stacking energetics ($\Delta H^\circ, \Delta S^\circ$) [(Xia et al. 1998)](https://doi.org/10.1021/bi9809425). Reversing an RNA sequence ($3' \to 5'$) disrupts stem-loop folding topology and corrupts minimum free energy (MFE) calculations.
-* **Mandatory Strand Adjustment**: Alignment engines lacking automated orientation checks fail on reverse-complemented input sequences. Incorporating automated strand orientation detection (e.g., MAFFT `--adjustdirection` or RNAhub workflows [(Magnus et al. 2025)](https://doi.org/10.1093/nar/gkaf342)) must be enforced across all primary alignment pathways.
+* **Mandatory Strand Adjustment**: Alignment engines lacking automated orientation checks fail on reverse-complemented input sequences. Incorporating automated strand orientation detection (e.g., MAFFT `--adjustdirection` or RNAhub workflows [(Magnus et al. 2025)](https://doi.org/10.1093/nar/gkaf342) must be enforced across all primary alignment pathways.
 
 ---
 
@@ -88,8 +88,6 @@ Multiple sequence alignment tools rely on distinct algorithmic frameworks. Below
 * **Recommended Flag Configuration**: Ensure explicit fallback parameters preserve U-encoding and avoid case erasure or default BLOSUM substitution matrices.
 
 ### 2.7 Additional State-of-the-Art Aligners
-* **Infernal `cmalign`**: Profile Stochastic Context-Free Grammar (pSCFG) alignment engine [(Nawrocki et al. 2013)](https://doi.org/10.1093/bioinformatics/btt509). The benchmark gold standard when a reference covariance model exists. Automatically assigns variable flanking regions to insert states ($I_k$), leaving core match states ($M_k$) intact. Using `--glocal` forces global alignment relative to the CM model, but local alignment relative to input sequences.
-* **LocARNA**: Simultaneous alignment and folding based on light-weight Sankoff algorithms [(Will et al. 2007)](https://doi.org/10.1371/journal.pcbi.0030065). High structural accuracy for unannotated ncRNAs, but limited by $\mathcal{O}(N^2 \cdot L^4)$ time complexity.
 * **DAFS & DECIPHER**: Evaluated in the RNAconTest benchmark [(Wright 2020)](https://doi.org/10.1261/rna.073015.119). DAFS [(Sato et al. 2012)](https://doi.org/10.1093/bioinformatics/bts612) demonstrates top-tier structural consistency by integrating pairwise folding probabilities via dual decomposition, though computational demands scale rapidly with sequence length.
 
 ---
