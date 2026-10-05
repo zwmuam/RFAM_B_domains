@@ -26,7 +26,7 @@ Genomic extraction pipelines and sequencing datasets frequently retain IUPAC amb
 ### 1.3 DNA/RNA Alphabet Flexibility ($\mathrm{T} \leftrightarrow \mathrm{U}$ Interchangeability)
 Genomic repositories (such as NCBI or Ensembl FASTA files) store ncRNA genes using DNA alphabets ($\mathrm{T}$), whereas RNA structural modeling tools (such as ViennaRNA or Infernal) expect RNA alphabets ($\mathrm{U}$).
 * **Thermodynamic Equivalence**: Thymine ($\mathrm{T}$, 5-methyluracil) and Uracil ($\mathrm{U}$) share identical Watson-Crick hydrogen bonding geometry with Adenine ($\mathrm{A}$).
-* **Canonical & Wobble Base Pairing**: $\mathrm{G-U}$ (or $\mathrm{G-T}$) wobble base pairs contribute significant thermodynamic stability ($\Delta G^\circ \approx -1.3\text{ kcal/mol}$) to RNA helices. Alignment scoring systems must recognize $\mathrm{G-T}$ and $\mathrm{G-U}$ interactions as structurally valid match states rather than mismatches. Sequence extraction workflows must perform standardization without case erasure or alphabet corruption.
+* **Canonical & Wobble Base Pairing**: $\mathrm{G-U}$ (or $\mathrm{G-T}$) wobble base pairs contribute significant thermodynamic stability ($\Delta G^\circ \approx -1.3\text{ kcal/mol}$) to RNA helices [(Xia et al. 1998)](https://doi.org/10.1021/bi9809425). Alignment scoring systems must recognize $\mathrm{G-T}$ and $\mathrm{G-U}$ interactions as structurally valid match states rather than mismatches. Sequence extraction workflows must perform standardization without case erasure or alphabet corruption.
 
 ### 1.4 Sequence Orientation & Strand Awareness
 Genomic annotations frequently extract ncRNA features from mixed strand orientations ($5' \to 3'$ vs. $3' \to 5'$) if strand orientation is misannotated.
@@ -48,7 +48,7 @@ Multiple sequence alignment tools operate under distinct algorithmic paradigms. 
   * *Optimized Parameters*: Use MUSCLE v5 ensemble generation (`-stratified` or `-diversified`) to assess column confidence. Unstable column positions (high ensemble variance) indicate variable flanking regions.
 
 ### 2.2 MAFFT Q-INS-i (`MafftQinsiPipeline`)
-* **Theoretical Foundation**: MAFFT Q-INS-i [(Katoh et al. 2013)](https://doi.org/10.1093/molbev/mst010) integrates the McCaskill partition function algorithm [(McCaskill 1990)](https://doi.org/10.1002/bip.360290621) to calculate individual sequence base-pairing probability matrices $P_{ij}$. Pairwise alignments incorporate structural consensus scores derived from these base-pair probabilities.
+* **Theoretical Foundation**: MAFFT Q-INS-i [(Katoh & Toh 2008)](https://doi.org/10.1186/1471-2105-9-212) integrates the McCaskill partition function algorithm [(McCaskill 1990)](https://doi.org/10.1002/bip.360290621) to calculate individual sequence base-pairing probability matrices $P_{ij}$. Pairwise alignments incorporate structural consensus scores derived from these base-pair probabilities.
 * **Evaluation for Structured ncRNA**: Gold standard for structural alignment of moderately conserved ncRNA families ($45\% - 70\%$ identity). Balances primary sequence similarity with secondary structure base-pair probabilities.
 * **Computational Footprint & Scalability**: Time complexity is $\mathcal{O}(N^2 \cdot L^3)$ due to repeated partition function calculations. Memory scales as $\mathcal{O}(N \cdot L^2)$. For datasets with $N > 100$ or $L > 1000\text{ nt}$, runtime increases substantially.
 * **Recommendations**:
@@ -64,7 +64,7 @@ Multiple sequence alignment tools operate under distinct algorithmic paradigms. 
   * *Optimized Parameters*: `mafft --localpair --op 3.0 --ep 0.0 --maxiterate 1000 input.fasta`. Eliminating terminal gap penalties (`--ep 0.0`) allows variable-length genomic flanks to overhang without inserting gap columns inside conserved structural stems.
 
 ### 2.4 MAFFT X-INS-i (`MafftXinsiPipeline`)
-* **Theoretical Foundation**: Incorporates framework structural alignment algorithms (such as MXSCARNA) to calculate stem-candidate pairing matrices across sequence pairs before progressive alignment [(Katoh et al. 2013)](https://doi.org/10.1093/molbev/mst010).
+* **Theoretical Foundation**: Incorporates framework structural alignment algorithms (such as MXSCARNA [(Tabei et al. 2008)](https://doi.org/10.1186/1471-2105-9-33)) to calculate stem-candidate pairing matrices across sequence pairs before progressive alignment [(Katoh & Toh 2008)](https://doi.org/10.1186/1471-2105-9-212).
 * **Evaluation for Structured ncRNA**: Effective for highly diverged RNA sequences below the twilight zone ($< 40\%$ sequence identity). However, false-positive stem predictions in unconstrained single-stranded regions can introduce structural misalignments.
 * **Computational Footprint & Scalability**: Time complexity is $\mathcal{O}(N^2 \cdot L^3 + N^2 \cdot \mathrm{MXSCARNA})$ and memory requirement is high. Scalability is limited for $N > 50$.
 * **Recommendations**:
@@ -86,7 +86,7 @@ Multiple sequence alignment tools operate under distinct algorithmic paradigms. 
 ### 2.7 Additional State-of-the-Art Aligners
 * **Infernal `cmalign`**: Profile Stochastic Context-Free Grammar (pSCFG) alignment engine [(Nawrocki et al. 2013)](https://doi.org/10.1093/bioinformatics/btt509). The benchmark gold standard when a reference covariance model exists. Automatically assigns variable flanking regions to insert states ($I_k$), leaving core match states ($M_k$) intact.
 * **LocARNA**: Simultaneous alignment and folding based on light-weight Sankoff algorithms [(Will et al. 2007)](https://doi.org/10.1371/journal.pcbi.0030065). High structural accuracy for unannotated ncRNAs, but limited by $\mathcal{O}(N^2 \cdot L^4)$ time complexity.
-* **DAFS & DECIPHER**: Evaluated in the RNAconTest benchmark [(Wright 2020)](https://doi.org/10.1261/rna.073015.119). DAFS demonstrates top-tier structural consistency by integrating pairwise folding probabilities, though computational demands scale rapidly with sequence length.
+* **DAFS & DECIPHER**: Evaluated in the RNAconTest benchmark [(Wright 2020)](https://doi.org/10.1261/rna.073015.119). DAFS [(Sato et al. 2012)](https://doi.org/10.1093/bioinformatics/bts612) demonstrates top-tier structural consistency by integrating pairwise folding probabilities via dual decomposition, though computational demands scale rapidly with sequence length.
 
 ---
 
@@ -99,7 +99,7 @@ Evaluating multiple sequence alignments requires metrics that measure structural
 
 $$\mathrm{SCI} = \frac{E_{\mathrm{consensus}}}{\bar{E}_{\mathrm{single}}}$$
 
-  where $E_{\mathrm{consensus}}$ is the Minimum Free Energy (MFE) of the consensus secondary structure predicted by `RNAalifold` [(Bernhart et al. 2008)](https://doi.org/10.1186/1471-2105-9-474), and $\bar{E}_{\mathrm{single}}$ is the arithmetic mean MFE of individual ungapped sequences predicted by `RNAfold`.
+  where $E_{\mathrm{consensus}}$ is the Minimum Free Energy (MFE) of the consensus secondary structure predicted by `RNAalifold` [(Bernhart et al. 2008)](https://doi.org/10.1186/1471-2105-9-474), and $\bar{E}_{\mathrm{single}}$ is the arithmetic mean MFE of individual ungapped sequences predicted by `RNAfold` [(Hofacker et al. 1994)](https://doi.org/10.1007/BF00818163). The SCI metric was originally formulated by Washietl et al. [(Washietl et al. 2005)](https://doi.org/10.1073/pnas.0409169102).
 * **Biological Critique & Biases**:
   * **Validity**: SCI measures whether aligned sequences fold into a thermodynamically stable common structure. An $\mathrm{SCI} \ge 1.0$ indicates strong structural conservation and compensatory base changes.
   * **Zero-Denominator Division**: If individual ungapped sequences lack secondary structure ($\bar{E}_{\mathrm{single}} = 0.0$), division by zero must be guarded against (assigning $\mathrm{SCI} = 0.0$).
@@ -224,7 +224,7 @@ Infernal [(Nawrocki et al. 2013)](https://doi.org/10.1093/bioinformatics/btt509)
 ## 6. Biological Problems to Consider and Solve
 
 1. **Pseudoknot Modeling Limitations**: Standard folding engines (`RNAalifold`) and pSCFG implementations (`cmbuild`) assume nested secondary structure topologies and cannot model non-nested pseudoknot interactions directly. Incorporating pseudoknot-aware covariation algorithms (such as R-scape with `--nonested` options) is required for pseudoknot-containing ncRNAs (e.g., viral IRES elements, riboswitches).
-2. **Non-Canonical Base Pairing in Structural Cores**: Non-canonical base pairs ($\mathrm{A-G, U-U, C-A}$) often stabilize internal loops and tertiary motifs. Traditional structural aligners penalize non-canonical matches as mismatches. Downstream covariance models handle non-canonical emissions via 16-state pair emission matrices, but initial alignment steps require scoring matrices (e.g., RIBOSUM60 [(Klein et al. 2004)](https://doi.org/10.1186/1471-2105-4-44)) that accommodate non-canonical pair preferences.
+2. **Non-Canonical Base Pairing in Structural Cores**: Non-canonical base pairs ($\mathrm{A-G, U-U, C-A}$) classified under the Leontis-Westhof nomenclature [(Leontis & Westhof 2001)](https://doi.org/10.1017/s1355838201002515) often stabilize internal loops and tertiary motifs. Traditional structural aligners penalize non-canonical matches as mismatches. Downstream covariance models handle non-canonical emissions via 16-state pair emission matrices, but initial alignment steps require scoring matrices (e.g., RIBOSUM60 [(Klein et al. 2004)](https://doi.org/10.1186/1471-2105-4-44)) that accommodate non-canonical pair preferences.
 3. **Genomic Contamination & Decoy Sequences**: Homology searches in unannotated genomic loci may collect spurious non-homologous sequences or pseudogenes. Integrating sequence decontamination filters (e.g., DecoyFinder [(Zhu et al. 2024)](https://doi.org/10.1101/2024.10.12.618037)) prior to alignment prevents sequence corruption.
 4. **Lineage-Specific Structural Insertions**: Certain clades possess extended stem-loop insertions within an otherwise conserved core. Pure gap-density trimming tools excise these insertions, destroying lineage-specific structural information. Structure-aware masking retains structural insertions if they form closed stem-loop topologies.
 
@@ -267,3 +267,10 @@ To achieve optimal ncRNA core extraction, alignment quality, and model construct
 18. Will, S., Reiche, K., Hofacker, I. L., Stadler, P. F., & Backofen, R. (2007). Inferring non-coding RNA structures and models by sequence profiles. *PLoS Computational Biology*, 3(4), e65. [(Will et al. 2007)](https://doi.org/10.1371/journal.pcbi.0030065)
 19. Chang, J. M., Di Tommaso, P., & Notredame, C. (2014). TCS: a new multiple sequence alignment reliability measure to estimate alignment accuracy and phylogenetic tree correctness. *Molecular Biology and Evolution*, 31(6), 1625-1637. [(Chang et al. 2014)](https://doi.org/10.1093/molbev/msu117)
 20. Klein, R. J., & Eddy, S. R. (2004). RSEARCH: finding homologs of non-coding RNAs in genomic sequence. *BMC Bioinformatics*, 4(1), 44. [(Klein et al. 2004)](https://doi.org/10.1186/1471-2105-4-44)
+21. Xia, T., SantaLucia, J. Jr., Burkard, M. E., Kierzek, R., Schroeder, S. J., Jiao, X., Cox, C., & Turner, D. H. (1998). Thermodynamic parameters for an expanded nearest-neighbor model for formation of RNA duplexes with Watson-Crick base pairs. *Biochemistry*, 37(42), 14719-14735. [(Xia et al. 1998)](https://doi.org/10.1021/bi9809425)
+22. Katoh, K., & Toh, H. (2008). Improved accuracy of multiple ncRNA alignment by incorporating structural information into a MAFFT-based framework. *BMC Bioinformatics*, 9, 212. [(Katoh & Toh 2008)](https://doi.org/10.1186/1471-2105-9-212)
+23. Tabei, Y., Kiryu, H., Kin, T., & Asai, K. (2008). A fast structural multiple alignment method for long RNA sequences. *BMC Bioinformatics*, 9, 33. [(Tabei et al. 2008)](https://doi.org/10.1186/1471-2105-9-33)
+24. Sato, K., Kato, Y., & Akutsu, T. (2012). DAFS: simultaneous aligning and folding of RNA sequences via dual decomposition. *Bioinformatics*, 28(24), 3218-3224. [(Sato et al. 2012)](https://doi.org/10.1093/bioinformatics/bts612)
+25. Washietl, S., Hofacker, I. L., & Stadler, P. F. (2005). Fast and reliable prediction of noncoding RNAs. *Proceedings of the National Academy of Sciences*, 102(7), 2454-2459. [(Washietl et al. 2005)](https://doi.org/10.1073/pnas.0409169102)
+26. Hofacker, I. L., Fontana, W., Stadler, P. F., Bonhoeffer, L. S., Tacker, M., & Schuster, P. (1994). Fast folding and comparison of RNA secondary structures. *Monatshefte für Chemie*, 125(2), 167-188. [(Hofacker et al. 1994)](https://doi.org/10.1007/BF00818163)
+27. Leontis, N. B., & Westhof, E. (2001). Geometric nomenclature and classification of RNA base pairs. *RNA*, 7(4), 499-512. [(Leontis & Westhof 2001)](https://doi.org/10.1017/s1355838201002515)
