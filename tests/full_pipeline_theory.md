@@ -1,4 +1,4 @@
-# Theoretical Framework, Scientific Critique, and Analytical Roadmap for Non-Coding RNA Multiple Sequence Alignment and Structural Trimming
+# Non-Coding RNA Multiple Sequence Alignment and Structural Trimming
 
 Non-coding RNA (ncRNA) transcripts extracted from genomic loci—such as transfer RNAs, ribosomal RNA domains, riboswitches, long non-coding RNA (lncRNA) domains, and viral structured elements—possess distinct evolutionary features compared to protein-coding sequences. Crucially, functional ncRNAs are constrained primarily by secondary and tertiary structure conservation rather than primary sequence identity. At the genomic locus level, extracted sequences frequently consist of a structurally conserved, base-paired "core" (e.g., stem-loops, catalytic centers, pseudoknots) flanked by terminal regions that exhibit high length heterogeneity, rapid nucleotide substitution, and lineage-specific insertion/deletion (indel) dynamics.
 
