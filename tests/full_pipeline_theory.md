@@ -86,7 +86,7 @@ Multiple sequence alignment tools operate under distinct algorithmic paradigms. 
 ### 2.7 Additional State-of-the-Art Aligners
 * **Infernal `cmalign`**: Profile Stochastic Context-Free Grammar (pSCFG) alignment engine [(Nawrocki et al. 2013)](https://doi.org/10.1093/bioinformatics/btt509). The benchmark gold standard when a reference covariance model exists. Automatically assigns variable flanking regions to insert states ($I_k$), leaving core match states ($M_k$) intact.
 * **LocARNA**: Simultaneous alignment and folding based on light-weight Sankoff algorithms [(Will et al. 2007)](https://doi.org/10.1371/journal.pcbi.0030065). High structural accuracy for unannotated ncRNAs, but limited by $\mathcal{O}(N^2 \cdot L^4)$ time complexity.
-* **DAFS & DECIPHER**: Evaluated in the RNAconTest benchmark [(Wright 2020)](https://doi.org/10.1261/rna.073007.119). DAFS demonstrates top-tier structural consistency by integrating pairwise folding probabilities, though computational demands scale rapidly with sequence length.
+* **DAFS & DECIPHER**: Evaluated in the RNAconTest benchmark [(Wright 2020)](https://doi.org/10.1261/rna.073015.119). DAFS demonstrates top-tier structural consistency by integrating pairwise folding probabilities, though computational demands scale rapidly with sequence length.
 
 ---
 
@@ -106,7 +106,7 @@ $$\mathrm{SCI} = \frac{E_{\mathrm{consensus}}}{\bar{E}_{\mathrm{single}}}$$
   * **`RNAalifold` Invocation Parameters**: Calculating $E_{\mathrm{consensus}}$ using default `RNAalifold` settings without flags can inflate consensus energy estimates. `RNAalifold` should be executed with `--noLP` (disallowing isolated, thermodynamic-unstable base pairs) and `--noPS` (suppressing postscript output clutter).
 
 ### 3.2 Transitive Consistency Score (TCS)
-* **Mathematical Formulation**: Evaluates the consistency of column residue pairs across all pairwise alignment paths [(Notredame et al. 2000)](https://doi.org/10.1006/jmbi.2000.4042), [(Chang et al. 2014)](https://doi.org/10.1093/molbev/msu084):
+* **Mathematical Formulation**: Evaluates the consistency of column residue pairs across all pairwise alignment paths [(Notredame et al. 2000)](https://doi.org/10.1006/jmbi.2000.4042), [(Chang et al. 2014)](https://doi.org/10.1093/molbev/msu117):
 
 $$\mathrm{TCS} = \frac{\sum_{c=1}^L \mathrm{Pairs}_{\mathrm{consistent}}(c)}{\sum_{c=1}^L \mathrm{Pairs}_{\mathrm{valid}}(c)} \times 100$$
 
@@ -148,7 +148,7 @@ $$H_N = \frac{1}{L_{\mathrm{valid}}} \sum_{c=1}^{L} \left( \frac{-\sum_{x \in \m
 * **Pairwise Sequence Identity Sensitivity**: Sequence identity calculation denominators must include non-gap positions present in either sequence of a pair to prevent inflated identity estimates in alignments with extensive terminal or internal gaps.
 
 ### 3.7 Critical Analysis of Benchmark Design: The "BRaliBase Dent"
-* **Benchmark Bias**: Historical ncRNA alignment benchmark evaluations rely on BRaliBase. However, Löwes et al. [(Löwes et al. 2017)](https://doi.org/10.1093/bib/bbw129) demonstrated that the unexplained drop in aligner accuracy observed at $40\%-60\%$ sequence identity (the "BRaliBase Dent") was an artifact of benchmark composition—specifically an over-representation of transfer RNAs (tRNAs). Performance evaluations must benchmark across diverse ncRNA families (riboswitches, lncRNA domains, viral elements) to avoid family-specific structural bias.
+* **Benchmark Bias**: Historical ncRNA alignment benchmark evaluations rely on BRaliBase. However, Löwes et al. [(Löwes et al. 2017)](https://doi.org/10.1093/bib/bbw022) demonstrated that the unexplained drop in aligner accuracy observed at $40\%-60\%$ sequence identity (the "BRaliBase Dent") was an artifact of benchmark composition—specifically an over-representation of transfer RNAs (tRNAs). Performance evaluations must benchmark across diverse ncRNA families (riboswitches, lncRNA domains, viral elements) to avoid family-specific structural bias.
 
 ---
 
@@ -174,7 +174,7 @@ Alignment trimming aims to remove poorly aligned or non-homologous flanking regi
 * **Weaknesses**: Operates strictly on site-by-site primary sequence entropy; does not evaluate base-pair covariation or consensus structural integrity.
 
 #### 4. CIAlign
-* **Mechanism**: Clean-up tool designed for removing divergent sequence ends, single-sequence insertions, and noise [(Tweedie et al. 2021)](https://doi.org/10.1093/bioinformatics/btab012).
+* **Mechanism**: Clean-up tool designed for removing divergent sequence ends, single-sequence insertions, and noise [(Tumescheit et al. 2022)](https://doi.org/10.7717/peerj.12983).
 * **Strengths**: Features a dedicated crop-from-ends function that trims unaligned terminal overhangs without altering internal structural columns.
 * **Weaknesses**: Relies on primary sequence gap/entropy heuristics.
 
@@ -259,11 +259,11 @@ To achieve optimal ncRNA core extraction, alignment quality, and model construct
 10. Steenwyk, J. L., Buida, T. III, Li, Y., Shen, X. X., & Rokas, A. (2020). ClipKIT: A multiple sequence alignment trimming software for accurate phylogenomic inference. *PLoS Biology*, 18(12), e3001007. [(Steenwyk et al. 2020)](https://doi.org/10.1371/journal.pbio.3001007)
 11. Capella-Gutiérrez, S., Silla-Martínez, J. M., & Gabaldón, T. (2009). trimAl: a tool for automated alignment trimming in large-scale phylogenetic analyses. *Bioinformatics*, 25(15), 1972-1973. [(Capella-Gutiérrez et al. 2009)](https://doi.org/10.1093/bioinformatics/btp348)
 12. Criscuolo, A., & Gribaldo, S. (2010). BMGE (Block Mapping and Gathering with Entropy): a new software for selection of phylogenetic informative regions from multiple sequence alignments. *BMC Evolutionary Biology*, 10(1), 210. [(Criscuolo et al. 2010)](https://doi.org/10.1186/1471-2148-10-210)
-13. Tweedie, A., Capella-Gutiérrez, S., & Gabaldón, T. (2021). CIAlign: A highly customizable tool for cleaning, analyzing, and visualizing multiple sequence alignments. *Bioinformatics*, 37(22), 4248-4250. [(Tweedie et al. 2021)](https://doi.org/10.1093/bioinformatics/btab012)
-14. Löwes, B., Chauve, C., Ponty, Y., & Giegerich, R. (2017). The BRaliBase dent—a tale of benchmark design and interpretation. *Briefings in Bioinformatics*, 18(2), 203-211. [(Löwes et al. 2017)](https://doi.org/10.1093/bib/bbw129)
-15. Wright, E. S. (2020). RNAconTest: comparing tools for noncoding RNA multiple sequence alignment based on structural consistency. *RNA*, 26(11), 1731-1740. [(Wright 2020)](https://doi.org/10.1261/rna.073007.119)
+13. Tumescheit, C., Firth, A. E., & Brown, K. (2022). CIAlign: A highly customisable command line tool to clean, interpret and visualise multiple sequence alignments. *PeerJ*, 10, e12983. [(Tumescheit et al. 2022)](https://doi.org/10.7717/peerj.12983)
+14. Löwes, B., Chauve, C., Ponty, Y., & Giegerich, R. (2017). The BRaliBase dent—a tale of benchmark design and interpretation. *Briefings in Bioinformatics*, 18(2), 203-211. [(Löwes et al. 2017)](https://doi.org/10.1093/bib/bbw022)
+15. Wright, E. S. (2020). RNAconTest: comparing tools for noncoding RNA multiple sequence alignment based on structural consistency. *RNA*, 26(11), 1731-1740. [(Wright 2020)](https://doi.org/10.1261/rna.073015.119)
 16. Magnus, M., Gao, W., Dutta, N., Vicens, Q., & Rivas, E. (2025). RNAhub—an automated pipeline to search and align RNA homologs with secondary structure assessment. *Nucleic Acids Research*, 53(W1), W496-W502. [(Magnus et al. 2025)](https://doi.org/10.1093/nar/gkaf342)
 17. Zhu, M., Zuber, J., Tan, Z., Sharma, G., & Mathews, D. H. (2024). DecoyFinder: Identification of Contaminants in Sets of Homologous RNA Sequences. *bioRxiv*, 2024-10. [(Zhu et al. 2024)](https://doi.org/10.1101/2024.10.12.618037)
 18. Will, S., Reiche, K., Hofacker, I. L., Stadler, P. F., & Backofen, R. (2007). Inferring non-coding RNA structures and models by sequence profiles. *PLoS Computational Biology*, 3(4), e65. [(Will et al. 2007)](https://doi.org/10.1371/journal.pcbi.0030065)
-19. Chang, J. M., Di Tommaso, P., & Notredame, C. (2014). TCS: a new multiple sequence alignment reliability measure to estimate alignment accuracy and phylogenetic tree correctness. *Molecular Biology and Evolution*, 31(6), 1625-1637. [(Chang et al. 2014)](https://doi.org/10.1093/molbev/msu084)
+19. Chang, J. M., Di Tommaso, P., & Notredame, C. (2014). TCS: a new multiple sequence alignment reliability measure to estimate alignment accuracy and phylogenetic tree correctness. *Molecular Biology and Evolution*, 31(6), 1625-1637. [(Chang et al. 2014)](https://doi.org/10.1093/molbev/msu117)
 20. Klein, R. J., & Eddy, S. R. (2004). RSEARCH: finding homologs of non-coding RNAs in genomic sequence. *BMC Bioinformatics*, 4(1), 44. [(Klein et al. 2004)](https://doi.org/10.1186/1471-2105-4-44)
