@@ -1,12 +1,8 @@
 # Theoretical Framework, Scientific Critique, and Analytical Roadmap for Non-Coding RNA Multiple Sequence Alignment and Structural Trimming
 
-## Summary & Theoretical Foundations
-
 Non-coding RNA (ncRNA) transcripts extracted from genomic loci—such as transfer RNAs, ribosomal RNA domains, riboswitches, long non-coding RNA (lncRNA) domains, and viral structured elements—possess distinct evolutionary features compared to protein-coding sequences. Crucially, functional ncRNAs are constrained primarily by secondary and tertiary structure conservation rather than primary sequence identity. At the genomic locus level, extracted sequences frequently consist of a structurally conserved, base-paired "core" (e.g., stem-loops, catalytic centers, pseudoknots) flanked by terminal regions that exhibit high length heterogeneity, rapid nucleotide substitution, and lineage-specific insertion/deletion (indel) dynamics.
 
 Standard global multiple sequence alignment (MSA) algorithms and unguided entropy- or gap-density-based trimming heuristics perform poorly in this regime. Global aligners attempt to align non-homologous or variable-length flanking sequences across the full transcript length. This introduces artificial gaps and misalignment artifacts directly into structural stems and loop boundaries. Downstream, these alignment artifacts distort structural covariance signals, impairing statistical testing of covariation via tools like R-scape [(Rivas et al. 2017)](https://doi.org/10.1038/nmeth.4066) and degrading profile Stochastic Context-Free Grammars (pSCFGs) constructed via Infernal / infeRNAl [(Nawrocki et al. 2013)](https://doi.org/10.1093/bioinformatics/btt509).
-
-This document provides a comprehensive theoretical breakdown, rigorous scientific critique, and evidence-based optimization strategy for ncRNA alignment and alignment-trimming. It evaluates existing alignment tools and quality metrics, explores biological data subtleties, rigorously ranks trimming methodologies, and details the theoretical framework required to prepare optimized MSAs for downstream R-scape covariation analysis and infeRNAl/Infernal covariance model construction.
 
 ---
 
@@ -49,7 +45,7 @@ Multiple sequence alignment tools operate under distinct algorithmic paradigms. 
 
 ### 2.2 MAFFT Q-INS-i (`MafftQinsiPipeline`)
 * **Theoretical Foundation**: MAFFT Q-INS-i [(Katoh & Toh 2008)](https://doi.org/10.1186/1471-2105-9-212) integrates the McCaskill partition function algorithm [(McCaskill 1990)](https://doi.org/10.1002/bip.360290621) to calculate individual sequence base-pairing probability matrices $P_{ij}$. Pairwise alignments incorporate structural consensus scores derived from these base-pair probabilities.
-* **Evaluation for Structured ncRNA**: Gold standard for structural alignment of moderately conserved ncRNA families ($45\% - 70\%$ identity). Balances primary sequence similarity with secondary structure base-pair probabilities.
+* **Evaluation for Structured ncRNA**: Gold standard for structural alignment of moderately conserved ncRNA families ($\% - 70\%$ identity). Balances primary sequence similarity with secondary structure base-pair probabilities.
 * **Computational Footprint & Scalability**: Time complexity is $\mathcal{O}(N^2 \cdot L^3)$ due to repeated partition function calculations. Memory scales as $\mathcal{O}(N \cdot L^2)$. For datasets with $N > 100$ or $L > 1000\text{ nt}$, runtime increases substantially.
 * **Recommendations**:
   * *Current Invocation*: `mafft --qinsi --maxiterate 1000 input.fasta`
@@ -250,7 +246,7 @@ To achieve optimal ncRNA core extraction, alignment quality, and model construct
 1. Katoh, K., & Standley, D. M. (2013). MAFFT multiple sequence alignment software version 7: improvements in performance and usability. *Molecular Biology and Evolution*, 30(4), 772-780. [(Katoh et al. 2013)](https://doi.org/10.1093/molbev/mst010)
 2. Edgar, R. C. (2022). Muscle5: High-accuracy alignment ensembles enable unbiased assessments of sequence homology and phylogeny. *Nature Communications*, 13(1), 6068. [(Edgar 2022)](https://doi.org/10.1038/s41467-022-34630-w)
 3. Wilm, A., Higgins, D. G., & Notredame, C. (2008). R-Coffee: a method for multiple alignment of non-coding RNA. *Nucleic Acids Research*, 36(9), e52. [(Wilm et al. 2008)](https://doi.org/10.1093/nar/gkn174)
-4. Rivas, E., Clements, J., & Eddy, S. R. (2017). A statistical test for conserved RNA secondary structure. *Nature Methods*, 14(1), 45-48. [(Rivas et al. 2017)](https://doi.org/10.1038/nmeth.4066)
+4. Rivas, E., Clements, J., & Eddy, S. R. (2017). A statistical test for conserved RNA secondary structure. *Nature Methods*, 14(1), -48. [(Rivas et al. 2017)](https://doi.org/10.1038/nmeth.4066)
 5. Nawrocki, E. P., & Eddy, S. R. (2013). Infernal 1.1: 100-fold faster RNA homology searches. *Bioinformatics*, 29(22), 2933-2935. [(Nawrocki et al. 2013)](https://doi.org/10.1093/bioinformatics/btt509)
 6. Bernhart, S. H., Hofacker, I. L., Will, S., Gruber, A. R., & Stadler, P. F. (2008). RNAalifold: computing consensus structures for RNA alignments. *BMC Bioinformatics*, 9(1), 474. [(Bernhart et al. 2008)](https://doi.org/10.1186/1471-2105-9-474)
 7. McCaskill, J. S. (1990). The equilibrium partition function and base pairing probabilities of RNA secondary structure. *Biopolymers*, 29(6‐7), 1105-1119. [(McCaskill 1990)](https://doi.org/10.1002/bip.360290621)
@@ -271,6 +267,6 @@ To achieve optimal ncRNA core extraction, alignment quality, and model construct
 22. Katoh, K., & Toh, H. (2008). Improved accuracy of multiple ncRNA alignment by incorporating structural information into a MAFFT-based framework. *BMC Bioinformatics*, 9, 212. [(Katoh & Toh 2008)](https://doi.org/10.1186/1471-2105-9-212)
 23. Tabei, Y., Kiryu, H., Kin, T., & Asai, K. (2008). A fast structural multiple alignment method for long RNA sequences. *BMC Bioinformatics*, 9, 33. [(Tabei et al. 2008)](https://doi.org/10.1186/1471-2105-9-33)
 24. Sato, K., Kato, Y., & Akutsu, T. (2012). DAFS: simultaneous aligning and folding of RNA sequences via dual decomposition. *Bioinformatics*, 28(24), 3218-3224. [(Sato et al. 2012)](https://doi.org/10.1093/bioinformatics/bts612)
-25. Washietl, S., Hofacker, I. L., & Stadler, P. F. (2005). Fast and reliable prediction of noncoding RNAs. *Proceedings of the National Academy of Sciences*, 102(7), 2454-2459. [(Washietl et al. 2005)](https://doi.org/10.1073/pnas.0409169102)
+25. Washietl, S., Hofacker, I. L., & Stadler, P. F. (2005). Fast and reliable prediction of noncoding RNAs. *Proceedings of the National Academy of Sciences*, 102(7), 24-29. [(Washietl et al. 2005)](https://doi.org/10.1073/pnas.0409169102)
 26. Hofacker, I. L., Fontana, W., Stadler, P. F., Bonhoeffer, L. S., Tacker, M., & Schuster, P. (1994). Fast folding and comparison of RNA secondary structures. *Monatshefte für Chemie*, 125(2), 167-188. [(Hofacker et al. 1994)](https://doi.org/10.1007/BF00818163)
 27. Leontis, N. B., & Westhof, E. (2001). Geometric nomenclature and classification of RNA base pairs. *RNA*, 7(4), 499-512. [(Leontis & Westhof 2001)](https://doi.org/10.1017/s1355838201002515)
