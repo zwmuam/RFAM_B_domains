@@ -19,42 +19,70 @@ _REVERSE_COMPLEMENT_TRANS: Dict[int, int] = str.maketrans(
     "TGCAANYRSWMKVHDBtgcaanyrswmkvhdb"
 )
 
+DEGENERATE_IUPAC_CODES = set("RYSWKMBDHVNryswkmbdhvn")
 
-def reverse_complement(sequence: str) -> str:
+
+def reverse_complement(sequence: str, preserve_case: bool = True) -> str:
     """
     Computes the reverse complement of a nucleotide sequence string using optimized translation tables.
-    Handles standard (A, C, G, T, U) and IUPAC degenerate nucleotide bases (N, R, Y, S, W, K, M, B, D, H, V),
-    producing uppercase output while preserving sequence length and structural orientation.
+    Handles standard (A, C, G, T, U) and IUPAC degenerate nucleotide bases (N, R, Y, S, W, K, M, B, D, H, V).
+    Preserves character case (soft-masking metadata) when preserve_case is True.
 
     Mathematical/Biological bias:
         Maintains strict 5'-to-3' orientation conversion across Watson-Crick and wobble pairing options.
 
     :param sequence: Input DNA or RNA sequence string.
-    :return: Upper-case reverse complemented nucleotide sequence string.
+    :param preserve_case: Whether to preserve original character case (soft-masking).
+    :return: Reverse complemented nucleotide sequence string.
     """
     if not sequence:
         return ""
-    return sequence.translate(_REVERSE_COMPLEMENT_TRANS)[::-1].upper()
+    rc = sequence.translate(_REVERSE_COMPLEMENT_TRANS)[::-1]
+    return rc if preserve_case else rc.upper()
 
 
-def standardize_rna_sequence(sequence: str, convert_to_rna: bool = True) -> str: # RESOLVED
+def calculate_iupac_density(sequence: str) -> float:
+    """
+    Calculates the proportion of ambiguous/degenerate IUPAC nucleotide codes in a sequence string.
+
+    :param sequence: Input nucleotide sequence.
+    :return: Float ratio (0.0 to 1.0) of degenerate IUPAC bases.
+    """
+    if not sequence:
+        return 0.0
+    ungapped = [c for c in sequence if c not in ("-", ".")]
+    if not ungapped:
+        return 0.0
+    degenerate_count = sum(1 for c in ungapped if c in DEGENERATE_IUPAC_CODES)
+    return float(degenerate_count / len(ungapped))
+
+
+def standardize_rna_sequence(
+    sequence: str,
+    convert_to_rna: bool = True,
+    preserve_soft_masking: bool = True
+) -> str:
     """
     Standardizes nucleotide sequences into canonical RNA (U-containing) or DNA (T-containing) representations.
-    Removes whitespace and line returns while preserving IUPAC ambiguous character codes.
-
-    Implementation Detail:
-        Replaces 'T' with 'U' if convert_to_rna is True; converts 'U' to 'T' if False.
+    Removes whitespace and line returns while preserving IUPAC ambiguous character codes and soft-masking.
 
     :param sequence: Input nucleotide sequence string.
     :param convert_to_rna: Boolean flag indicating conversion to RNA (U) if True, or DNA (T) if False.
-    :return: Upper-case standardized sequence string.
+    :param preserve_soft_masking: If True, preserves lowercase character soft-masking metadata.
+    :return: Standardized sequence string.
     """
     if not sequence:
         return ""
-    clean_seq: str = sequence.strip().replace(" ", "").replace("\r", "").replace("\n", "").upper()
+    clean_seq: str = sequence.strip().replace(" ", "").replace("\r", "").replace("\n", "")
+    if not preserve_soft_masking:
+        clean_seq = clean_seq.upper()
+
     if convert_to_rna:
-        return clean_seq.replace("T", "U")
-    return clean_seq.replace("U", "T")
+        clean_seq = clean_seq.replace("T", "U").replace("t", "u")
+    else:
+        clean_seq = clean_seq.replace("U", "T").replace("u", "t")
+
+    return clean_seq
 
 
 class GFFSequenceExtractor:
@@ -68,21 +96,27 @@ class GFFSequenceExtractor:
         fasta_path: Path,
         primary_gff_path: Path,
         secondary_gff_path: Optional[Path] = None,
-        flank_length: int = 0
+        flank_length: int = 0,
+        max_iupac_density: float = 0.05,
+        preserve_soft_masking: bool = True
     ) -> None:
         """
-        Initializes GFFSequenceExtractor with input file paths and flanking configuration.
+        Initializes GFFSequenceExtractor with input file paths and flanking/filtering configurations.
 
         :param fasta_path: Path object specifying the input FASTA sequence file.
         :param primary_gff_path: Path object specifying primary GFF annotation features.
         :param secondary_gff_path: Optional Path object specifying secondary GFF features.
         :param flank_length: Non-negative integer indicating flanking nucleotides to extend boundaries.
+        :param max_iupac_density: Maximum allowed fraction of IUPAC degenerate bases (default 0.05).
+        :param preserve_soft_masking: Whether to preserve lowercase characters for soft-masked repeats.
         :return: None
         """
         self.fasta_path: Path = Path(fasta_path)
         self.primary_gff_path: Path = Path(primary_gff_path)
         self.secondary_gff_path: Optional[Path] = Path(secondary_gff_path) if secondary_gff_path else None
         self.flank_length: int = max(0, flank_length)
+        self.max_iupac_density: float = max_iupac_density
+        self.preserve_soft_masking: bool = preserve_soft_masking
 
         self.fasta_dict: Dict[str, str] = {}
         self.primary_gff_df: pd.DataFrame = pd.DataFrame()
@@ -90,10 +124,7 @@ class GFFSequenceExtractor:
 
     def parse_fasta(self) -> Dict[str, str]:
         """
-        Parses multi-record FASTA files into a dictionary mapping sequence identifiers to clean upper-case sequence strings.
-
-        Implementation Detail:
-            Uses line-by-line streaming buffer to safely read large genomic fasta files without high memory overhead.
+        Parses multi-record FASTA files into a dictionary mapping sequence identifiers to clean sequence strings.
 
         :return: Dictionary mapping fasta record headers to continuous sequence strings.
         """
@@ -112,13 +143,15 @@ class GFFSequenceExtractor:
                     continue
                 if line_str.startswith(">"):
                     if current_id is not None:
-                        sequences[current_id] = "".join(seq_chunks).upper()
+                        seq_str = "".join(seq_chunks)
+                        sequences[current_id] = seq_str if self.preserve_soft_masking else seq_str.upper()
                     current_id = line_str[1:].split()[0]
                     seq_chunks = []
                 else:
                     seq_chunks.append(line_str)
             if current_id is not None:
-                sequences[current_id] = "".join(seq_chunks).upper()
+                seq_str = "".join(seq_chunks)
+                sequences[current_id] = seq_str if self.preserve_soft_masking else seq_str.upper()
 
         self.fasta_dict = sequences
         return self.fasta_dict
@@ -162,11 +195,7 @@ class GFFSequenceExtractor:
         """
         Extracts genomic sub-sequences bounded by primary GFF features (plus optional flanks)
         and adjusts coordinates of overlapping secondary GFF features onto extracted sequence frames.
-
-        Mathematical/Biological bias:
-            Reverse complements sub-sequences on the negative strand and maps secondary relative coordinates:
-            `adj_start = ext_end - c_end + 1`
-            `adj_end = ext_end - c_start + 1`
+        Filters sequences exceeding the maximum IUPAC density threshold (default > 5%).
 
         :return: Tuple containing extracted sequence dictionary and adjusted secondary GFF DataFrame.
         """
@@ -217,7 +246,12 @@ class GFFSequenceExtractor:
 
             is_neg_strand: bool = (p_strand == "-")
             if is_neg_strand:
-                subseq = reverse_complement(subseq)
+                subseq = reverse_complement(subseq, preserve_case=self.preserve_soft_masking)
+
+            # Check IUPAC degenerate density threshold
+            if calculate_iupac_density(subseq) > self.max_iupac_density:
+                # Exclude sequence exceeding high IUPAC density threshold (>5%)
+                continue
 
             seq_header: str = f"{p_fid}::{p_seqid}::{ext_start}_{ext_end}_flank{self.flank_length}"
             extracted_sequences[seq_header] = subseq
@@ -231,7 +265,7 @@ class GFFSequenceExtractor:
                             c_end: int = min(s_en, ext_end)
 
                             subseq_len: int = len(subseq)
-                            if is_neg_strand: # RESOLVED BUG-06
+                            if is_neg_strand:
                                 raw_start: int = ext_end - c_end + 1
                                 raw_end: int = ext_end - c_start + 1
                                 adj_start: int = max(1, min(raw_start, subseq_len))
@@ -329,7 +363,9 @@ def extract_and_annotate_sequences(
     primary_gff_path: Path,
     secondary_gff_path: Optional[Path] = None,
     flank_length: int = 0,
-    output_dir: Optional[Path] = None
+    output_dir: Optional[Path] = None,
+    max_iupac_density: float = 0.05,
+    preserve_soft_masking: bool = True
 ) -> Tuple[Dict[str, str], Optional[pd.DataFrame], Optional[List[Path]]]:
     """
     High-level functional API wrapper coordinating FASTA sequence parsing, primary/secondary GFF coordinate mapping,
@@ -340,13 +376,17 @@ def extract_and_annotate_sequences(
     :param secondary_gff_path: Optional Path object to secondary GFF annotation file.
     :param flank_length: Non-negative integer specifying flanking region extension.
     :param output_dir: Optional Path object specifying output directory.
+    :param max_iupac_density: Maximum allowed fraction of IUPAC degenerate bases.
+    :param preserve_soft_masking: Whether to preserve lowercase characters for soft-masked repeats.
     :return: Tuple containing extracted sequence map, adjusted GFF DataFrame, and exported file paths list.
     """
     extractor = GFFSequenceExtractor(
         fasta_path=fasta_path,
         primary_gff_path=primary_gff_path,
         secondary_gff_path=secondary_gff_path,
-        flank_length=flank_length
+        flank_length=flank_length,
+        max_iupac_density=max_iupac_density,
+        preserve_soft_masking=preserve_soft_masking
     )
     seqs, adj_df = extractor.extract_and_adjust()
 

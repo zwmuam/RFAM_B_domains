@@ -9,5 +9,10 @@ dependencies:
   - muscle>=5.1.0
   - t-coffee>=13.45
   - viennarna>=2.5.1
+  - infernal>=1.1.4
+  - trimal>=1.4.1
+  - cialign>=1.0.0
   - biopython>=1.83
   - psutil>=5.9.0
+  - pandas>=2.0.0
+  - numpy>=1.24.0
