@@ -141,9 +141,15 @@ Alignment trimming aims to remove poorly aligned or non-homologous flanking regi
 
 ## 4. Paths to optimised core-sequence alignment
 
-To analyze tens of thousands of alignments spanning thousands of 50–500 nt sequences extracted from genomic and transcriptomic settings, pipelines must balance structural accuracy, throughput, and memory consumption. Below are three candidate pathways designed for distinct operational objectives.
+To analyze tens of thousands of alignments spanning thousands of 50–500 nt sequences extracted from genomic and transcriptomic settings, pipelines must balance structural accuracy, throughput, and memory consumption. Below are four candidate pathways designed for distinct operational objectives.
 
 ```
+====================================================================================================
+PATHWAY 0: ULTRA-FAST MUSCLE5-SUPER5 PRIMARY SEQUENCE PIPELINE
+[Raw FASTA] ──> [T->U + Soft-Mask Check] ──> [MUSCLE v5 Super5 (-super5)] ──> [CIAlign / trimAl Trimming]
+Execution Time: ~0.01 - 0.05 sec/MSA | RAM: < 20 MB | Purpose: Ultra-fast screening > 100,000 datasets
+====================================================================================================
+
 ====================================================================================================
 PATHWAY 1: ULTRA-FAST HIGH-THROUGHPUT SCREENING
 [Raw FASTA] ──> [T->U + Soft-Mask Check] ──> [MAFFT L-INS-i (--ep 0.0 --adjustdirection)] ──> [CIAlign Crop-from-Ends]
@@ -181,21 +187,28 @@ Execution Time: ~10.0 - 45.0 sec/MSA | RAM: < 1 GB | Purpose: Publication-grade 
 ====================================================================================================
 ```
 
-### 4.1 Candidate Path 1: Ultra-Fast High-Throughput Screening Pipeline
+### 4.1 Candidate Path 0: Ultra-Fast MUSCLE5-Super5 Primary Sequence Pipeline
+* **Target Objective**: Ultra-fast primary sequence-based alignment and trimming for massive datasets ($> 100,000$ alignments) where computational throughput is paramount and execution must remain strictly free from any structure-aware algorithms (such as McCaskill probability matrices, ViennaRNA partition functions, or Covariance Model profile alignments).
+* **Alignment Engine**: **MUSCLE v5 Super5** (`muscle -super5 input.fasta -output output.aln`).
+* **Trimming Engine**: **CIAlign (Crop-from-Ends + Gap/Entropy Trimming)** or **trimAl** (`trimal -gappyout` / `-automated1`).
+* **Algorithmic Rationale**: MUSCLE v5 Super5 [(Edgar 2022)](https://doi.org/10.1038/s41467-022-34630-w) utilizes $k$-mer distance estimations and fast progressive guide trees without secondary structure base-pair scoring. By avoiding computationally intensive structural calculations ($\mathcal{O}(L^3)$ partition functions) or consistency transformations, Super5 achieves near-linear time complexity ($\mathcal{O}(N \log N \cdot L^2)$). Coupling Super5 alignment with lightweight primary sequence trimming tools such as CIAlign (`--crop_divergent`) [(Tumescheit et al. 2022)](https://doi.org/10.7717/peerj.12983) or trimAl [(Capella-Gutiérrez et al. 2009)](https://doi.org/10.1093/bioinformatics/btp348) effectively removes unaligned, low-complexity terminal overhangs and non-conserved gap columns based strictly on positional entropy and gap fractions. While optimized purely for primary sequence conservation without folding thermodynamics, this pathway delivers maximum execution throughput for massive sequence repositories.
+* **Performance Profile**: Runtime is $\sim 0.01 - 0.05\text{ seconds}$ per MSA (100 sequences, 200 nt). RAM usage $< 20\text{ MB}$.
+
+### 4.2 Candidate Path 1: Ultra-Fast High-Throughput Screening Pipeline
 * **Target Objective**: High-throughput preliminary screening across $> 50,000$ alignments.
 * **Alignment Engine**: **MAFFT L-INS-i** (`mafft --localpair --op 3.0 --ep 0.0 --adjustdirection --maxiterate 200`).
 * **Trimming Engine**: **CIAlign (Crop-from-Ends mode)**.
 * **Algorithmic Rationale**: MAFFT L-INS-i executes local Smith-Waterman pair consistency matching in $\mathcal{O}(N^2 \cdot L^2)$ time. Setting `--ep 0.0` allows variable flanks to overhang without inserting gap columns inside conserved cores. `--adjustdirection` detects reverse-complemented sequences. CIAlign crop-from-ends removes unaligned terminal overhangs in linear time without touching interior stem columns.
 * **Performance Profile**: Runtime is $\sim 0.1 - 0.5\text{ seconds}$ per MSA (100 sequences, 200 nt). RAM usage $< 50\text{ MB}$.
 
-### 4.2 Candidate Path 2: Balanced Structure-Aware Pipeline
+### 4.3 Candidate Path 2: Balanced Structure-Aware Pipeline
 * **Target Objective**: High-confidence motif extraction and consensus secondary structure derivation for intermediate datasets (1,000 – 10,000 alignments).
 * **Alignment Engine**: **MAFFT Q-INS-i** (`mafft --qinsi --ep 0.0 --op 2.5 --adjustdirection --maxiterate 200`) for $N \le 100$, switching dynamically to **MAFFT L-INS-i** for $N > 100$.
 * **Trimming Engine**: **Consensus Secondary Structure Masking** (`RNAalifold --noLP` / R-scape).
 * **Algorithmic Rationale**: Incorporates McCaskill base-pairing probability matrices ($P_{ij}$) into pairwise alignments. Columns involved in consensus base pairs `()`, `[]` or structural loop boundaries are masked for retention. Unstructured, non-covarying terminal flanking columns are trimmed.
 * **Performance Profile**: Runtime is $\sim 2.0 - 15.0\text{ seconds}$ per MSA. RAM usage $< 500\text{ MB}$.
 
-### 4.3 Candidate Path 3: Speed-Optimized Gold-Standard Profile Covariance Model Pipeline
+### 4.4 Candidate Path 3: Speed-Optimized Gold-Standard Profile Covariance Model Pipeline
 * **Target Objective**: Maximum-accuracy covariance model (CM) construction and statistical covariation testing via R-scape [(Rivas et al. 2017)](https://doi.org/10.1038/nmeth.4066) and Infernal [(Nawrocki et al. 2013)](https://doi.org/10.1093/bioinformatics/btt509).
 * **Pipeline Workflow**:
   1. Generate initial alignment via MAFFT L-INS-i (`--localpair --op 3.0 --ep 0.0 --adjustdirection`).
