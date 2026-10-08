@@ -5,7 +5,7 @@ Evaluation module providing scientific quality metrics for non-coding RNA multip
 Calculates Structure Conservation Index (SCI), Transitive Consistency Score (TCS),
 mutual information with APC covariation (MI-APC), consensus base-pair covariation scores,
 normalized Shannon entropy (H_N), Mean Overlap Score (MOS), pairwise sequence identity statistics,
-and records aligner execution time and peak memory footprint.
+and records aligner execution time and peak memory footprint across pre-trimming and post-trimming stages.
 """
 
 import math
@@ -25,10 +25,12 @@ from msa import RNASequenceDataset
 @dataclass
 class EvaluationMetrics:
     """
-    Data structure aggregating scientific quality evaluation metrics for a single alignment pipeline output.
+    Data structure aggregating scientific quality evaluation metrics for a single alignment pipeline output,
+    recording the trimming stage ("pre-trim" vs "post-trim").
     """
     dataset_name: str
     pipeline_name: str
+    trimming_stage: str
     structure_conservation_index_sci: float
     transitive_consistency_score_tcs: float
     mean_mi_apc_covariation: float
@@ -52,6 +54,7 @@ class EvaluationMetrics:
         return {
             "dataset": self.dataset_name,
             "pipeline": self.pipeline_name,
+            "trimming_stage": self.trimming_stage,
             "execution_time_seconds": self.execution_time_seconds,
             "memory_peak_mb": self.memory_peak_mb,
             "structure_conservation_index_sci": self.structure_conservation_index_sci,
@@ -72,6 +75,7 @@ class EvaluationMetrics:
         cls,
         dataset_name: str,
         pipeline_name: str,
+        trimming_stage: str = "pre-trim",
         execution_time_seconds: float = 0.0,
         memory_peak_mb: float = 0.0
     ) -> "EvaluationMetrics":
@@ -81,6 +85,7 @@ class EvaluationMetrics:
 
         :param dataset_name: Name of the sequence dataset.
         :param pipeline_name: Name of the alignment pipeline.
+        :param trimming_stage: "pre-trim" or "post-trim".
         :param execution_time_seconds: Elapsed execution time before failure.
         :param memory_peak_mb: Peak memory usage in MB before failure.
         :return: EvaluationMetrics instance with penalized metric values.
@@ -88,6 +93,7 @@ class EvaluationMetrics:
         return cls(
             dataset_name=dataset_name,
             pipeline_name=pipeline_name,
+            trimming_stage=trimming_stage,
             execution_time_seconds=execution_time_seconds,
             memory_peak_mb=memory_peak_mb,
             structure_conservation_index_sci=0.0,
@@ -95,7 +101,7 @@ class EvaluationMetrics:
             mean_mi_apc_covariation=0.0,
             consensus_bp_covariation_score=0.0,
             compensatory_mutation_count=0.0,
-            normalized_shannon_entropy_hn=1.0,  # Maximum disorder/entropy
+            normalized_shannon_entropy_hn=1.0,  # Maximum disorder/entropy penalty
             mean_overlap_score_mos=0.0,
             mean_sequence_similarity=0.0,
             median_sequence_similarity=0.0,
@@ -118,7 +124,7 @@ class AlignmentEvaluator:
         across all sequence pairs in a multiple sequence alignment.
         """
         aligned_dataset = RNASequenceDataset.from_fasta(alignment_fasta_path)
-        seq_list = list(aligned_dataset.sequences.values())
+        seq_list = [s.upper() for s in aligned_dataset.sequences.values()]
         if len(seq_list) < 2:
             return {
                 "mean_sequence_similarity": 100.0,
@@ -176,7 +182,7 @@ class AlignmentEvaluator:
 
         ungapped_items: List[Tuple[str, str]] = []
         for header_name, aligned_seq in aligned_sequences.items():
-            ungapped_seq: str = aligned_seq.replace("-", "").replace(".", "")
+            ungapped_seq: str = aligned_seq.replace("-", "").replace(".", "").upper()
             if ungapped_seq:
                 ungapped_items.append((header_name, ungapped_seq))
 
@@ -247,7 +253,7 @@ class AlignmentEvaluator:
 
         # Vectorized consistency score
         aligned_dataset = RNASequenceDataset.from_fasta(alignment_fasta_path)
-        seq_list = list(aligned_dataset.sequences.values())
+        seq_list = [s.upper() for s in aligned_dataset.sequences.values()]
         if len(seq_list) < 2:
             return 100.0
 
@@ -326,7 +332,7 @@ class AlignmentEvaluator:
         Calculates mutual information (MI) with Average Product Correction (APC) covariation metrics and compensatory mutation counts.
         """
         aligned_dataset = RNASequenceDataset.from_fasta(alignment_fasta_path)
-        seq_list = list(aligned_dataset.sequences.values())
+        seq_list = [s.upper() for s in aligned_dataset.sequences.values()]
         if not seq_list:
             return {
                 "mean_mi_apc_covariation": 0.0,
@@ -446,9 +452,9 @@ class AlignmentEvaluator:
         Preserves IUPAC ambiguous/degenerate nucleotide codes rather than filtering them out.
         """
         aligned_dataset = RNASequenceDataset.from_fasta(alignment_fasta_path)
-        seq_list = list(aligned_dataset.sequences.values())
+        seq_list = [s.upper() for s in aligned_dataset.sequences.values()]
         if not seq_list:
-            return 1.0  # Max entropy for empty alignment
+            return 1.0  # Max entropy penalty for empty alignment
 
         char_matrix = np.array([list(s) for s in seq_list])
         _, align_len = char_matrix.shape

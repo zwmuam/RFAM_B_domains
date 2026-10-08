@@ -2,6 +2,8 @@
 test_msa_benchmark.py
 
 Comprehensive test suite for msa.py, msa_evaluate.py, gff_sequence_extractor.py, and benchmark.py.
+Verifies preprocessing rules, IUPAC density filtering, soft-masking preservation, orientation handling,
+trimming strategies, explicit pipeline error handling without silent fallbacks, and pre/post-trim benchmark evaluation.
 """
 
 import sys
@@ -13,10 +15,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import pytest
 
-from gff_sequence_extractor import GFFSequenceExtractor
-from msa import RNASequenceDataset, AlignmentResult, Muscle5Pipeline
-from msa_evaluate import EvaluationMetrics, AlignmentEvaluator
-from benchmark import run_benchmark_workflow, convert_fasta_to_stockholm
+from gff_sequence_extractor import (
+    GFFSequenceExtractor,
+    calculate_iupac_density,
+    reverse_complement,
+    standardize_rna_sequence,
+)
+from msa import (
+    AlignmentResult,
+    Muscle5Pipeline,
+    ProfileCovarianceModelPipeline,
+    RNASequenceDataset,
+    available_pipelines,
+    trim_cialign_crop_from_ends,
+    trim_consensus_structure_masking,
+    trim_trimal_gappyout,
+)
+from msa_evaluate import AlignmentEvaluator, EvaluationMetrics
+from benchmark import convert_fasta_to_stockholm, run_benchmark_workflow
 
 
 @pytest.fixture
@@ -51,20 +67,31 @@ def sample_fasta_and_gffs(tmp_path: Path):
     return fasta_path, cluster_gff_path, ref_gff_path
 
 
-def test_rna_sequence_dataset(tmp_path: Path):
+def test_preprocessing_and_softmasking():
+    # T -> U conversion preserving soft-masking
+    seq_dna = "acgtACGT"
+    seq_rna = standardize_rna_sequence(seq_dna, convert_to_rna=True, preserve_soft_masking=True)
+    assert seq_rna == "acguACGU"
+
+    # Reverse complement preserving soft-masking and converting to RNA
+    rc_seq = standardize_rna_sequence(
+        reverse_complement(seq_rna, preserve_case=True), convert_to_rna=True, preserve_soft_masking=True
+    )
+    assert rc_seq == "ACGUacgu"
+
+
+def test_rna_sequence_dataset_iupac_filtering(tmp_path: Path):
     fasta_file = tmp_path / "test.fasta"
-    fasta_file.write_text(">seq1\nacgt\n>seq2\nagcu\n", encoding="utf-8")
+    # seq1: low IUPAC density, seq2: high IUPAC density (> 5%)
+    fasta_file.write_text(
+        ">seq1\nACGUACGUACGUACGU\n"
+        ">seq2\nACGUNRRRYSWKMBDH\n",
+        encoding="utf-8"
+    )
 
-    ds = RNASequenceDataset.from_fasta(fasta_file)
-    assert ds.dataset_name == "test"
+    ds = RNASequenceDataset.from_fasta(fasta_file, max_iupac_density=0.05)
     assert "seq1" in ds.sequences
-    assert ds.sequences["seq1"] == "ACGU"
-    assert ds.sequences["seq2"] == "AGCU"
-
-    out_file = tmp_path / "out.fasta"
-    ds.write_fasta(out_file, use_dna_encoding=True)
-    out_ds = RNASequenceDataset.from_fasta(out_file)
-    assert out_ds.sequences["seq1"] == "ACGU"
+    assert "seq2" not in ds.sequences  # Filtered due to high IUPAC density > 5%
 
 
 def test_gff_sequence_extractor(sample_fasta_and_gffs, tmp_path: Path):
@@ -91,11 +118,43 @@ def test_gff_sequence_extractor(sample_fasta_and_gffs, tmp_path: Path):
     assert (out_dir / "cluster_2.fasta").exists()
 
 
+def test_trimming_strategies(tmp_path: Path):
+    aln_fasta = tmp_path / "aln.fasta"
+    aln_fasta.write_text(
+        ">s1\n-----ACGUACGU-----\n"
+        ">s2\n-----ACGUAGCU-----\n",
+        encoding="utf-8"
+    )
+
+    # Test CIAlign crop from ends
+    crop_out = tmp_path / "crop.fasta"
+    success = trim_cialign_crop_from_ends(aln_fasta, crop_out)
+    assert success
+    assert crop_out.exists()
+    crop_ds = RNASequenceDataset.from_fasta(crop_out)
+    assert crop_ds.sequences["s1"] == "ACGUACGU"
+
+    # Test trimAl gappyout
+    trimal_out = tmp_path / "trimal.fasta"
+    success = trim_trimal_gappyout(aln_fasta, trimal_out)
+    assert success
+    assert trimal_out.exists()
+
+    # Test consensus structure masking
+    mask_out = tmp_path / "mask.fasta"
+    success = trim_consensus_structure_masking(aln_fasta, mask_out)
+    assert success
+    assert mask_out.exists()
+
+
 def test_evaluation_metrics_penalized():
-    penalized = EvaluationMetrics.create_penalized("dataset1", "dummy_pipeline", execution_time_seconds=2.5)
+    penalized = EvaluationMetrics.create_penalized(
+        "dataset1", "dummy_pipeline", trimming_stage="pre-trim", execution_time_seconds=2.5
+    )
     p_dict = penalized.to_dict()
     assert p_dict["dataset"] == "dataset1"
     assert p_dict["pipeline"] == "dummy_pipeline"
+    assert p_dict["trimming_stage"] == "pre-trim"
     assert p_dict["execution_time_seconds"] == 2.5
     assert p_dict["normalized_shannon_entropy_hn"] == 1.0
     assert p_dict["structure_conservation_index_sci"] == 0.0
@@ -143,14 +202,15 @@ def test_convert_fasta_to_stockholm(tmp_path: Path):
     assert "# STOCKHOLM 1.0" in content
 
 
-def test_pipeline_failure_handling(tmp_path: Path):
-    pipeline = Muscle5Pipeline()
-    ds = RNASequenceDataset("test", {"s1": "ACGU", "s2": "ACGU"})
+def test_pipeline_failure_handling_no_silent_fallback(tmp_path: Path):
+    pipeline = ProfileCovarianceModelPipeline()
+    ds = RNASequenceDataset("test", {"s1": "ACGUACGU", "s2": "ACGUAGCU"})
     out_path = tmp_path / "out.fna"
 
     result = pipeline.align(ds, out_path)
     assert isinstance(result, AlignmentResult)
-    assert isinstance(result.is_successful, bool)
+    if not result.is_successful:
+        assert "🛑" in result.error_message or "Missing required executables" in result.error_message or "not found" in result.error_message
 
 
 def test_run_benchmark_workflow(sample_fasta_and_gffs, tmp_path: Path):
@@ -168,6 +228,7 @@ def test_run_benchmark_workflow(sample_fasta_and_gffs, tmp_path: Path):
     assert not df.empty
     assert "dataset" in df.columns
     assert "pipeline" in df.columns
+    assert "trimming_stage" in df.columns
     assert "execution_time_seconds" in df.columns
     assert "normalized_shannon_entropy_hn" in df.columns
 

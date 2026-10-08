@@ -6,10 +6,15 @@ Benchmarking framework for non-coding RNA Multiple Sequence Alignment (MSA) algo
 Workflow:
 1. Extract annotations specific to a certain ID number (GFF "ID" attribute) from cluster.gff + input.fasta pair
    and create coordinate-shifted extraction of reference annotations (extracted FASTA, shifted/filtered reference GFF).
-2. Align every FASTA with every aligner in msa.py and output alignments in aligned FASTA (.fna) and Stockholm (.sto) format for manual inspection.
-3. Evaluate all alignments with every metric to produce per-alignment metric DataFrame. On aligner failure or missing output,
-   penalize as worst possible metric value (normalized_shannon_entropy_hn=1.0, all other metrics=0.0).
-4. Export the metric DataFrame to Excel (.xlsx) format.
+2. Align every FASTA with every aligner in msa.py and output alignments in aligned FASTA (.fna) and Stockholm (.sto) format.
+3. Apply trimming strategies (CIAlign crop-from-ends, trimAl gappyout, Consensus Secondary Structure Masking).
+4. Evaluate all alignments pre-trimming and post-trimming across every metric to produce per-alignment metric DataFrame.
+   On aligner failure or missing output, penalize as worst possible metric value
+   (normalized_shannon_entropy_hn=1.0, all other metrics=0.0).
+5. Export the metric DataFrame to Excel (.xlsx) format.
+
+Note: Strictly avoids argparse in accordance with benchmark module requirements;
+hardcodes input/output defaults in __main__.
 """
 
 from pathlib import Path
@@ -21,7 +26,14 @@ from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 
 from gff_sequence_extractor import GFFSequenceExtractor
-from msa import AlignmentResult, RNASequenceDataset, available_pipelines
+from msa import (
+    AlignmentResult,
+    RNASequenceDataset,
+    available_pipelines,
+    trim_cialign_crop_from_ends,
+    trim_consensus_structure_masking,
+    trim_trimal_gappyout,
+)
 from msa_evaluate import AlignmentEvaluator, EvaluationMetrics
 
 
@@ -46,23 +58,81 @@ def convert_fasta_to_stockholm(fasta_path: Path, sto_path: Path) -> bool:
         return False
 
 
+def _evaluate_single_alignment(
+    dataset_id: str,
+    pipe_name: str,
+    trim_stage: str,
+    aln_path: Path,
+    exec_time: float,
+    peak_mb: float,
+    mos_score: float,
+    evaluator: AlignmentEvaluator
+) -> EvaluationMetrics:
+    """
+    Evaluates quality metrics for a single aligned FASTA file (pre-trim or post-trim).
+    """
+    if not aln_path.exists() or aln_path.stat().st_size == 0:
+        return EvaluationMetrics.create_penalized(
+            dataset_name=dataset_id,
+            pipeline_name=pipe_name,
+            trimming_stage=trim_stage,
+            execution_time_seconds=exec_time,
+            memory_peak_mb=peak_mb
+        )
+
+    try:
+        sci_val: float = evaluator.calculate_structure_conservation_index(aln_path)
+        tcs_val: float = evaluator.calculate_transitive_consistency_score(aln_path)
+        cov_dict: Dict[str, float] = evaluator.calculate_structural_covariation_score(aln_path)
+        hn_val: float = evaluator.calculate_normalized_shannon_entropy(aln_path)
+        sim_dict: Dict[str, float] = evaluator.calculate_pairwise_sequence_similarity(aln_path)
+
+        return EvaluationMetrics(
+            dataset_name=dataset_id,
+            pipeline_name=pipe_name,
+            trimming_stage=trim_stage,
+            execution_time_seconds=exec_time,
+            memory_peak_mb=peak_mb,
+            structure_conservation_index_sci=sci_val,
+            transitive_consistency_score_tcs=tcs_val,
+            mean_mi_apc_covariation=cov_dict["mean_mi_apc_covariation"],
+            consensus_bp_covariation_score=cov_dict["consensus_bp_covariation_score"],
+            compensatory_mutation_count=cov_dict["compensatory_mutation_count"],
+            normalized_shannon_entropy_hn=hn_val,
+            mean_overlap_score_mos=mos_score,
+            mean_sequence_similarity=sim_dict["mean_sequence_similarity"],
+            median_sequence_similarity=sim_dict["median_sequence_similarity"],
+            min_sequence_similarity=sim_dict["min_sequence_similarity"],
+            max_sequence_similarity=sim_dict["max_sequence_similarity"],
+        )
+    except Exception:
+        return EvaluationMetrics.create_penalized(
+            dataset_name=dataset_id,
+            pipeline_name=pipe_name,
+            trimming_stage=trim_stage,
+            execution_time_seconds=exec_time,
+            memory_peak_mb=peak_mb
+        )
+
+
 def run_benchmark_workflow(
     input_fasta: Path,
     cluster_gff: Path,
-    reference_gff: Path,
+    reference_gff: Optional[Path],
     output_dir: Path,
     flank_length: int = 0
 ) -> pd.DataFrame:
     """
-    Executes the 4-step ncRNA MSA benchmark workflow:
+    Executes the ncRNA MSA benchmark workflow:
       Step 1: Extract ID-specific sequences and shifted reference GFFs.
       Step 2: Align extracted FASTAs across all pipelines and export .fna and .sto files.
-      Step 3: Evaluate all alignments across quality metrics with failure penalization.
-      Step 4: Export full metrics DataFrame to Excel (.xlsx) workbook.
+      Step 3: Apply trimming strategies (CIAlign, trimAl, Consensus SS Masking).
+      Step 4: Evaluate pre-trim and post-trim quality metrics with failure penalization.
+      Step 5: Export full metrics DataFrame to Excel (.xlsx) workbook.
 
     :param input_fasta: Path to input FASTA file containing target sequences.
     :param cluster_gff: Path to primary cluster GFF file.
-    :param reference_gff: Path to secondary/reference annotation GFF file.
+    :param reference_gff: Optional Path to secondary/reference annotation GFF file.
     :param output_dir: Destination directory path for benchmark outputs.
     :param flank_length: Flanking nucleotides length around features.
     :return: Summary DataFrame of evaluated alignment metrics.
@@ -95,7 +165,7 @@ def run_benchmark_workflow(
     metrics_list: List[EvaluationMetrics] = []
     evaluator = AlignmentEvaluator()
 
-    # Step 2 & 3: Align and Evaluate
+    # Step 2, 3, 4: Align, Trim, Evaluate Pre- and Post-Trimming
     for fasta_file in extracted_fasta_files:
         dataset: RNASequenceDataset = RNASequenceDataset.from_fasta(fasta_file)
         dataset_id = dataset.dataset_name
@@ -129,48 +199,48 @@ def run_benchmark_workflow(
             peak_mb = result.memory_peak_mb if result else 0.0
 
             if not result or not result.is_successful or not result.aligned_fasta_path or not result.aligned_fasta_path.exists():
-                penalized_metrics = EvaluationMetrics.create_penalized(
-                    dataset_name=dataset_id,
-                    pipeline_name=pipe_name,
-                    execution_time_seconds=exec_time,
-                    memory_peak_mb=peak_mb
-                )
-                metrics_list.append(penalized_metrics)
+                # Pre-trim failure
+                metrics_list.append(EvaluationMetrics.create_penalized(
+                    dataset_id, pipe_name, trimming_stage="pre-trim", execution_time_seconds=exec_time, memory_peak_mb=peak_mb
+                ))
+                # Post-trim failure
+                metrics_list.append(EvaluationMetrics.create_penalized(
+                    dataset_id, pipe_name, trimming_stage="post-trim", execution_time_seconds=exec_time, memory_peak_mb=peak_mb
+                ))
                 continue
 
             aln_path: Path = result.aligned_fasta_path
 
-            try:
-                sci_val: float = evaluator.calculate_structure_conservation_index(aln_path)
-                tcs_val: float = evaluator.calculate_transitive_consistency_score(aln_path)
-                cov_dict: Dict[str, float] = evaluator.calculate_structural_covariation_score(aln_path)
-                hn_val: float = evaluator.calculate_normalized_shannon_entropy(aln_path)
-                sim_dict: Dict[str, float] = evaluator.calculate_pairwise_sequence_similarity(aln_path)
+            # Evaluate pre-trim
+            pre_trim_metrics = _evaluate_single_alignment(
+                dataset_id, pipe_name, "pre-trim", aln_path, exec_time, peak_mb, mos_score, evaluator
+            )
+            metrics_list.append(pre_trim_metrics)
 
-                metrics = EvaluationMetrics(
-                    dataset_name=dataset_id,
-                    pipeline_name=pipe_name,
-                    execution_time_seconds=exec_time,
-                    memory_peak_mb=peak_mb,
-                    structure_conservation_index_sci=sci_val,
-                    transitive_consistency_score_tcs=tcs_val,
-                    mean_mi_apc_covariation=cov_dict["mean_mi_apc_covariation"],
-                    consensus_bp_covariation_score=cov_dict["consensus_bp_covariation_score"],
-                    compensatory_mutation_count=cov_dict["compensatory_mutation_count"],
-                    normalized_shannon_entropy_hn=hn_val,
-                    mean_overlap_score_mos=mos_score,
-                    mean_sequence_similarity=sim_dict["mean_sequence_similarity"],
-                    median_sequence_similarity=sim_dict["median_sequence_similarity"],
-                    min_sequence_similarity=sim_dict["min_sequence_similarity"],
-                    max_sequence_similarity=sim_dict["max_sequence_similarity"],
+            # Apply trimming
+            trimmed_path = cluster_alignments_dir / f"{dataset_id}_{pipe_name}_trimmed.fna"
+            trimmed_sto_path = cluster_alignments_dir / f"{dataset_id}_{pipe_name}_trimmed.sto"
+
+            # Trim selection based on pipeline
+            if "muscle" in pipe_name or "linsi" in pipe_name:
+                trim_cialign_crop_from_ends(aln_path, trimmed_path)
+            elif "qinsi" in pipe_name or "structural" in pipe_name:
+                trim_consensus_structure_masking(aln_path, trimmed_path)
+            else:
+                trim_trimal_gappyout(aln_path, trimmed_path)
+
+            if trimmed_path.exists():
+                convert_fasta_to_stockholm(trimmed_path, trimmed_sto_path)
+                post_trim_metrics = _evaluate_single_alignment(
+                    dataset_id, pipe_name, "post-trim", trimmed_path, exec_time, peak_mb, mos_score, evaluator
                 )
-                metrics_list.append(metrics)
-            except Exception:
+                metrics_list.append(post_trim_metrics)
+            else:
                 metrics_list.append(EvaluationMetrics.create_penalized(
-                    dataset_id, pipe_name, execution_time_seconds=exec_time, memory_peak_mb=peak_mb
+                    dataset_id, pipe_name, trimming_stage="post-trim", execution_time_seconds=exec_time, memory_peak_mb=peak_mb
                 ))
 
-    # Step 4: Export to Excel
+    # Step 5: Export to Excel
     records: List[Dict[str, Union[str, float]]] = [m.to_dict() for m in metrics_list]
     df = pd.DataFrame(records)
 
@@ -181,7 +251,7 @@ def run_benchmark_workflow(
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name="Alignment Metrics", index=False)
             if not df.empty:
-                summary_df = df.groupby("pipeline").mean(numeric_only=True).reset_index()
+                summary_df = df.groupby(["pipeline", "trimming_stage"]).mean(numeric_only=True).reset_index()
                 summary_df.to_excel(writer, sheet_name="Pipeline Means Summary", index=False)
     except Exception:
         csv_path = excel_path.with_suffix(".csv")
@@ -191,6 +261,7 @@ def run_benchmark_workflow(
 
 
 if __name__ == "__main__":
+    # Hardcoded default path settings (argparse strictly excluded)
     features_to_extract = Path("cluster.gff")
     reference_annotations = Path("reference.gff")
     fasta_file = Path("input.fasta")
