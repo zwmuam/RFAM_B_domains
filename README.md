@@ -29,7 +29,6 @@ The framework operates via an enhanced 5-step benchmarking workflow:
    - **Pathway 3**: Speed-Optimized Gold-Standard Profile Covariance Model Pipeline (`cmbuild` + `cmalign --glocal`)
    - MAFFT X-INS-i, R-Coffee, and Structural Encoding
 
-   *Note*: Silent fallbacks to scientifically dubious defaults are strictly prohibited. Missing external binaries raise clear, explicit errors flagged with 🛑.
 3. **Alignment Trimming (`msa.py`)**:
    Applies trimming strategies post-alignment:
    - **CIAlign Crop-from-ends**: Trims unaligned terminal overhangs while preserving internal structural core columns.
