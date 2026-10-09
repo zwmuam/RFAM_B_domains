@@ -57,10 +57,10 @@ conda activate msa_benchmark_msa
 
 | Pathway / Method | Alignment Engine | Trimming Engine | Objective & Purpose | Error Policy |
 | :--- | :--- | :--- | :--- | :--- |
-| **Pathway 0** | MUSCLE v5 Super5 | CIAlign Crop-from-ends / trimAl | Ultra-fast primary sequence screening ($> 100,000$ alignments) | Explicit error if missing 🛑 |
-| **Pathway 1** | MAFFT L-INS-i | CIAlign Crop-from-ends | High-throughput local pair consistency matching | Explicit error if missing 🛑 |
-| **Pathway 2** | MAFFT Q-INS-i / L-INS-i | Consensus Structure Masking | Structure-aware base-pairing probability alignment | Explicit error if missing 🛑 |
-| **Pathway 3** | Infernal `cmbuild` + `cmalign --glocal` | Profile Match-State Truncation | Speed-optimized profile Covariance Model alignment | Explicit error if missing 🛑 |
+| **Pathway 0** | MUSCLE v5 Super5 | CIAlign Crop-from-ends / trimAl | Ultra-fast primary sequence screening ($> 100,000$ alignments) |
+| **Pathway 1** | MAFFT L-INS-i | CIAlign Crop-from-ends | High-throughput local pair consistency matching |
+| **Pathway 2** | MAFFT Q-INS-i / L-INS-i | Consensus Structure Masking | Structure-aware base-pairing probability alignment |
+| **Pathway 3** | Infernal `cmbuild` + `cmalign --glocal` | Profile Match-State Truncation | Speed-optimized profile Covariance Model alignment |
 
 ---
 
