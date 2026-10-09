@@ -1,8 +1,6 @@
 # RFAM_B_domains: Non-Coding RNA Multiple Sequence Alignment & Benchmarking Framework
 
-A modern, production-grade Python 3.10+ framework for benchmarking non-coding RNA (ncRNA) Multiple Sequence Alignment (MSA) tools and trimming strategies.
-
-The framework integrates genomic feature extraction, soft-masking preservation, IUPAC degenerate base filtering, alignment execution across sequence and structural aligners (Pathways 0–3), trimming strategies, bioinformatic metric evaluations (pre-trim and post-trim), automated Excel reporting, and visualization routines.
+A modern framework for benchmarking non-coding RNA (ncRNA) Multiple Sequence Alignment (MSA) tools and trimming strategies.
 
 ---
 
