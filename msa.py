@@ -1,13 +1,15 @@
+# fmt: off
 """
 msa.py
 
-Object-oriented framework for running Multiple Sequence Alignment (MSA) tools and trimming strategies on ncRNA sequences.
-Defines RNASequenceDataset, AlignmentResult dataclass, abstract AlignmentPipeline interface,
-and implementations for:
+Object-oriented framework for running Multiple Sequence Alignment (MSA) tools and trimming
+strategies on ncRNA sequences. Defines RNASequenceDataset, AlignmentResult dataclass, abstract
+AlignmentPipeline interface, and implementations for:
   - Pathway 0: Muscle v5 Super5 Primary Sequence Pipeline
   - Pathway 1: Ultra-Fast High-Throughput Screening Pipeline (MAFFT L-INS-i)
   - Pathway 2: Balanced Structure-Aware Pipeline (MAFFT Q-INS-i / L-INS-i)
-  - Pathway 3: Speed-Optimized Gold-Standard Profile Covariance Model Pipeline (Infernal `cmbuild` + `cmalign --glocal`)
+  - Pathway 3: Speed-Optimized Gold-Standard Profile Covariance Model Pipeline (Infernal `cmbuild`
+               + `cmalign --glocal`)
   - MAFFT X-INS-i
   - R-Coffee
   - Structural Encoding
@@ -17,10 +19,12 @@ Also includes trimming engines:
   - trimAl gappyout
   - RNAalifold Consensus Secondary Structure Masking
 
-Includes lightweight psutil memory tracking for subprocess execution.
-No silent fallbacks: explicitly raises or returns descriptive error results when external bioinformatics executables are absent.
+Includes lightweight psutil memory tracking for subprocess execution. No silent fallbacks:
+explicitly raises or returns descriptive error results when external bioinformatics
+executables are absent.
 """
 
+# built-ins
 import abc
 import shutil
 import subprocess
@@ -30,13 +34,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+# standard libraries
 import psutil
 
-from gff_sequence_extractor import (
-    calculate_iupac_density,
-    reverse_complement,
-    standardize_rna_sequence,
-)
+# internal repository/package imports
+from gff_sequence_extractor import (calculate_iupac_density,
+                                     reverse_complement,
+                                     standardize_rna_sequence)
 
 
 @dataclass(frozen=True)
@@ -50,19 +54,18 @@ class RNASequenceDataset:
     sequences: Dict[str, str]
 
     @classmethod
-    def from_fasta(
-        cls,
-        fasta_path: Path,
-        max_iupac_density: float = 0.05,
-        preserve_soft_masking: bool = True
-    ) -> "RNASequenceDataset":
+    def from_fasta(cls,
+                   fasta_path: Path,
+                   max_iupac_density: float = 0.05,
+                   preserve_soft_masking: bool = True) -> "RNASequenceDataset":
         """
         Parses a FASTA file into an RNASequenceDataset instance with standardized RNA sequences.
         Filters sequences exceeding the maximum IUPAC degenerate threshold (> 5%).
 
         :param fasta_path: Path object pointing to the input FASTA file to be read.
         :param max_iupac_density: Maximum allowed IUPAC degenerate code density (default 0.05).
-        :param preserve_soft_masking: Whether to preserve lowercase characters for soft-masked repeats.
+        :param preserve_soft_masking: Whether to preserve lowercase characters for soft-masked
+                                      repeats.
         :return: RNASequenceDataset instance containing dataset name and sequence map.
         """
         fasta_path_obj = Path(fasta_path)
@@ -88,9 +91,9 @@ class RNASequenceDataset:
             header: str = lines[0].split()[0]
             raw_seq: str = "".join(lines[1:]).strip()
             # Standardize sequence to RNA (U-containing), preserving soft-masking
-            sequence: str = standardize_rna_sequence(
-                raw_seq, convert_to_rna=True, preserve_soft_masking=preserve_soft_masking
-            )
+            sequence: str = standardize_rna_sequence(raw_seq,
+                                                     convert_to_rna=True,
+                                                     preserve_soft_masking=preserve_soft_masking)
             if sequence and calculate_iupac_density(sequence) <= max_iupac_density:
                 sequence_map[header] = sequence
 
@@ -98,15 +101,18 @@ class RNASequenceDataset:
 
     def write_fasta(self, output_path: Path, use_dna_encoding: bool = False) -> None:
         """
-        Writes sequence dataset to a standard FASTA formatted file, with optional DNA conversion (U -> T).
+        Writes sequence dataset to a standard FASTA formatted file, with optional DNA conversion
+        (U -> T).
 
         :param output_path: Destination Path object where the FASTA file will be created.
-        :param use_dna_encoding: Boolean flag indicating if U should be converted back to T for DNA tools.
+        :param use_dna_encoding: Boolean flag indicating if U should be converted back to T for
+                                 DNA tools.
         :return: None
         """
         fasta_lines: List[str] = []
         for header_name, sequence_string in self.sequences.items():
-            out_seq = sequence_string.replace("U", "T").replace("u", "t") if use_dna_encoding else sequence_string
+            out_seq = (sequence_string.replace("U", "T").replace("u", "t")
+                       if use_dna_encoding else sequence_string)
             fasta_lines.append(f">{header_name}")
             fasta_lines.append(out_seq)
 
@@ -116,7 +122,8 @@ class RNASequenceDataset:
 @dataclass
 class AlignmentResult:
     """
-    Data structure containing aligned sequences and detailed execution metadata for an alignment pipeline run.
+    Data structure containing aligned sequences and detailed execution metadata for an alignment
+    pipeline run.
     """
     pipeline_name: str
     dataset_name: str
@@ -128,11 +135,9 @@ class AlignmentResult:
     memory_peak_mb: float = 0.0
 
 
-def _run_cmd_with_memory_tracking(
-    cmd: List[str],
-    cwd: Path,
-    timeout: float = 120.0
-) -> Tuple[int, str, str, float, float]:
+def _run_cmd_with_memory_tracking(cmd: List[str],
+                                  cwd: Path,
+                                  timeout: float = 120.0) -> Tuple[int, str, str, float, float]:
     """
     Executes a subprocess command while polling process memory RSS using psutil.
 
@@ -142,7 +147,11 @@ def _run_cmd_with_memory_tracking(
     :return: Tuple of (returncode, stdout, stderr, elapsed_seconds, peak_memory_mb).
     """
     start_time = time.time()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd)
+    proc = subprocess.Popen(cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            cwd=cwd)
 
     peak_rss_bytes = 0
     try:
@@ -197,11 +206,13 @@ class AlignmentPipeline(abc.ABC):
 
 class Muscle5Pipeline(AlignmentPipeline):
     """
-    Pathway 0: MUSCLE v5 alignment pipeline supporting high-accuracy Progressive Perturbed Pairwise (PPP)
-    and Super5 modes for primary sequence alignment.
+    Pathway 0: MUSCLE v5 alignment pipeline supporting high-accuracy Progressive Perturbed Pairwise
+    (PPP) and Super5 modes for primary sequence alignment.
     """
 
-    def __init__(self, mode: str = "default", extra_args: Optional[List[str]] = None) -> None:
+    def __init__(self,
+                 mode: str = "default",
+                 extra_args: Optional[List[str]] = None) -> None:
         """Initializes Muscle5 alignment pipeline runner."""
         name = "muscle5" if mode == "default" else f"muscle5_{mode}"
         super().__init__(name)
@@ -227,7 +238,8 @@ class Muscle5Pipeline(AlignmentPipeline):
                 temp_output: Path = temp_dir_path / "output.aln"
 
                 if self.mode == "super5":
-                    cmd: List[str] = [executable, "-super5", str(temp_input), "-output", str(temp_output)]
+                    cmd: List[str] = [executable, "-super5", str(temp_input),
+                                      "-output", str(temp_output)]
                 else:
                     cmd = [executable, "-align", str(temp_input), "-output", str(temp_output)]
                     if self.mode == "stratified":
@@ -238,18 +250,26 @@ class Muscle5Pipeline(AlignmentPipeline):
                 if self.extra_args:
                     cmd.extend(self.extra_args)
 
-                retcode, stdout, stderr, elapsed, peak_mb = _run_cmd_with_memory_tracking(cmd, temp_dir_path, timeout=120)
+                retcode, stdout, stderr, elapsed, peak_mb = (
+                    _run_cmd_with_memory_tracking(cmd, temp_dir_path, timeout=120)
+                )
 
                 if retcode == 0 and temp_output.exists() and temp_output.stat().st_size > 0:
-                    aligned_dataset: RNASequenceDataset = RNASequenceDataset.from_fasta(temp_output)
+                    aligned_dataset: RNASequenceDataset = (
+                        RNASequenceDataset.from_fasta(temp_output)
+                    )
                     aligned_dataset.write_fasta(output_path)
-                    return AlignmentResult(self.name, dataset.dataset_name, aligned_dataset.sequences,
-                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed,
+                    return AlignmentResult(self.name, dataset.dataset_name,
+                                           aligned_dataset.sequences,
+                                           aligned_fasta_path=output_path,
+                                           execution_time_seconds=elapsed,
                                            memory_peak_mb=peak_mb)
                 else:
-                    return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
+                    return AlignmentResult(self.name, dataset.dataset_name, {},
+                                           is_successful=False,
                                            error_message=stderr or f"Exit code {retcode} 🛑",
-                                           execution_time_seconds=elapsed, memory_peak_mb=peak_mb)
+                                           execution_time_seconds=elapsed,
+                                           memory_peak_mb=peak_mb)
         except Exception as err:
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
                                    error_message=str(err))
@@ -257,8 +277,8 @@ class Muscle5Pipeline(AlignmentPipeline):
 
 class MafftQinsiPipeline(AlignmentPipeline):
     """
-    Pathway 2: MAFFT Q-INS-i structural alignment pipeline incorporating McCaskill base-pairing probability matrices.
-    Uses --ep 0.0 --op 2.5 --adjustdirection --maxiterate 1000 flags.
+    Pathway 2: MAFFT Q-INS-i structural alignment pipeline incorporating McCaskill base-pairing
+    probability matrices. Uses --ep 0.0 --op 2.5 --adjustdirection --maxiterate 1000 flags.
     """
 
     def __init__(self) -> None:
@@ -280,26 +300,31 @@ class MafftQinsiPipeline(AlignmentPipeline):
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_input: Path = Path(temp_dir) / "input.fasta"
                 dataset.write_fasta(temp_input)
-                cmd = [
-                    executable, "--qinsi", "--ep", "0.0", "--op", "2.5",
-                    "--adjustdirection", "--maxiterate", "1000", str(temp_input)
-                ] if "mafft-qinsi" not in executable else [
-                    executable, "--ep", "0.0", "--op", "2.5",
-                    "--adjustdirection", "--maxiterate", "1000", str(temp_input)
-                ]
+                if "mafft-qinsi" not in executable:
+                    cmd = [executable, "--qinsi", "--ep", "0.0", "--op", "2.5",
+                           "--adjustdirection", "--maxiterate", "1000", str(temp_input)]
+                else:
+                    cmd = [executable, "--ep", "0.0", "--op", "2.5",
+                           "--adjustdirection", "--maxiterate", "1000", str(temp_input)]
 
-                retcode, stdout, stderr, elapsed, peak_mb = _run_cmd_with_memory_tracking(cmd, Path(temp_dir), timeout=120)
+                retcode, stdout, stderr, elapsed, peak_mb = (
+                    _run_cmd_with_memory_tracking(cmd, Path(temp_dir), timeout=120)
+                )
 
                 if retcode == 0 and stdout.strip():
                     output_path.write_text(stdout, encoding="utf-8")
                     aligned_dataset = RNASequenceDataset.from_fasta(output_path)
-                    return AlignmentResult(self.name, dataset.dataset_name, aligned_dataset.sequences,
-                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed,
+                    return AlignmentResult(self.name, dataset.dataset_name,
+                                           aligned_dataset.sequences,
+                                           aligned_fasta_path=output_path,
+                                           execution_time_seconds=elapsed,
                                            memory_peak_mb=peak_mb)
                 else:
-                    return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
+                    return AlignmentResult(self.name, dataset.dataset_name, {},
+                                           is_successful=False,
                                            error_message=stderr or f"Exit code {retcode} 🛑",
-                                           execution_time_seconds=elapsed, memory_peak_mb=peak_mb)
+                                           execution_time_seconds=elapsed,
+                                           memory_peak_mb=peak_mb)
         except Exception as err:
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
                                    error_message=str(err))
@@ -307,8 +332,8 @@ class MafftQinsiPipeline(AlignmentPipeline):
 
 class MafftLinsiPipeline(AlignmentPipeline):
     """
-    Pathway 1: MAFFT L-INS-i local pairwise alignment pipeline with maximum consistency refinement.
-    Uses --localpair --op 3.0 --ep 0.0 --adjustdirection --maxiterate 1000 flags.
+    Pathway 1: MAFFT L-INS-i local pairwise alignment pipeline with maximum consistency
+    refinement. Uses --localpair --op 3.0 --ep 0.0 --adjustdirection --maxiterate 1000 flags.
     """
 
     def __init__(self) -> None:
@@ -330,26 +355,31 @@ class MafftLinsiPipeline(AlignmentPipeline):
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_input: Path = Path(temp_dir) / "input.fasta"
                 dataset.write_fasta(temp_input)
-                cmd = [
-                    executable, "--localpair", "--op", "3.0", "--ep", "0.0",
-                    "--adjustdirection", "--maxiterate", "1000", str(temp_input)
-                ] if "mafft-linsi" not in executable else [
-                    executable, "--op", "3.0", "--ep", "0.0",
-                    "--adjustdirection", "--maxiterate", "1000", str(temp_input)
-                ]
+                if "mafft-linsi" not in executable:
+                    cmd = [executable, "--localpair", "--op", "3.0", "--ep", "0.0",
+                           "--adjustdirection", "--maxiterate", "1000", str(temp_input)]
+                else:
+                    cmd = [executable, "--op", "3.0", "--ep", "0.0",
+                           "--adjustdirection", "--maxiterate", "1000", str(temp_input)]
 
-                retcode, stdout, stderr, elapsed, peak_mb = _run_cmd_with_memory_tracking(cmd, Path(temp_dir), timeout=120)
+                retcode, stdout, stderr, elapsed, peak_mb = (
+                    _run_cmd_with_memory_tracking(cmd, Path(temp_dir), timeout=120)
+                )
 
                 if retcode == 0 and stdout.strip():
                     output_path.write_text(stdout, encoding="utf-8")
                     aligned_dataset = RNASequenceDataset.from_fasta(output_path)
-                    return AlignmentResult(self.name, dataset.dataset_name, aligned_dataset.sequences,
-                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed,
+                    return AlignmentResult(self.name, dataset.dataset_name,
+                                           aligned_dataset.sequences,
+                                           aligned_fasta_path=output_path,
+                                           execution_time_seconds=elapsed,
                                            memory_peak_mb=peak_mb)
                 else:
-                    return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
+                    return AlignmentResult(self.name, dataset.dataset_name, {},
+                                           is_successful=False,
                                            error_message=stderr or f"Exit code {retcode} 🛑",
-                                           execution_time_seconds=elapsed, memory_peak_mb=peak_mb)
+                                           execution_time_seconds=elapsed,
+                                           memory_peak_mb=peak_mb)
         except Exception as err:
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
                                    error_message=str(err))
@@ -357,8 +387,8 @@ class MafftLinsiPipeline(AlignmentPipeline):
 
 class MafftXinsiPipeline(AlignmentPipeline):
     """
-    MAFFT X-INS-i structural alignment pipeline utilizing pairwise MXSCARNA structural alignment algorithms.
-    Uses --xinsi --ep 0.0 --adjustdirection --maxiterate 1000 flags.
+    MAFFT X-INS-i structural alignment pipeline utilizing pairwise MXSCARNA structural
+    alignment algorithms. Uses --xinsi --ep 0.0 --adjustdirection --maxiterate 1000 flags.
     """
 
     def __init__(self) -> None:
@@ -380,26 +410,31 @@ class MafftXinsiPipeline(AlignmentPipeline):
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_input: Path = Path(temp_dir) / "input.fasta"
                 dataset.write_fasta(temp_input)
-                cmd = [
-                    executable, "--xinsi", "--ep", "0.0", "--adjustdirection",
-                    "--maxiterate", "1000", str(temp_input)
-                ] if "mafft-xinsi" not in executable else [
-                    executable, "--ep", "0.0", "--adjustdirection",
-                    "--maxiterate", "1000", str(temp_input)
-                ]
+                if "mafft-xinsi" not in executable:
+                    cmd = [executable, "--xinsi", "--ep", "0.0", "--adjustdirection",
+                           "--maxiterate", "1000", str(temp_input)]
+                else:
+                    cmd = [executable, "--ep", "0.0", "--adjustdirection",
+                           "--maxiterate", "1000", str(temp_input)]
 
-                retcode, stdout, stderr, elapsed, peak_mb = _run_cmd_with_memory_tracking(cmd, Path(temp_dir), timeout=120)
+                retcode, stdout, stderr, elapsed, peak_mb = (
+                    _run_cmd_with_memory_tracking(cmd, Path(temp_dir), timeout=120)
+                )
 
                 if retcode == 0 and stdout.strip():
                     output_path.write_text(stdout, encoding="utf-8")
                     aligned_dataset = RNASequenceDataset.from_fasta(output_path)
-                    return AlignmentResult(self.name, dataset.dataset_name, aligned_dataset.sequences,
-                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed,
+                    return AlignmentResult(self.name, dataset.dataset_name,
+                                           aligned_dataset.sequences,
+                                           aligned_fasta_path=output_path,
+                                           execution_time_seconds=elapsed,
                                            memory_peak_mb=peak_mb)
                 else:
-                    return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
+                    return AlignmentResult(self.name, dataset.dataset_name, {},
+                                           is_successful=False,
                                            error_message=stderr or f"Exit code {retcode} 🛑",
-                                           execution_time_seconds=elapsed, memory_peak_mb=peak_mb)
+                                           execution_time_seconds=elapsed,
+                                           memory_peak_mb=peak_mb)
         except Exception as err:
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
                                    error_message=str(err))
@@ -407,7 +442,8 @@ class MafftXinsiPipeline(AlignmentPipeline):
 
 class RCoffeePipeline(AlignmentPipeline):
     """
-    R-Coffee alignment pipeline incorporating secondary structure folding predictions into consistency libraries.
+    R-Coffee alignment pipeline incorporating secondary structure folding predictions into
+    consistency libraries.
     """
 
     def __init__(self) -> None:
@@ -431,21 +467,29 @@ class RCoffeePipeline(AlignmentPipeline):
                 temp_input: Path = temp_dir_path / "input.fasta"
                 dataset.write_fasta(temp_input)
                 temp_out: Path = temp_dir_path / "rcoffee_out.aln"
-                cmd = [executable, "-seq", str(temp_input.resolve()), "-mode", "rcoffee", "-output", "fasta_aln",
+                cmd = [executable, "-seq", str(temp_input.resolve()),
+                       "-mode", "rcoffee",
+                       "-output", "fasta_aln",
                        "-outfile", str(temp_out.resolve())]
 
-                retcode, stdout, stderr, elapsed, peak_mb = _run_cmd_with_memory_tracking(cmd, temp_dir_path, timeout=120)
+                retcode, stdout, stderr, elapsed, peak_mb = (
+                    _run_cmd_with_memory_tracking(cmd, temp_dir_path, timeout=120)
+                )
 
                 if retcode == 0 and temp_out.exists():
                     aligned_dataset = RNASequenceDataset.from_fasta(temp_out)
                     aligned_dataset.write_fasta(output_path)
-                    return AlignmentResult(self.name, dataset.dataset_name, aligned_dataset.sequences,
-                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed,
+                    return AlignmentResult(self.name, dataset.dataset_name,
+                                           aligned_dataset.sequences,
+                                           aligned_fasta_path=output_path,
+                                           execution_time_seconds=elapsed,
                                            memory_peak_mb=peak_mb)
                 else:
-                    return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
+                    return AlignmentResult(self.name, dataset.dataset_name, {},
+                                           is_successful=False,
                                            error_message=stderr or f"Exit code {retcode} 🛑",
-                                           execution_time_seconds=elapsed, memory_peak_mb=peak_mb)
+                                           execution_time_seconds=elapsed,
+                                           memory_peak_mb=peak_mb)
         except Exception as err:
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
                                    error_message=str(err))
@@ -477,24 +521,31 @@ class StructuralEncodingPipeline(AlignmentPipeline):
                 temp_dir_path: Path = Path(temporary_directory)
                 temp_input: Path = temp_dir_path / "input.fasta"
                 dataset.write_fasta(temp_input)
-                mafft_cmd = [
-                    executable, "--qinsi", "--ep", "0.0", "--maxiterate", "1000", str(temp_input)
-                ] if "mafft-qinsi" in executable or "qinsi" in executable else [
-                    executable, "--globalpair", "--ep", "0.0", "--maxiterate", "1000", str(temp_input)
-                ]
+                if "mafft-qinsi" in executable or "qinsi" in executable:
+                    mafft_cmd = [executable, "--qinsi", "--ep", "0.0",
+                                 "--maxiterate", "1000", str(temp_input)]
+                else:
+                    mafft_cmd = [executable, "--globalpair", "--ep", "0.0",
+                                 "--maxiterate", "1000", str(temp_input)]
 
-                retcode, stdout, stderr, elapsed, peak_mb = _run_cmd_with_memory_tracking(mafft_cmd, temp_dir_path, timeout=120)
+                retcode, stdout, stderr, elapsed, peak_mb = (
+                    _run_cmd_with_memory_tracking(mafft_cmd, temp_dir_path, timeout=120)
+                )
 
                 if retcode == 0 and stdout.strip():
                     output_path.write_text(stdout, encoding="utf-8")
                     aligned_dataset = RNASequenceDataset.from_fasta(output_path)
-                    return AlignmentResult(self.name, dataset.dataset_name, aligned_dataset.sequences,
-                                           aligned_fasta_path=output_path, execution_time_seconds=elapsed,
+                    return AlignmentResult(self.name, dataset.dataset_name,
+                                           aligned_dataset.sequences,
+                                           aligned_fasta_path=output_path,
+                                           execution_time_seconds=elapsed,
                                            memory_peak_mb=peak_mb)
                 else:
-                    return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
+                    return AlignmentResult(self.name, dataset.dataset_name, {},
+                                           is_successful=False,
                                            error_message=stderr or f"Exit code {retcode} 🛑",
-                                           execution_time_seconds=elapsed, memory_peak_mb=peak_mb)
+                                           execution_time_seconds=elapsed,
+                                           memory_peak_mb=peak_mb)
         except Exception as err:
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
                                    error_message=str(err))
@@ -508,7 +559,8 @@ class ProfileCovarianceModelPipeline(AlignmentPipeline):
       3. cmbuild Round 1 (Initial CM).
       4. cmalign --glocal Round 2 (Profile re-alignment).
       5. cmbuild Round 3 (Refined CM).
-      Note: Model calibration (cmcalibrate) is skipped during screening for an 8- to 10-fold speedup.
+      Note: Model calibration (cmcalibrate) is skipped during screening for an 8- to 10-fold
+      speedup.
     """
 
     def __init__(self) -> None:
@@ -537,8 +589,9 @@ class ProfileCovarianceModelPipeline(AlignmentPipeline):
             missing_tools.append("cmalign")
 
         if missing_tools:
+            err_msg = f"Missing required executables: {', '.join(missing_tools)} 🛑"
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                   error_message=f"Missing required executables: {', '.join(missing_tools)} 🛑")
+                                   error_message=err_msg)
 
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -547,30 +600,39 @@ class ProfileCovarianceModelPipeline(AlignmentPipeline):
                 dataset.write_fasta(input_fasta)
 
                 # Step 1: Initial MAFFT L-INS-i alignment
-                init_cmd = [
-                    mafft_exec, "--localpair", "--op", "3.0", "--ep", "0.0",
-                    "--adjustdirection", "--maxiterate", "1000", str(input_fasta)
-                ] if "mafft-linsi" not in mafft_exec else [
-                    mafft_exec, "--op", "3.0", "--ep", "0.0",
-                    "--adjustdirection", "--maxiterate", "1000", str(input_fasta)
-                ]
+                if "mafft-linsi" not in mafft_exec:
+                    init_cmd = [mafft_exec, "--localpair", "--op", "3.0", "--ep", "0.0",
+                                "--adjustdirection", "--maxiterate", "1000", str(input_fasta)]
+                else:
+                    init_cmd = [mafft_exec, "--op", "3.0", "--ep", "0.0",
+                                "--adjustdirection", "--maxiterate", "1000", str(input_fasta)]
 
-                retcode, stdout, stderr, elapsed1, peak1 = _run_cmd_with_memory_tracking(init_cmd, temp_dir_path, timeout=120)
+                retcode, stdout, stderr, elapsed1, peak1 = (
+                    _run_cmd_with_memory_tracking(init_cmd, temp_dir_path, timeout=120)
+                )
                 if retcode != 0 or not stdout.strip():
-                    return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                           error_message=stderr or f"MAFFT initial failed with code {retcode} 🛑",
-                                           execution_time_seconds=elapsed1, memory_peak_mb=peak1)
+                    err_msg = stderr or f"MAFFT initial failed code {retcode} 🛑"
+                    return AlignmentResult(self.name, dataset.dataset_name, {},
+                                           is_successful=False,
+                                           error_message=err_msg,
+                                           execution_time_seconds=elapsed1,
+                                           memory_peak_mb=peak1)
 
                 initial_aln_fasta = temp_dir_path / "initial_aln.fa"
                 initial_aln_fasta.write_text(stdout, encoding="utf-8")
 
                 # Step 2: RNAalifold consensus structure calculation
                 alifold_cmd = [alifold_exec, "--noLP", "--noPS", str(initial_aln_fasta)]
-                retcode, stdout, stderr, elapsed2, peak2 = _run_cmd_with_memory_tracking(alifold_cmd, temp_dir_path, timeout=60)
+                retcode, stdout, stderr, elapsed2, peak2 = (
+                    _run_cmd_with_memory_tracking(alifold_cmd, temp_dir_path, timeout=60)
+                )
                 if retcode != 0:
-                    return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                           error_message=stderr or f"RNAalifold failed with code {retcode} 🛑",
-                                           execution_time_seconds=elapsed1 + elapsed2, memory_peak_mb=max(peak1, peak2))
+                    err_msg = stderr or f"RNAalifold failed code {retcode} 🛑"
+                    return AlignmentResult(self.name, dataset.dataset_name, {},
+                                           is_successful=False,
+                                           error_message=err_msg,
+                                           execution_time_seconds=elapsed1 + elapsed2,
+                                           memory_peak_mb=max(peak1, peak2))
 
                 dbn_lines = stdout.splitlines()
                 consensus_ss = dbn_lines[1].split()[0] if len(dbn_lines) >= 2 else ""
@@ -589,21 +651,32 @@ class ProfileCovarianceModelPipeline(AlignmentPipeline):
                 # Step 3: Round 1 cmbuild
                 cm_file1 = temp_dir_path / "round1.cm"
                 cmbuild_cmd = [cmbuild_exec, str(cm_file1), str(sto_file)]
-                retcode, stdout, stderr, elapsed3, peak3 = _run_cmd_with_memory_tracking(cmbuild_cmd, temp_dir_path, timeout=120)
+                retcode, stdout, stderr, elapsed3, peak3 = (
+                    _run_cmd_with_memory_tracking(cmbuild_cmd, temp_dir_path, timeout=120)
+                )
                 if retcode != 0 or not cm_file1.exists():
-                    return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                           error_message=stderr or f"cmbuild Round 1 failed code {retcode} 🛑",
+                    err_msg = stderr or f"cmbuild Round 1 failed code {retcode} 🛑"
+                    return AlignmentResult(self.name, dataset.dataset_name, {},
+                                           is_successful=False,
+                                           error_message=err_msg,
                                            execution_time_seconds=elapsed1 + elapsed2 + elapsed3,
                                            memory_peak_mb=max(peak1, peak2, peak3))
 
                 # Step 4: Round 2 profile alignment via cmalign --glocal
                 refined_sto = temp_dir_path / "refined.sto"
-                cmalign_cmd = [cmalign_exec, "--glocal", "-o", str(refined_sto), str(cm_file1), str(input_fasta)]
-                retcode, stdout, stderr, elapsed4, peak4 = _run_cmd_with_memory_tracking(cmalign_cmd, temp_dir_path, timeout=120)
+                cmalign_cmd = [cmalign_exec, "--glocal", "-o", str(refined_sto),
+                               str(cm_file1), str(input_fasta)]
+                retcode, stdout, stderr, elapsed4, peak4 = (
+                    _run_cmd_with_memory_tracking(cmalign_cmd, temp_dir_path, timeout=120)
+                )
                 if retcode != 0 or not refined_sto.exists():
-                    return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
-                                           error_message=stderr or f"cmalign failed code {retcode} 🛑",
-                                           execution_time_seconds=elapsed1 + elapsed2 + elapsed3 + elapsed4,
+                    err_msg = stderr or f"cmalign failed code {retcode} 🛑"
+                    return AlignmentResult(self.name, dataset.dataset_name, {},
+                                           is_successful=False,
+                                           error_message=err_msg,
+                                           execution_time_seconds=(
+                                               elapsed1 + elapsed2 + elapsed3 + elapsed4
+                                           ),
                                            memory_peak_mb=max(peak1, peak2, peak3, peak4))
 
                 # Parse aligned sequences from refined.sto
@@ -623,10 +696,12 @@ class ProfileCovarianceModelPipeline(AlignmentPipeline):
                     total_time = elapsed1 + elapsed2 + elapsed3 + elapsed4
                     max_peak = max(peak1, peak2, peak3, peak4)
                     return AlignmentResult(self.name, dataset.dataset_name, aligned_seqs,
-                                           aligned_fasta_path=output_path, execution_time_seconds=total_time,
+                                           aligned_fasta_path=output_path,
+                                           execution_time_seconds=total_time,
                                            memory_peak_mb=max_peak)
                 else:
-                    return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
+                    return AlignmentResult(self.name, dataset.dataset_name, {},
+                                           is_successful=False,
                                            error_message="cmalign output empty 🛑")
         except Exception as err:
             return AlignmentResult(self.name, dataset.dataset_name, {}, is_successful=False,
@@ -644,11 +719,10 @@ def trim_cialign_crop_from_ends(alignment_fasta_path: Path, output_path: Path) -
     if cialign_exec:
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                cmd = [
-                    cialign_exec, "--infile", str(alignment_fasta_path.resolve()),
-                    "--outname", "cialign_out", "--crop_divergent", "TRUE"
-                ]
-                res = subprocess.run(cmd, capture_output=True, text=True, cwd=Path(temp_dir), timeout=60)
+                cmd = [cialign_exec, "--infile", str(alignment_fasta_path.resolve()),
+                       "--outname", "cialign_out", "--crop_divergent", "TRUE"]
+                res = subprocess.run(cmd, capture_output=True, text=True,
+                                     cwd=Path(temp_dir), timeout=60)
                 cropped_file = Path(temp_dir) / "cialign_out_cleaned.fasta"
                 if res.returncode == 0 and cropped_file.exists():
                     shutil.copy(cropped_file, output_path)
@@ -698,7 +772,8 @@ def trim_trimal_gappyout(alignment_fasta_path: Path, output_path: Path) -> bool:
     trimal_exec = shutil.which("trimal")
     if trimal_exec:
         try:
-            cmd = [trimal_exec, "-in", str(alignment_fasta_path.resolve()), "-out", str(output_path.resolve()), "-gappyout"]
+            cmd = [trimal_exec, "-in", str(alignment_fasta_path.resolve()),
+                   "-out", str(output_path.resolve()), "-gappyout"]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             return res.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0
         except Exception:
@@ -732,18 +807,18 @@ def trim_trimal_gappyout(alignment_fasta_path: Path, output_path: Path) -> bool:
 def trim_consensus_structure_masking(alignment_fasta_path: Path, output_path: Path) -> bool:
     """
     Executes RNAalifold consensus secondary structure masking.
-    Masks for retention any alignment column involved in consensus base pairs () [] or loop boundaries.
-    Trims non-covarying unaligned terminal flanking columns.
+    Masks for retention any alignment column involved in consensus base pairs () [] or loop
+    boundaries. Trims non-covarying unaligned terminal flanking columns.
     """
     alifold_exec = shutil.which("RNAalifold")
     consensus_dbn = ""
     if alifold_exec:
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                res = subprocess.run(
-                    [alifold_exec, "--noLP", "--noPS", str(alignment_fasta_path.resolve())],
-                    capture_output=True, text=True, cwd=Path(temp_dir), timeout=60
-                )
+                res = subprocess.run([alifold_exec, "--noLP", "--noPS",
+                                      str(alignment_fasta_path.resolve())],
+                                     capture_output=True, text=True,
+                                     cwd=Path(temp_dir), timeout=60)
                 lines = res.stdout.splitlines()
                 if len(lines) >= 2:
                     consensus_dbn = lines[1].split()[0]
@@ -782,3 +857,4 @@ available_pipelines: List[AlignmentPipeline] = [
     StructuralEncodingPipeline(),
     ProfileCovarianceModelPipeline(),
 ]
+# fmt: on

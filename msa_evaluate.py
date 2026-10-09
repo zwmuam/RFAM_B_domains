@@ -1,13 +1,16 @@
+# fmt: off
 """
 msa_evaluate.py
 
-Evaluation module providing scientific quality metrics for non-coding RNA multiple sequence alignments.
-Calculates Structure Conservation Index (SCI), Transitive Consistency Score (TCS),
+Evaluation module providing scientific quality metrics for non-coding RNA multiple sequence
+alignments. Calculates Structure Conservation Index (SCI), Transitive Consistency Score (TCS),
 mutual information with APC covariation (MI-APC), consensus base-pair covariation scores,
-normalized Shannon entropy (H_N), Mean Overlap Score (MOS), pairwise sequence identity statistics,
-and records aligner execution time and peak memory footprint across pre-trimming and post-trimming stages.
+normalized Shannon entropy (H_N), Mean Overlap Score (MOS), pairwise sequence identity
+statistics, and records aligner execution time and peak memory footprint across pre-trimming
+and post-trimming stages.
 """
 
+# built-ins
 import math
 import re
 import shutil
@@ -17,16 +20,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+# standard libraries
 import numpy as np
 
+# internal repository/package imports
 from msa import RNASequenceDataset
 
 
 @dataclass
 class EvaluationMetrics:
     """
-    Data structure aggregating scientific quality evaluation metrics for a single alignment pipeline output,
-    recording the trimming stage ("pre-trim" vs "post-trim").
+    Data structure aggregating scientific quality evaluation metrics for a single alignment
+    pipeline output, recording the trimming stage ("pre-trim" vs "post-trim").
     """
     dataset_name: str
     pipeline_name: str
@@ -47,38 +52,35 @@ class EvaluationMetrics:
 
     def to_dict(self) -> Dict[str, Union[str, float]]:
         """
-        Converts EvaluationMetrics dataclass attributes into a flat dictionary suitable for DataFrame creation.
+        Converts EvaluationMetrics dataclass attributes into a flat dictionary suitable for
+        DataFrame creation.
 
         :return: Dictionary mapping metric names to evaluated floating point or string values.
         """
-        return {
-            "dataset": self.dataset_name,
-            "pipeline": self.pipeline_name,
-            "trimming_stage": self.trimming_stage,
-            "execution_time_seconds": self.execution_time_seconds,
-            "memory_peak_mb": self.memory_peak_mb,
-            "structure_conservation_index_sci": self.structure_conservation_index_sci,
-            "transitive_consistency_score_tcs": self.transitive_consistency_score_tcs,
-            "mean_mi_apc_covariation": self.mean_mi_apc_covariation,
-            "consensus_bp_covariation_score": self.consensus_bp_covariation_score,
-            "compensatory_mutation_count": self.compensatory_mutation_count,
-            "normalized_shannon_entropy_hn": self.normalized_shannon_entropy_hn,
-            "mean_overlap_score_mos": self.mean_overlap_score_mos,
-            "mean_sequence_similarity": self.mean_sequence_similarity,
-            "median_sequence_similarity": self.median_sequence_similarity,
-            "min_sequence_similarity": self.min_sequence_similarity,
-            "max_sequence_similarity": self.max_sequence_similarity,
-        }
+        return {"dataset": self.dataset_name,
+                "pipeline": self.pipeline_name,
+                "trimming_stage": self.trimming_stage,
+                "execution_time_seconds": self.execution_time_seconds,
+                "memory_peak_mb": self.memory_peak_mb,
+                "structure_conservation_index_sci": self.structure_conservation_index_sci,
+                "transitive_consistency_score_tcs": self.transitive_consistency_score_tcs,
+                "mean_mi_apc_covariation": self.mean_mi_apc_covariation,
+                "consensus_bp_covariation_score": self.consensus_bp_covariation_score,
+                "compensatory_mutation_count": self.compensatory_mutation_count,
+                "normalized_shannon_entropy_hn": self.normalized_shannon_entropy_hn,
+                "mean_overlap_score_mos": self.mean_overlap_score_mos,
+                "mean_sequence_similarity": self.mean_sequence_similarity,
+                "median_sequence_similarity": self.median_sequence_similarity,
+                "min_sequence_similarity": self.min_sequence_similarity,
+                "max_sequence_similarity": self.max_sequence_similarity}
 
     @classmethod
-    def create_penalized(
-        cls,
-        dataset_name: str,
-        pipeline_name: str,
-        trimming_stage: str = "pre-trim",
-        execution_time_seconds: float = 0.0,
-        memory_peak_mb: float = 0.0
-    ) -> "EvaluationMetrics":
+    def create_penalized(cls,
+                         dataset_name: str,
+                         pipeline_name: str,
+                         trimming_stage: str = "pre-trim",
+                         execution_time_seconds: float = 0.0,
+                         memory_peak_mb: float = 0.0) -> "EvaluationMetrics":
         """
         Creates an EvaluationMetrics instance with penalized worst-case metric values
         representing aligner or evaluation failure.
@@ -90,24 +92,22 @@ class EvaluationMetrics:
         :param memory_peak_mb: Peak memory usage in MB before failure.
         :return: EvaluationMetrics instance with penalized metric values.
         """
-        return cls(
-            dataset_name=dataset_name,
-            pipeline_name=pipeline_name,
-            trimming_stage=trimming_stage,
-            execution_time_seconds=execution_time_seconds,
-            memory_peak_mb=memory_peak_mb,
-            structure_conservation_index_sci=0.0,
-            transitive_consistency_score_tcs=0.0,
-            mean_mi_apc_covariation=0.0,
-            consensus_bp_covariation_score=0.0,
-            compensatory_mutation_count=0.0,
-            normalized_shannon_entropy_hn=1.0,  # Maximum disorder/entropy penalty
-            mean_overlap_score_mos=0.0,
-            mean_sequence_similarity=0.0,
-            median_sequence_similarity=0.0,
-            min_sequence_similarity=0.0,
-            max_sequence_similarity=0.0,
-        )
+        return cls(dataset_name=dataset_name,
+                   pipeline_name=pipeline_name,
+                   trimming_stage=trimming_stage,
+                   execution_time_seconds=execution_time_seconds,
+                   memory_peak_mb=memory_peak_mb,
+                   structure_conservation_index_sci=0.0,
+                   transitive_consistency_score_tcs=0.0,
+                   mean_mi_apc_covariation=0.0,
+                   consensus_bp_covariation_score=0.0,
+                   compensatory_mutation_count=0.0,
+                   normalized_shannon_entropy_hn=1.0,  # Maximum disorder/entropy penalty
+                   mean_overlap_score_mos=0.0,
+                   mean_sequence_similarity=0.0,
+                   median_sequence_similarity=0.0,
+                   min_sequence_similarity=0.0,
+                   max_sequence_similarity=0.0)
 
 
 class AlignmentEvaluator:
@@ -126,12 +126,10 @@ class AlignmentEvaluator:
         aligned_dataset = RNASequenceDataset.from_fasta(alignment_fasta_path)
         seq_list = [s.upper() for s in aligned_dataset.sequences.values()]
         if len(seq_list) < 2:
-            return {
-                "mean_sequence_similarity": 100.0,
-                "median_sequence_similarity": 100.0,
-                "min_sequence_similarity": 100.0,
-                "max_sequence_similarity": 100.0,
-            }
+            return {"mean_sequence_similarity": 100.0,
+                    "median_sequence_similarity": 100.0,
+                    "min_sequence_similarity": 100.0,
+                    "max_sequence_similarity": 100.0}
 
         char_matrix = np.array([list(s) for s in seq_list])
         num_seqs, align_len = char_matrix.shape
@@ -151,28 +149,27 @@ class AlignmentEvaluator:
                 pair_identities.append(identity_pct)
 
         if not pair_identities:
-            return {
-                "mean_sequence_similarity": 0.0,
-                "median_sequence_similarity": 0.0,
-                "min_sequence_similarity": 0.0,
-                "max_sequence_similarity": 0.0,
-            }
+            return {"mean_sequence_similarity": 0.0,
+                    "median_sequence_similarity": 0.0,
+                    "min_sequence_similarity": 0.0,
+                    "max_sequence_similarity": 0.0}
 
         arr = np.array(pair_identities)
-        return {
-            "mean_sequence_similarity": float(np.mean(arr)),
-            "median_sequence_similarity": float(np.median(arr)),
-            "min_sequence_similarity": float(np.min(arr)),
-            "max_sequence_similarity": float(np.max(arr)),
-        }
+        return {"mean_sequence_similarity": float(np.mean(arr)),
+                "median_sequence_similarity": float(np.median(arr)),
+                "min_sequence_similarity": float(np.min(arr)),
+                "max_sequence_similarity": float(np.max(arr))}
 
     @staticmethod
     def calculate_structure_conservation_index(alignment_fasta_path: Path) -> float:
         """
-        Calculates the Structure Conservation Index (SCI) by comparing RNAalifold consensus minimum free energy (E_consensus)
-        to the mean individual sequence MFEs (E_mean) from RNAfold.
+        Calculates the Structure Conservation Index (SCI) by comparing RNAalifold consensus
+        minimum free energy (E_consensus) to the mean individual sequence MFEs (E_mean) from
+        RNAfold.
         """
-        aligned_dataset: RNASequenceDataset = RNASequenceDataset.from_fasta(alignment_fasta_path)
+        aligned_dataset: RNASequenceDataset = (
+            RNASequenceDataset.from_fasta(alignment_fasta_path)
+        )
         aligned_sequences: Dict[str, str] = aligned_dataset.sequences
         if not aligned_sequences:
             return 0.0
@@ -195,10 +192,10 @@ class AlignmentEvaluator:
                 temp_dir_path: Path = Path(temporary_directory)
                 batch_input: str = "\n".join([f">{h}\n{s}" for h, s in ungapped_items]) + "\n"
                 try:
-                    rnafold_proc = subprocess.run(
-                        [rnafold_exec, "--noPS"], input=batch_input, capture_output=True, text=True, check=True,
-                        cwd=temp_dir_path, timeout=60
-                    )
+                    rnafold_proc = subprocess.run([rnafold_exec, "--noPS"],
+                                                  input=batch_input, capture_output=True,
+                                                  text=True, check=True, cwd=temp_dir_path,
+                                                  timeout=60)
                     for line in rnafold_proc.stdout.splitlines():
                         mfe_match = re.search(r"\(\s*(-?\d+\.\d+)\)", line)
                         if mfe_match:
@@ -207,15 +204,22 @@ class AlignmentEvaluator:
                     if single_mfe_list:
                         mean_single_mfe: float = float(np.mean(single_mfe_list))
                         alifold_proc = subprocess.run(
-                            [alifold_exec, "--noLP", "--noPS", str(alignment_fasta_path.resolve())],
-                            capture_output=True, text=True, check=True, cwd=temp_dir_path, timeout=60
+                            [alifold_exec, "--noLP", "--noPS",
+                             str(alignment_fasta_path.resolve())],
+                            capture_output=True, text=True, check=True,
+                            cwd=temp_dir_path, timeout=60
                         )
-                        consensus_match = re.search(r"\(\s*(-?\d+\.\d+)\s*=\s*", alifold_proc.stdout) or re.search(
-                            r"\(\s*(-?\d+\.\d+)\)", alifold_proc.stdout)
+                        consensus_match = (
+                            re.search(r"\(\s*(-?\d+\.\d+)\s*=\s*", alifold_proc.stdout) or
+                            re.search(r"\(\s*(-?\d+\.\d+)\)", alifold_proc.stdout)
+                        )
                         if consensus_match:
                             consensus_mfe = float(consensus_match.group(1))
                             if abs(mean_single_mfe) < 1e-6 or mean_single_mfe >= 0.0:
-                                sci_val = 0.0 if abs(consensus_mfe) < 1e-6 or consensus_mfe >= 0.0 else 1.0
+                                sci_val = (
+                                    0.0 if abs(consensus_mfe) < 1e-6 or consensus_mfe >= 0.0
+                                    else 1.0
+                                )
                             else:
                                 sci_val = consensus_mfe / mean_single_mfe
                             if sci_val == 0.0 or abs(sci_val) < 1e-6:
@@ -229,20 +233,20 @@ class AlignmentEvaluator:
     @staticmethod
     def calculate_transitive_consistency_score(alignment_fasta_path: Path) -> float:
         """
-        Calculates Transitive Consistency Score (TCS) measuring column residue consistency across alignment paths
-        using T-Coffee evaluation or vectorized matrix computation.
+        Calculates Transitive Consistency Score (TCS) measuring column residue consistency across
+        alignment paths using T-Coffee evaluation or vectorized matrix computation.
         """
         tcoffee_exec: Optional[str] = shutil.which("t_coffee")
         if tcoffee_exec:
             with tempfile.TemporaryDirectory() as temporary_directory:
                 temp_dir_path: Path = Path(temporary_directory)
                 score_file: Path = temp_dir_path / "tcs.score"
-                eval_cmd = [tcoffee_exec, "-evaluate", "-aln", str(alignment_fasta_path.resolve()), "-output",
-                            "score_ascii", "-outfile", str(score_file.resolve())]
+                eval_cmd = [tcoffee_exec, "-evaluate", "-aln", str(alignment_fasta_path.resolve()),
+                            "-output", "score_ascii", "-outfile", str(score_file.resolve())]
 
                 try:
-                    eval_proc = subprocess.run(eval_cmd, capture_output=True, text=True, check=False, cwd=temp_dir_path,
-                                               timeout=60)
+                    eval_proc = subprocess.run(eval_cmd, capture_output=True, text=True,
+                                               check=False, cwd=temp_dir_path, timeout=60)
                     if eval_proc.returncode == 0 and score_file.exists():
                         file_text = score_file.read_text(encoding="utf-8")
                         match = re.search(r"SCORE\s*=\s*(\d+)", file_text)
@@ -282,8 +286,8 @@ class AlignmentEvaluator:
     @staticmethod
     def calculate_mean_overlap_score(alignments_map: Dict[str, Dict[str, str]]) -> float:
         """
-        Computes the Mean Overlap Score (MOS) measuring Jaccard consensus index across aligned residue pair positions
-        produced by different pipelines.
+        Computes the Mean Overlap Score (MOS) measuring Jaccard consensus index across aligned
+        residue pair positions produced by different pipelines.
         """
         pipeline_names = list(alignments_map.keys())
         if len(pipeline_names) < 2:
@@ -329,26 +333,25 @@ class AlignmentEvaluator:
     @staticmethod
     def calculate_structural_covariation_score(alignment_fasta_path: Path) -> Dict[str, float]:
         """
-        Calculates mutual information (MI) with Average Product Correction (APC) covariation metrics and compensatory mutation counts.
+        Calculates mutual information (MI) with Average Product Correction (APC) covariation
+        metrics and compensatory mutation counts.
         """
         aligned_dataset = RNASequenceDataset.from_fasta(alignment_fasta_path)
         seq_list = [s.upper() for s in aligned_dataset.sequences.values()]
         if not seq_list:
-            return {
-                "mean_mi_apc_covariation": 0.0,
-                "consensus_bp_covariation_score": 0.0,
-                "compensatory_mutation_count": 0.0,
-            }
+            return {"mean_mi_apc_covariation": 0.0,
+                    "consensus_bp_covariation_score": 0.0,
+                    "compensatory_mutation_count": 0.0}
 
         alifold_exec = shutil.which("RNAalifold")
         consensus_dbn = ""
         if alifold_exec:
             with tempfile.TemporaryDirectory() as temp_dir:
                 try:
-                    proc = subprocess.run(
-                        [alifold_exec, "--noLP", "--noPS", str(alignment_fasta_path.resolve())],
-                        capture_output=True, text=True, check=True, cwd=Path(temp_dir), timeout=60
-                    )
+                    proc = subprocess.run([alifold_exec, "--noLP", "--noPS",
+                                           str(alignment_fasta_path.resolve())],
+                                          capture_output=True, text=True,
+                                          check=True, cwd=Path(temp_dir), timeout=60)
                     lines = proc.stdout.splitlines()
                     if len(lines) >= 2:
                         consensus_dbn = lines[1].split()[0]
@@ -403,7 +406,9 @@ class AlignmentEvaluator:
                 outer_prod = np.outer(p_i, p_j)
                 valid_mi_cells = nonzero_mask & (outer_prod > 0)
                 mi_val = float(
-                    np.sum(p_ij[valid_mi_cells] * np.log2(p_ij[valid_mi_cells] / outer_prod[valid_mi_cells])))
+                    np.sum(p_ij[valid_mi_cells] *
+                           np.log2(p_ij[valid_mi_cells] / outer_prod[valid_mi_cells]))
+                )
 
                 mi_matrix[i, j] = mi_val
                 mi_matrix[j, i] = mi_val
@@ -418,7 +423,8 @@ class AlignmentEvaluator:
             np.fill_diagonal(mi_apc_matrix, 0.0)
 
         upper_tri_indices = np.triu_indices(align_len, k=1)
-        mean_apc_cov = float(np.mean(mi_apc_matrix[upper_tri_indices])) if len(upper_tri_indices[0]) > 0 else 0.0
+        mean_apc_cov = (float(np.mean(mi_apc_matrix[upper_tri_indices]))
+                        if len(upper_tri_indices[0]) > 0 else 0.0)
 
         bp_cov_scores = []
         compensatory_count = 0
@@ -437,19 +443,20 @@ class AlignmentEvaluator:
                 if len(valid_canonical_observed) >= 2 and bp_apc_score > 0.01:
                     compensatory_count += 1
 
-        consensus_bp_cov = float(np.mean(bp_cov_scores)) if bp_cov_scores else mean_apc_cov * 1.5
+        consensus_bp_cov = (
+            float(np.mean(bp_cov_scores)) if bp_cov_scores else mean_apc_cov * 1.5
+        )
 
-        return {
-            "mean_mi_apc_covariation": float(mean_apc_cov),
-            "consensus_bp_covariation_score": float(consensus_bp_cov),
-            "compensatory_mutation_count": float(compensatory_count),
-        }
+        return {"mean_mi_apc_covariation": float(mean_apc_cov),
+                "consensus_bp_covariation_score": float(consensus_bp_cov),
+                "compensatory_mutation_count": float(compensatory_count)}
 
     @staticmethod
     def calculate_normalized_shannon_entropy(alignment_fasta_path: Path) -> float:
         """
-        Computes column-wise Normalized Shannon Entropy (H_N) across non-gap sequence positions in the alignment.
-        Preserves IUPAC ambiguous/degenerate nucleotide codes rather than filtering them out.
+        Computes column-wise Normalized Shannon Entropy (H_N) across non-gap sequence positions
+        in the alignment. Preserves IUPAC ambiguous/degenerate nucleotide codes rather than
+        filtering them out.
         """
         aligned_dataset = RNASequenceDataset.from_fasta(alignment_fasta_path)
         seq_list = [s.upper() for s in aligned_dataset.sequences.values()]
@@ -480,3 +487,4 @@ class AlignmentEvaluator:
             return 1.0
 
         return float(np.mean(column_entropies))
+# fmt: on
