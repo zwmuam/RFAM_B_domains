@@ -55,7 +55,7 @@ conda activate msa_benchmark_msa
 
 ## Implemented Pipeline Pathways & Trimming Modes
 
-| Pathway / Method | Alignment Engine | Trimming Engine | Objective & Purpose | Error Policy |
+| Pathway / Method | Alignment Engine | Trimming Engine | Objective & Purpose |
 | :--- | :--- | :--- | :--- | :--- |
 | **Pathway 0** | MUSCLE v5 Super5 | CIAlign Crop-from-ends / trimAl | Ultra-fast primary sequence screening ($> 100,000$ alignments) |
 | **Pathway 1** | MAFFT L-INS-i | CIAlign Crop-from-ends | High-throughput local pair consistency matching |
