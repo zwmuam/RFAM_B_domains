@@ -1,3 +1,4 @@
+# fmt: off
 """
 plot_benchmark.py
 
@@ -17,8 +18,11 @@ Fixed Y-axis limits (Theoretical maximums):
 - Execution Time: [0, 30] minutes
 """
 
+# built-ins
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import Dict, List, Optional, Tuple
+
+# standard libraries
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -27,34 +31,26 @@ import seaborn as sns
 
 # Set styling
 sns.set_theme(style="whitegrid", palette="muted")
-plt.rcParams.update({
-    "font.size": 11,
-    "axes.labelsize": 12,
-    "axes.titlesize": 14,
-    "xtick.labelsize": 10,
-    "ytick.labelsize": 10,
-    "legend.fontsize": 11,
-    "figure.titlesize": 16
-})
+plt.rcParams.update({"font.size": 11,
+                     "axes.labelsize": 12,
+                     "axes.titlesize": 14,
+                     "xtick.labelsize": 10,
+                     "ytick.labelsize": 10,
+                     "legend.fontsize": 11,
+                     "figure.titlesize": 16})
 
 
-PIPELINE_RENAME_MAP = {
-    "MMseqs2_simweighted": "MMseqs2 (simweighted)",
-    "RiboSeek_None": "RiboSeek (None)",
-    "RiboSeek_simweighted": "RiboSeek (simweighted)"
-}
+PIPELINE_RENAME_MAP = {"MMseqs2_simweighted": "MMseqs2 (simweighted)",
+                       "RiboSeek_None": "RiboSeek (None)",
+                       "RiboSeek_simweighted": "RiboSeek (simweighted)"}
 
-PIPELINE_ORDER = [
-    "MMseqs2 (simweighted)",
-    "RiboSeek (None)",
-    "RiboSeek (simweighted)"
-]
+PIPELINE_ORDER = ["MMseqs2 (simweighted)",
+                  "RiboSeek (None)",
+                  "RiboSeek (simweighted)"]
 
-PIPELINE_COLORS = {
-    "MMseqs2 (simweighted)": "#9370DB",   # Mauve
-    "RiboSeek (None)": "#9ACD32",         # Yellow-Green
-    "RiboSeek (simweighted)": "#66CDAA"   # Aquamarine
-}
+PIPELINE_COLORS = {"MMseqs2 (simweighted)": "#9370DB",   # Mauve
+                   "RiboSeek (None)": "#9ACD32",         # Yellow-Green
+                   "RiboSeek (simweighted)": "#66CDAA"}  # Aquamarine
 
 
 def load_and_prepare_data(excel_path: Path) -> Tuple[pd.DataFrame, List[str]]:
@@ -81,11 +77,9 @@ def load_and_prepare_data(excel_path: Path) -> Tuple[pd.DataFrame, List[str]]:
         merged_df["full_time_min"] = merged_df["full_time"] / 60.0
 
     # Calculate mean ARI per dataset across all pipelines
-    mean_ari_per_dataset = (
-        merged_df.groupby("dataset")["adjusted_rand_score"]
-        .mean()
-        .sort_values(ascending=False)
-    )
+    mean_ari_per_dataset = (merged_df.groupby("dataset")["adjusted_rand_score"]
+                                     .mean()
+                                     .sort_values(ascending=False))
 
     all_datasets = mean_ari_per_dataset.index.tolist()
 
@@ -98,14 +92,14 @@ def load_and_prepare_data(excel_path: Path) -> Tuple[pd.DataFrame, List[str]]:
         dataset_order = all_datasets
 
     # Convert dataset column to Categorical with explicit order
-    merged_df["dataset"] = pd.Categorical(
-        merged_df["dataset"], categories=dataset_order, ordered=True
-    )
+    merged_df["dataset"] = pd.Categorical(merged_df["dataset"],
+                                          categories=dataset_order,
+                                          ordered=True)
 
     # Convert pipeline column to Categorical with explicit order
-    merged_df["pipeline"] = pd.Categorical(
-        merged_df["pipeline"], categories=PIPELINE_ORDER, ordered=True
-    )
+    merged_df["pipeline"] = pd.Categorical(merged_df["pipeline"],
+                                           categories=PIPELINE_ORDER,
+                                           ordered=True)
 
     merged_df = merged_df.sort_values(["dataset", "pipeline"])
 
@@ -117,18 +111,17 @@ def get_ordered_pipelines(df: pd.DataFrame) -> List[str]:
     Returns pipeline names ordered according to PIPELINE_ORDER.
     """
     present_pipes = df["pipeline"].unique().tolist()
-    return [p for p in PIPELINE_ORDER if p in present_pipes] + [p for p in present_pipes if p not in PIPELINE_ORDER]
+    return ([p for p in PIPELINE_ORDER if p in present_pipes] +
+            [p for p in present_pipes if p not in PIPELINE_ORDER])
 
 
-def create_comparative_bar_chart(
-    df: pd.DataFrame,
-    metric_col: str,
-    title: str,
-    ylabel: str,
-    output_path: Path,
-    y_max: Optional[float] = None,
-    annotate_values: bool = True
-) -> Path:
+def create_comparative_bar_chart(df: pd.DataFrame,
+                                 metric_col: str,
+                                 title: str,
+                                 ylabel: str,
+                                 output_path: Path,
+                                 y_max: Optional[float] = None,
+                                 annotate_values: bool = True) -> Path:
     """
     Creates a grouped comparative bar chart for a specified metric across datasets.
 
@@ -158,15 +151,13 @@ def create_comparative_bar_chart(
         offset = x - (total_width / 2) + (idx + 0.5) * bar_width
         bar_color = PIPELINE_COLORS.get(pipeline, "#7570b3")
 
-        bars = ax.bar(
-            offset,
-            values,
-            width=bar_width,
-            label=pipeline,
-            color=bar_color,
-            edgecolor="black",
-            linewidth=0.5
-        )
+        bars = ax.bar(offset,
+                      values,
+                      width=bar_width,
+                      label=pipeline,
+                      color=bar_color,
+                      edgecolor="black",
+                      linewidth=0.5)
 
         if annotate_values:
             for bar in bars:
@@ -175,21 +166,21 @@ def create_comparative_bar_chart(
                     if isinstance(height, float) and abs(height) < 10:
                         text = f"{height:.2f}"
                     else:
-                        text = f"{int(round(height)):,}" if abs(height) >= 1000 else f"{int(round(height))}"
+                        text = (f"{int(round(height)):,}" if abs(height) >= 1000
+                                else f"{int(round(height))}")
 
-                    ax.annotate(
-                        text,
-                        xy=(bar.get_x() + bar.get_width() / 2, height),
-                        xytext=(0, 3),
-                        textcoords="offset points",
-                        ha="center",
-                        va="bottom",
-                        fontsize=7,
-                        rotation=90
-                    )
+                    ax.annotate(text,
+                                xy=(bar.get_x() + bar.get_width() / 2, height),
+                                xytext=(0, 3),
+                                textcoords="offset points",
+                                ha="center",
+                                va="bottom",
+                                fontsize=7,
+                                rotation=90)
 
     ax.set_title(title, pad=15, fontweight="bold")
-    ax.set_xlabel("Dataset (Starting with Original Sequences, followed by Mean ARI Descending)", labelpad=10, fontweight="bold")
+    ax.set_xlabel("Dataset (Starting with Original Sequences, followed by Mean ARI Descending)",
+                 labelpad=10, fontweight="bold")
     ax.set_ylabel(ylabel, labelpad=10, fontweight="bold")
     ax.set_xticks(x)
     ax.set_xticklabels(datasets, rotation=45, ha="right")
@@ -212,13 +203,11 @@ def create_comparative_bar_chart(
     return output_path
 
 
-def create_pairs_breakdown_figure(
-    df: pd.DataFrame,
-    dataset_order: List[str],
-    cov_percentage: str,
-    pair_type: str,  # 'ref_pairs_in_pred' or 'pred_pairs_in_ref'
-    output_path: Path
-) -> Path:
+def create_pairs_breakdown_figure(df: pd.DataFrame,
+                                  dataset_order: List[str],
+                                  cov_percentage: str,
+                                  pair_type: str,  # 'ref_pairs_in_pred' or 'pred_pairs_in_ref'
+                                  output_path: Path) -> Path:
     """
     Creates a 1x3 panel figure comparing Accurate (Right), Faulty (Wrong), and Missing pairs
     at a specific COV coverage threshold (e.g. '50%', '75%', '90%'). Set to theoretical max (105%).
@@ -230,11 +219,9 @@ def create_pairs_breakdown_figure(
         prefix = "pred_pairs_in_ref_clusters"
         type_title = "Predicted Pairs in Reference Clusters"
 
-    metric_cols = [
-        (f"accurate_{prefix}_COV_{cov_percentage}", "Accurate (Right) Pairs (%)"),
-        (f"faulty_{prefix}_COV_{cov_percentage}", "Faulty (Wrong) Pairs (%)"),
-        (f"missing_{prefix}_COV_{cov_percentage}", "Missing Pairs (%)")
-    ]
+    metric_cols = [(f"accurate_{prefix}_COV_{cov_percentage}", "Accurate (Right) Pairs (%)"),
+                   (f"faulty_{prefix}_COV_{cov_percentage}", "Faulty (Wrong) Pairs (%)"),
+                   (f"missing_{prefix}_COV_{cov_percentage}", "Missing Pairs (%)")]
 
     fig, axes = plt.subplots(1, 3, figsize=(22, 6))
     pipelines = get_ordered_pipelines(df)
@@ -247,21 +234,22 @@ def create_pairs_breakdown_figure(
         ax = axes[ax_idx]
         for idx, pipeline in enumerate(pipelines):
             pipe_df = df[df["pipeline"] == pipeline].set_index("dataset")
-            values = [pipe_df.loc[d, col_name] if (d in pipe_df.index and col_name in pipe_df.columns) else 0 for d in dataset_order]
+            values = [pipe_df.loc[d, col_name]
+                      if (d in pipe_df.index and col_name in pipe_df.columns) else 0
+                      for d in dataset_order]
             offset = x - (total_width / 2) + (idx + 0.5) * bar_width
             bar_color = PIPELINE_COLORS.get(pipeline, "#7570b3")
 
-            ax.bar(
-                offset,
-                values,
-                width=bar_width,
-                label=pipeline,
-                color=bar_color,
-                edgecolor="black",
-                linewidth=0.5
-            )
+            ax.bar(offset,
+                   values,
+                   width=bar_width,
+                   label=pipeline,
+                   color=bar_color,
+                   edgecolor="black",
+                   linewidth=0.5)
 
-        ax.set_title(f"{status_title} ({cov_percentage} Coverage)", fontweight="bold", fontsize=12)
+        ax.set_title(f"{status_title} ({cov_percentage} Coverage)", fontweight="bold",
+                     fontsize=12)
         ax.set_ylabel("Percentage (%)", fontweight="bold", fontsize=10)
         ax.set_xticks(x)
         ax.set_xticklabels(dataset_order, rotation=45, ha="right", fontsize=8)
@@ -270,12 +258,11 @@ def create_pairs_breakdown_figure(
         if ax_idx == 0:
             ax.legend(title="Pipeline", fontsize=9, title_fontsize=10)
 
-    fig.suptitle(
-        f"{type_title} Comparison at COV {cov_percentage} (Starting with Original Sequences)",
-        fontsize=15,
-        fontweight="bold",
-        y=1.02
-    )
+    fig.suptitle(f"{type_title} Comparison at COV {cov_percentage} "
+                 "(Starting with Original Sequences)",
+                 fontsize=15,
+                 fontweight="bold",
+                 y=1.02)
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -284,23 +271,19 @@ def create_pairs_breakdown_figure(
     return output_path
 
 
-def create_summary_grid_figure(
-    df: pd.DataFrame,
-    dataset_order: List[str],
-    output_path: Path
-) -> Path:
+def create_summary_grid_figure(df: pd.DataFrame,
+                               dataset_order: List[str],
+                               output_path: Path) -> Path:
     """
     Creates a 2x2 panel summary figure showing ARI, NMI, Glued References, and Split References.
     """
     fig, axes = plt.subplots(2, 2, figsize=(18, 12))
     axes = axes.flatten()
 
-    metrics = [
-        ("adjusted_rand_score", "Adjusted Rand Index (ARI)", "ARI Score", 1.05),
-        ("normalized_mutual_info_score", "Normalized Mutual Information (NMI)", "NMI Score", 1.05),
-        ("n_glued_refs", "Glued Reference Clusters Count", "Number of Glued Refs", None),
-        ("n_split_refs", "Split Reference Clusters Count", "Number of Split Refs", None)
-    ]
+    metrics = [("adjusted_rand_score", "Adjusted Rand Index (ARI)", "ARI Score", 1.05),
+               ("normalized_mutual_info_score", "Normalized Mutual Info (NMI)", "NMI Score", 1.05),
+               ("n_glued_refs", "Glued Reference Clusters Count", "Number of Glued Refs", None),
+               ("n_split_refs", "Split Reference Clusters Count", "Number of Split Refs", None)]
 
     pipelines = get_ordered_pipelines(df)
     x = np.arange(len(dataset_order))
@@ -312,19 +295,18 @@ def create_summary_grid_figure(
         ax = axes[ax_idx]
         for idx, pipeline in enumerate(pipelines):
             pipe_df = df[df["pipeline"] == pipeline].set_index("dataset")
-            values = [pipe_df.loc[d, metric_col] if d in pipe_df.index else 0 for d in dataset_order]
+            values = [pipe_df.loc[d, metric_col] if d in pipe_df.index else 0
+                      for d in dataset_order]
             offset = x - (total_width / 2) + (idx + 0.5) * bar_width
             bar_color = PIPELINE_COLORS.get(pipeline, "#7570b3")
 
-            ax.bar(
-                offset,
-                values,
-                width=bar_width,
-                label=pipeline,
-                color=bar_color,
-                edgecolor="black",
-                linewidth=0.5
-            )
+            ax.bar(offset,
+                   values,
+                   width=bar_width,
+                   label=pipeline,
+                   color=bar_color,
+                   edgecolor="black",
+                   linewidth=0.5)
 
         ax.set_title(title, fontweight="bold", fontsize=12)
         ax.set_ylabel(ylabel, fontweight="bold", fontsize=10)
@@ -336,12 +318,10 @@ def create_summary_grid_figure(
         if ax_idx == 0:
             ax.legend(title="Pipeline", fontsize=9, title_fontsize=10)
 
-    fig.suptitle(
-        "Performance Comparison Across Pipelines (Starting with Original Sequences)",
-        fontsize=16,
-        fontweight="bold",
-        y=0.99
-    )
+    fig.suptitle("Performance Comparison Across Pipelines (Starting with Original Sequences)",
+                 fontsize=16,
+                 fontweight="bold",
+                 y=0.99)
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=300)
@@ -426,10 +406,8 @@ def generate_all_plots(excel_path: Path, output_dir: Path) -> List[Path]:
 
     # 7-12. Pair accuracy breakdown figures at COV 50%, 75%, and 90% (Theoretical max = 100%)
     cov_thresholds = ["50%", "75%", "90%"]
-    pair_types = [
-        ("ref_pairs_in_pred", "ref_pairs"),
-        ("pred_pairs_in_ref", "pred_pairs")
-    ]
+    pair_types = [("ref_pairs_in_pred", "ref_pairs"),
+                  ("pred_pairs_in_ref", "pred_pairs")]
 
     for pair_type, label in pair_types:
         for cov in cov_thresholds:
@@ -444,11 +422,13 @@ def generate_all_plots(excel_path: Path, output_dir: Path) -> List[Path]:
             generated_files.append(fig_path)
 
             # Standalone charts for accurate (right), faulty (wrong), missing pairs (Max = 105%)
-            prefix = "ref_pairs_in_pred_clusters" if pair_type == "ref_pairs_in_pred" else "pred_pairs_in_ref_clusters"
+            prefix = ("ref_pairs_in_pred_clusters" if pair_type == "ref_pairs_in_pred"
+                      else "pred_pairs_in_ref_clusters")
+            title_label = label.replace('_', ' ').title()
             p_acc = create_comparative_bar_chart(
                 df=df,
                 metric_col=f"accurate_{prefix}_COV_{cov}",
-                title=f"Accurate Pairs ({label.replace('_', ' ').title()}) at COV {cov}",
+                title=f"Accurate Pairs ({title_label}) at COV {cov}",
                 ylabel="Accurate Pairs (%)",
                 output_path=output_dir / f"{label}_accurate_cov_{clean_cov}.png",
                 y_max=105.0
@@ -458,7 +438,7 @@ def generate_all_plots(excel_path: Path, output_dir: Path) -> List[Path]:
             p_fault = create_comparative_bar_chart(
                 df=df,
                 metric_col=f"faulty_{prefix}_COV_{cov}",
-                title=f"Faulty (Wrong) Pairs ({label.replace('_', ' ').title()}) at COV {cov}",
+                title=f"Faulty (Wrong) Pairs ({title_label}) at COV {cov}",
                 ylabel="Faulty Pairs (%)",
                 output_path=output_dir / f"{label}_faulty_cov_{clean_cov}.png",
                 y_max=105.0
@@ -468,7 +448,7 @@ def generate_all_plots(excel_path: Path, output_dir: Path) -> List[Path]:
             p_miss = create_comparative_bar_chart(
                 df=df,
                 metric_col=f"missing_{prefix}_COV_{cov}",
-                title=f"Missing Pairs ({label.replace('_', ' ').title()}) at COV {cov}",
+                title=f"Missing Pairs ({title_label}) at COV {cov}",
                 ylabel="Missing Pairs (%)",
                 output_path=output_dir / f"{label}_missing_cov_{clean_cov}.png",
                 y_max=105.0
@@ -483,4 +463,5 @@ if __name__ == "__main__":
     plots_dir = Path("plots")
     if excel_file.exists():
         files = generate_all_plots(excel_file, plots_dir)
-        print(f"Successfully generated {len(files)} comparative visualization plots in '{plots_dir}'.")
+        print(f"Generated {len(files)} comparative visualization plots in '{plots_dir}'.")
+# fmt: on

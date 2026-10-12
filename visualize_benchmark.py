@@ -1,3 +1,4 @@
+# fmt: off
 """
 visualize_benchmark.py
 
@@ -10,7 +11,10 @@ Generates publication-quality figures from tests/mock_results.xlsx:
 Saves generated figures to tests/figures/ directory.
 """
 
+# built-ins
 from pathlib import Path
+
+# standard libraries
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -31,25 +35,25 @@ def create_visualizations(excel_path: Path, output_dir: Path) -> None:
     # ---------------------------------------------------------
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    metrics_to_plot = [
-        ("structure_conservation_index_sci", "Structure Conservation Index (SCI)", axes[0, 0], "Blues"),
-        ("transitive_consistency_score_tcs", "Transitive Consistency Score (TCS %)", axes[0, 1], "Greens"),
-        ("mean_mi_apc_covariation", "Mean MI-APC Covariation", axes[1, 0], "Purples"),
-        ("normalized_shannon_entropy_hn", "Normalized Shannon Entropy (H_N)", axes[1, 1], "Oranges_r"),
-    ]
+    metrics_to_plot = [("structure_conservation_index_sci",
+                        "Structure Conservation Index (SCI)", axes[0, 0], "Blues"),
+                       ("transitive_consistency_score_tcs",
+                        "Transitive Consistency Score (TCS %)", axes[0, 1], "Greens"),
+                       ("mean_mi_apc_covariation",
+                        "Mean MI-APC Covariation", axes[1, 0], "Purples"),
+                       ("normalized_shannon_entropy_hn",
+                        "Normalized Shannon Entropy (H_N)", axes[1, 1], "Oranges_r")]
 
     for col, title, ax, palette in metrics_to_plot:
-        sns.violinplot(
-            data=df,
-            x="pipeline",
-            y=col,
-            hue="pipeline",
-            ax=ax,
-            palette=palette,
-            inner="quartile",
-            density_norm="width",
-            legend=False
-        )
+        sns.violinplot(data=df,
+                       x="pipeline",
+                       y=col,
+                       hue="pipeline",
+                       ax=ax,
+                       palette=palette,
+                       inner="quartile",
+                       density_norm="width",
+                       legend=False)
         ax.set_title(title, fontsize=13, fontweight="bold")
         ax.set_xlabel("")
         ax.set_ylabel("")
@@ -65,18 +69,16 @@ def create_visualizations(excel_path: Path, output_dir: Path) -> None:
     # ---------------------------------------------------------
     mean_df = df.groupby("pipeline").mean(numeric_only=True)
 
-    heat_cols = [
-        "structure_conservation_index_sci",
-        "transitive_consistency_score_tcs",
-        "mean_mi_apc_covariation",
-        "consensus_bp_covariation_score",
-        "compensatory_mutation_count",
-        "normalized_shannon_entropy_hn",
-        "mean_overlap_score_mos",
-        "mean_sequence_similarity",
-        "execution_time_seconds",
-        "memory_peak_mb"
-    ]
+    heat_cols = ["structure_conservation_index_sci",
+                 "transitive_consistency_score_tcs",
+                 "mean_mi_apc_covariation",
+                 "consensus_bp_covariation_score",
+                 "compensatory_mutation_count",
+                 "normalized_shannon_entropy_hn",
+                 "mean_overlap_score_mos",
+                 "mean_sequence_similarity",
+                 "execution_time_seconds",
+                 "memory_peak_mb"]
 
     sub_mean = mean_df[heat_cols].copy()
 
@@ -86,16 +88,15 @@ def create_visualizations(excel_path: Path, output_dir: Path) -> None:
     norm_mean["normalized_shannon_entropy_hn"] = 1.0 - norm_mean["normalized_shannon_entropy_hn"]
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    sns.heatmap(
-        norm_mean.T,
-        annot=sub_mean.T.round(2),
-        fmt=".2f",
-        cmap="YlGnBu",
-        cbar_kws={"label": "Normalized Relative Score (0-1)"},
-        ax=ax,
-        linewidths=0.5
-    )
-    ax.set_title("Mean Alignment Pipeline Performance Matrix (Annotated Raw Values)", fontsize=14, fontweight="bold")
+    sns.heatmap(norm_mean.T,
+                annot=sub_mean.T.round(2),
+                fmt=".2f",
+                cmap="YlGnBu",
+                cbar_kws={"label": "Normalized Relative Score (0-1)"},
+                ax=ax,
+                linewidths=0.5)
+    ax.set_title("Mean Alignment Pipeline Performance Matrix (Annotated Raw Values)",
+                 fontsize=14, fontweight="bold")
     plt.xticks(rotation=25)
     plt.tight_layout()
     heatmap_path = output_dir / "pipeline_performance_heatmap.png"
@@ -107,16 +108,14 @@ def create_visualizations(excel_path: Path, output_dir: Path) -> None:
     # ---------------------------------------------------------
     fig, ax = plt.subplots(figsize=(10, 7))
 
-    scatter = ax.scatter(
-        df["execution_time_seconds"],
-        df["memory_peak_mb"],
-        c=df["structure_conservation_index_sci"],
-        cmap="viridis",
-        alpha=0.8,
-        s=60,
-        edgecolor="k",
-        linewidth=0.5
-    )
+    scatter = ax.scatter(df["execution_time_seconds"],
+                         df["memory_peak_mb"],
+                         c=df["structure_conservation_index_sci"],
+                         cmap="viridis",
+                         alpha=0.8,
+                         s=60,
+                         edgecolor="k",
+                         linewidth=0.5)
 
     cbar = plt.colorbar(scatter, ax=ax)
     cbar.set_label("Structure Conservation Index (SCI)", fontsize=12)
@@ -125,18 +124,18 @@ def create_visualizations(excel_path: Path, output_dir: Path) -> None:
     for pipe, group in df.groupby("pipeline"):
         mean_time = group["execution_time_seconds"].mean()
         mean_mem = group["memory_peak_mb"].mean()
-        ax.plot(mean_time, mean_mem, marker="X", markersize=14, color="red", markeredgecolor="black")
-        ax.annotate(
-            pipe,
-            (mean_time, mean_mem),
-            xytext=(10, 10),
-            textcoords="offset points",
-            fontweight="bold",
-            fontsize=10,
-            bbox=dict(boxstyle="round,pad=0.3", fc="yellow", alpha=0.6)
-        )
+        ax.plot(mean_time, mean_mem, marker="X", markersize=14, color="red",
+                markeredgecolor="black")
+        ax.annotate(pipe,
+                    (mean_time, mean_mem),
+                    xytext=(10, 10),
+                    textcoords="offset points",
+                    fontweight="bold",
+                    fontsize=10,
+                    bbox=dict(boxstyle="round,pad=0.3", fc="yellow", alpha=0.6))
 
-    ax.set_title("Runtime vs Peak Memory Footprint (Colored by SCI Score)", fontsize=14, fontweight="bold")
+    ax.set_title("Runtime vs Peak Memory Footprint (Colored by SCI Score)", fontsize=14,
+                 fontweight="bold")
     ax.set_xlabel("Wall-Clock Execution Time (Seconds)", fontsize=12)
     ax.set_ylabel("Peak Memory Usage (MB)", fontsize=12)
 
@@ -147,7 +146,6 @@ def create_visualizations(excel_path: Path, output_dir: Path) -> None:
 
 
 if __name__ == "__main__":
-    create_visualizations(
-        excel_path=Path("tests/mock_results.xlsx"),
-        output_dir=Path("tests/figures")
-    )
+    create_visualizations(excel_path=Path("tests/mock_results.xlsx"),
+                          output_dir=Path("tests/figures"))
+# fmt: on
