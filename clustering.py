@@ -8,7 +8,7 @@ from typing import Dict, List, Literal, Tuple, Optional, Union
 import numpy as np
 from scipy.sparse import csr_matrix
 
-from mmseq_parser import Span
+from aligners import Span
 
 
 def compare_sorted_spans(spans: List[Span]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
