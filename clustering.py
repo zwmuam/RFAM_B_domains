@@ -32,25 +32,31 @@ def compare_sorted_spans(spans: Union[List[Span], np.ndarray]) -> Tuple[np.ndarr
         starts = [s.start for s in spans]
         ends = [s.end for s in spans]
 
-    low_indices = []
-    high_indices = []
-    intersection_lengths = []
+    if not isinstance(starts, np.ndarray):
+        starts = np.array(starts, dtype=np.int64)
+        ends = np.array(ends, dtype=np.int64)
 
+    lows, highs, inters = [], [], []
+
+    # Vectorized searchsorted binary range slice for O(N log N + K) complexity
     for i in range(n):
-        start_i, end_i = starts[i], ends[i]
-        for j in range(i + 1, n):
-            start_j, end_j = starts[j], ends[j]
-            if start_j >= end_i:
-                break  # Range-bound early exit because inputs are sorted by start position
-            inter_len = min(end_i, end_j) - max(start_i, start_j)
-            if inter_len > 0:
-                low_indices.append(i)
-                high_indices.append(j)
-                intersection_lengths.append(inter_len)
+        end_i = ends[i]
+        r = np.searchsorted(starts[i + 1:], end_i, side="left") + (i + 1)
+        if r > i + 1:
+            st_js = starts[i + 1:r]
+            en_js = ends[i + 1:r]
+            overlap = np.minimum(end_i, en_js) - st_js
+            valid = overlap > 0
+            if np.any(valid):
+                js = np.arange(i + 1, r, dtype=np.int32)[valid]
+                lows.append(np.full(js.size, i, dtype=np.int32))
+                highs.append(js)
+                inters.append(overlap[valid].astype(np.int32))
 
-    return (np.array(low_indices, dtype=np.int32),
-            np.array(high_indices, dtype=np.int32),
-            np.array(intersection_lengths, dtype=np.int32))
+    if not lows:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+
+    return np.concatenate(lows), np.concatenate(highs), np.concatenate(inters)
 
 
 def jaccard_index(intersections: np.ndarray,
