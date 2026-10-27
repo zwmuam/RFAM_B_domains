@@ -1,9 +1,5 @@
 # TODO: Memory Optimization Roadmap for `aligners.py` and `domain_finder.py`
 
-This document details realistic options for optimizing memory usage when loading and processing large MMseqs2 / RiboSeek alignment outputs (e.g., ~400 GB TSV files) without sacrificing downstream accuracy or computational efficiency.
-
-Solutions are ordered by **feasibility**, balancing performance gains against implementation complexity.
-
 ---
 
 ## Tier 1: High Feasibility & High Impact (Low-to-Medium Complexity)
