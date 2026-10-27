@@ -390,6 +390,7 @@ class DomainFinder:
 
         :return: None
         """
+        n_domains = len(self.domain_index)
         with tqdm(total=len(self.targets_per_seq),
                   desc="Calculating target overlaps") as pbar:
             for seq_id, targets in self.targets_per_seq.items():
@@ -405,9 +406,14 @@ class DomainFinder:
                         if np.any(mask):
                             g_r = np.minimum(global_rows[mask], global_cols[mask])
                             g_c = np.maximum(global_rows[mask], global_cols[mask])
-                            self._overlap_rows.append(g_r)
-                            self._overlap_cols.append(g_c)
-                            self._overlap_data.append(intersections[mask])
+                            # Perform immediate local deduplication per sequence to keep memory minimal
+                            coo = coo_matrix((intersections[mask], (g_r, g_c)), shape=(n_domains, n_domains))
+                            csr = coo.tocsr()
+                            csr.sum_duplicates()
+                            coo_dedup = csr.tocoo()
+                            self._overlap_rows.append(coo_dedup.row)
+                            self._overlap_cols.append(coo_dedup.col)
+                            self._overlap_data.append(coo_dedup.data)
                 pbar.update(1)
 
     def families(self,
