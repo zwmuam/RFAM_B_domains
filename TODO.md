@@ -267,56 +267,6 @@ The joint architecture addresses the memory bottleneck holistically:
 
 ---
 
-## Joint Implementation Architecture & Phase Flowchart
-
-```
-                          [ 400+ GB BLAST-TAB TSV File ]
-                                        │
-                                        ▼
-                  Phase 1 & 2: parse_mmseqs_tsv_stream()
-             ┌──────────────────────────────────────────────────┐
-             │ - Single-pass file streaming handle               │
-             │ - Unsorted Query ID Guard (assert/raise ValueError)│
-             │ - Fast Sequence ID -> int32 conversion           │
-             │ - Yields (q_seq_int, query_spans_list/array)     │
-             └─────────────────────────┬────────────────────────┘
-                                       │ Stream query block
-                                       ▼
-                  Phase 3 & 4: On-the-Fly Domain Extraction
-             ┌──────────────────────────────────────────────────┐
-             │ - Local DPC on q_i (compare_sorted_spans)        │
-             │ - Local spurious domain filter (max_containment) │
-             │ - Assign global atomic integer domain_id         │
-             │ - Save kept DomainInstance + partner targets     │
-             │ - Discard raw query_spans_list (prompt GC)       │
-             └─────────────────────────┬────────────────────────┘
-                                       │ Accumulated Domain Instances
-                                       ▼
-                        Phase 3.2: merge_targets()
-             ┌──────────────────────────────────────────────────┐
-             │ - Group partner target spans by target sequence  │
-             │ - Connected component reduction per target seq    │
-             └─────────────────────────┬────────────────────────┘
-                                       │ Merged Target Spans
-                                       ▼
-                  Phase 5: Vectorized Sparse Edge Accumulation
-             ┌──────────────────────────────────────────────────┐
-             │ - Local pairwise target intersections            │
-             │ - Append (global_r, global_c, intersect) to      │
-             │   1D NumPy triplet buffers                       │
-             │ - SciPy COO -> CSR sum_duplicates() aggregation  │
-             └─────────────────────────┬────────────────────────┘
-                                       │ Sparse Overlap Graph Matrix
-                                       ▼
-                           Phase 5.2: families()
-             ┌──────────────────────────────────────────────────┐
-             │ - DPC clustering on domain family overlap matrix │
-             │ - GFF Export: SequenceRegistry.get_str(seq_int)  │
-             └──────────────────────────────────────────────────┘
-```
-
----
-
 ## Detailed Step-by-Step Implementation Instructions
 
 ### Phase 1: Shared Core Sequence Registry (`SequenceRegistry`)
