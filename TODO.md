@@ -151,36 +151,25 @@
 
 ---
 
-# Detailed Risk Assessment & Architectural Evaluation
-
-This section presents an exhaustive technical risk analysis for all five proposed memory and speed optimization tiers. It highlights potential edge cases, risks of data corruption, efficiency losses, and subtle algorithmic dependencies across `aligners.py`, `domain_finder.py`, and `clustering.py`.
-
----
-
 ## Technical Risk Evaluation by Proposal
+
+These problems must be solved or avoided entirely
 
 ### 1. Streaming Generator TSV Parsing (`parse_mmseqs_tsv_stream`)
 
 #### Technical Risks & Edge Cases
-- **Unsorted TSV Input Risk:** Standard MMseqs2 and RiboSeek outputs are grouped contiguously by query sequence ID (`fields[1]`). However, if an input TSV is pre-filtered, concatenated from multiple split search runs, or produced by a third-party aligner without query-grouping guarantees, a single-pass streaming parser will encounter duplicate query sequence IDs across disconnected line blocks.
-  - *Data Corruption Vector:* Disconnected query blocks will be processed and yielded as separate, partial query instances. Local Density Peak Clustering (DPC) will execute on incomplete alignment subsets, producing fragmented domain instances and incorrect cluster densities.
+- **Unsorted TSV Input Risk:** Standard MMseqs2 and RiboSeek outputs are grouped contiguously by query sequence ID (`fields[1]`). However, if an input TSV is pre-filtered, concatenated from multiple split search runs, or produced by a third-party aligner without query-grouping guarantees, a single-pass streaming parser will encounter duplicate query sequence IDs across disconnected line blocks. This should be immediately caught as an error to break faulty iteration over corrupted file. Otherwise downstream analyses become meaningless. 
 - **Scattered Local Query Region Records:** Within a single query sequence block, target hits belonging to identical local query coordinates `(query_start, query_end)` are not guaranteed to be on adjacent lines. The accumulator must maintain `current_query_dict` across the entire sequence block before yielding.
-- **Generator State Leakage & Exception Safety:** If downstream domain extraction raises an unhandled exception or terminates early (e.g., during pipeline cancellation or timeout), file handles and partially consumed generator iterators may remain open, leading to file locks or resource leakage.
-
-#### Efficiency Loss & Unforeseen Consequences
-- **Loss of Total Progress Tracking:** Traditional parsing loads all hits upfront, providing an exact query count for progress bars (`tqdm(total=len(self.sorted_queries))`). A generator cannot determine total query count beforehand without pre-scanning the file, necessitating progress indicators based on line counts or file byte offsets rather than sequence counts.
+- **Generator State Leakage & Exception Safety:** If downstream domain extraction raises an unhandled exception or terminates early (e.g., during pipeline cancellation or timeout), file handles and partially consumed generator iterators may remain open, leading to file locks or resource leakage. Ensure closing after exception.
 
 ---
 
 ### 2. String Interning (`sys.intern`) & Integer Sequence Indexing
 
 #### Technical Risks & Edge Cases
-- **Registry State Scope & Lifecycle Management:** If `SequenceRegistry` is implemented as a global singleton, string-to-int mappings persist across multiple pipeline executions in long-running processes (e.g., benchmark loops or Web API workers). This leads to unbounded memory growth and potential ID collision across unrelated sequence sets.
-- **Multiprocessing / Serialization Failure:** In multi-process benchmark or alignment pipelines (e.g., `multiprocessing` or `concurrent.futures`), integer sequence IDs mapped via process-local registries become completely invalid when passed across process boundaries. Re-encoding or pickling without the registry will cause catastrophic sequence misassignment in GFF export.
-- **Integer Type Boundary & Overflow:** Using `int32` for sequence indexing limits maximum unique sequences to $2^{31}-1$ (~2.14 billion). While sufficient for most datasets, large pangenomic alignments approaching billions of contigs require strict `int64` indexing to avoid silent integer rollover.
-
-#### Data Corruption Vectors
-- **Asymmetric String Decoding in GFF Export:** If `DomainInstance.seq_id` stores an integer but downstream tools or formatting functions (`DomainInstance.to_gff()`, `DomainInstance.to_dict()`) expect a string identifier without accessing the `SequenceRegistry`, raw integer strings (e.g., `"1042"`) will be written to GFF headers, corrupting downstream bioinformatic pipelines (e.g., `bedtools`, `gffread`).
+- **Registry State Scope & Lifecycle Management:** If `SequenceRegistry` is implemented as a global singleton, string-to-int mappings persist across multiple pipeline executions in long-running processes (e.g., benchmark loops or Web API workers). This leads to unbounded memory growth and potential ID collision across unrelated sequence sets. Ensure locality or global termination.
+- **Multiprocessing / Serialization Failure:** In multi-process benchmark or alignment pipelines (e.g., `multiprocessing` or `concurrent.futures`), integer sequence IDs mapped via process-local registries become completely invalid when passed across process boundaries. Re-encoding or pickling without the registry will cause catastrophic sequence misassignment in GFF export. Ensure the index reproducibility, especially in MPIRE parallel framework (not implemented yet)
+- **Asymmetric String Decoding in GFF Export:** If `DomainInstance.seq_id` stores an integer but downstream tools or formatting functions (`DomainInstance.to_gff()`, `DomainInstance.to_dict()`) expect a string identifier without accessing the `SequenceRegistry`, raw integer strings (e.g., `"1042"`) will be written to GFF headers, corrupting downstream bioinformatic pipelines (e.g., `bedtools`, `gffread`). Ensure downstream compatibility.
 
 ---
 
@@ -204,26 +193,21 @@ This section presents an exhaustive technical risk analysis for all five propose
   if start_j >= end_i:
       break  # no further intersections possible
   ```
-  If alignments are converted into 2D NumPy arrays without enforcing start-coordinate sorting, vectorized array operations (e.g., pairwise broadcasting or outer subtraction) will either produce incorrect overlap matrices or revert to $O(N^2)$ dense matrix checks, causing severe speed regressions for high-depth alignment regions ($N > 10,000$).
-- **`__slots__` Attribute Restriction:** Enforcing `__slots__` on `Span` and `DomainInstance` prevents dynamic assignment of arbitrary monkey-patched attributes (e.g., `span.temp_score = 0.5`). Any legacy or experimental code attempting dynamic attribute assignment will raise `AttributeError`.
-
-#### Data Corruption Vectors
-- **Strand Sign Inversion & Zero-Coordinate Bug:** Converting strand representations between integer values ($+1, -1, 0$) and GFF string characters (`'+'`, `'-'`, `'.'`) within fixed-width integer NumPy arrays (`int8` or `int32`) risks sign inversion if bitwise shifts or unsigned casts are mistakenly applied.
+  If alignments are converted into 2D NumPy arrays without enforcing start-coordinate sorting, vectorized array operations (e.g., pairwise broadcasting or outer subtraction) will either produce incorrect overlap matrices or revert to $O(N^2)$ dense matrix checks, causing severe speed regressions for high-depth alignment regions ($N > 10,000$). Ensure this never happens.
+- **`__slots__` Attribute Restriction:** Enforcing `__slots__` on `Span` and `DomainInstance` prevents dynamic assignment of arbitrary monkey-patched attributes (e.g., `span.temp_score = 0.5`). Any legacy or experimental code attempting dynamic attribute assignment will raise `AttributeError` - this is intended, but check downstream functions and correct
+- **Strand Sign Inversion & Zero-Coordinate Bug:** Converting strand representations between integer values ($+1, -1, 0$) and GFF string characters (`'+'`, `'-'`, `'.'`) within fixed-width integer NumPy arrays (`int8` or `int32`) risks sign inversion if bitwise shifts or unsigned casts are mistakenly applied. Ensure it never happens.
 
 ---
 
 ### 5. Vectorized Triplet Arrays for Overlap Graph Construction
 
 #### Technical Risks & Edge Cases
-- **Memory Spikes during Buffer Concatenation:** Accumulating overlap triplet arrays as a `list[np.ndarray]` and calling `np.concatenate()` requires temporary allocation of double the total edge array size. For 200 million overlap edges, concatenating row, column, and data arrays simultaneously can cause a sharp 4–8 GB memory spike.
-- **Canonical Upper-Triangular Edge Duplication:** In `DomainFinder.calculate_target_overlaps()`, overlap edges between domains $d_i$ and $d_j$ must be undirected and canonicalized ($r < c$).
-  - *Data Corruption Vector:* If edge orientation is inconsistent when appending to triplet arrays (e.g., appending both $(d_i, d_j)$ and $(d_j, d_i)$ across different target sequences), SciPy's `coo_matrix.sum_duplicates()` will fail to merge opposing directed edges. The resulting Jaccard overlap graph will treat $(d_i, d_j)$ and $(d_j, d_i)$ as independent edges, halving calculated edge weights and corrupting family-level DPC clustering!
+- **Canonical Upper-Triangular Edge Duplication:** In `DomainFinder.calculate_target_overlaps()`, overlap edges between domains $d_i$ and $d_j$ must be undirected and canonicalized ($r < c$). Ensure that existing graph meets these requirements, find safe bypass or drop this optimisation (Vectorized Triplet Arrays) entirely.
 
 ---
 
 # Warning Set for Future Jules Tasks
-
-Future engineering tasks and automated Jules agents modifying `aligners.py`, `domain_finder.py`, or `clustering.py` **MUST** strictly adhere to the following mandatory guidelines, invariants, and verification protocols.
+adhere to the following mandatory guidelines, invariants, and verification protocols.
 
 ---
 
@@ -233,12 +217,11 @@ Future engineering tasks and automated Jules agents modifying `aligners.py`, `do
    - All text and Python source files MUST maintain Unix LF line endings (`eol=lf`).
    - Code changes MUST strictly comply with PEP 8 Visual Indent Style (delimiter-anchored alignment, max line length $\le 99$ characters, no post-bracket newlines) protected by `# fmt: off` / `# fmt: on` annotations.
 
-2. **Explicit Error Handling for Missing Bioinformatics Dependencies:**
-   - Alignment functions (`mmseq_easy_search`, `riboseek_easy_search`, `find_domains`) MUST raise clear, explicit errors containing the emoji `🛑` when required CLI tools (`mmseqs`, `riboseek`) are missing.
-   - **Silent fallbacks or mock data generation during benchmark execution are explicitly prohibited.**
+2. **Explicit Error Handling:**
+   - Prefer raising clear, explicit errors containing. Silent fallbacks or mock data generation during benchmark execution are explicitly prohibited.
 
 3. **Memory Ceiling Guarantee (< 200 GB RAM):**
-   - Peak memory consumption across all multi-GB TSV parsing, target merging, and graph construction operations MUST NOT exceed **200 GB RAM** under any workload.
+   - Peak memory consumption across all multi-GB TSV parsing, target merging, and graph construction operations MUST NOT exceed **200 GB RAM** for datasets <1TB
 
 4. **Preserve Sequence ID Decode Invariants for Downstream GFF Output:**
    - Any integer sequence indexing (`SequenceRegistry`) MUST be fully encapsulated. All methods producing user-facing or file output (`DomainInstance.to_gff()`, `DomainInstance.to_dict()`, log messages) MUST return valid decoded sequence string identifiers.
@@ -260,12 +243,10 @@ Future engineering tasks and automated Jules agents modifying `aligners.py`, `do
 Before submitting any optimization code changes, the following test suite commands and verification steps MUST be executed and confirmed passing:
 
 ```bash
-# 1. Run full pytest suite across alignment and domain finder modules
-python3 -m pytest tests/test_domain_finder.py tests/test_msa_benchmark.py -v
+# 1. Run full pytest suite across alignment and domain finder modules Create New tests as EXISTING ARE OUTDATED OR MISSING
 
-# 2. Verify GFF export correctness and structural parity
-python3 domain_finder.py
+# 2. Check code formatting against pyproject.toml / formatting guidelines
 
-# 3. Check code formatting against pyproject.toml / formatting guidelines
+# 3. Verify equivalence of the results of original and updated results. Results should either match ones obtained prior to the code revision or be explicit correction of evident error.
 python3 -m flake8 aligners.py domain_finder.py clustering.py
 ```
