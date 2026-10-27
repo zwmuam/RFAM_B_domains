@@ -65,7 +65,7 @@ class DomainInstance(Span):
 
     instance_counter = count()
 
-    __slots__ = ("source",)
+    __slots__ = ("source", "number", "targets")
 
     def __init__(self,
                  seq_id: Any,
