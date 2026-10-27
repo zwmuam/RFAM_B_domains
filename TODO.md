@@ -1,9 +1,5 @@
 # TODO: Memory Optimization Roadmap for `aligners.py` and `domain_finder.py`
 
-This document outlines a re-evaluated memory optimization roadmap for processing multi-gigabyte (and up to 400+ GB) BLAST-TAB TSV alignment files produced by MMseqs2 or RiboSeek. The target optimization limit is strictly below **200 GB RAM** (aiming for optimal operational RAM < 10–20 GB), without sacrificing downstream efficiency, clustering speed, or GFF output correctness in `domain_finder.py`.
-
----
-
 ## Tier 1: High Feasibility & High Impact (Low-to-Medium Complexity)
 
 ### 1. Streaming Generator TSV Parsing (`parse_mmseqs_tsv_stream`)
@@ -196,21 +192,3 @@ This document outlines a re-evaluated memory optimization roadmap for processing
   - **Speed Impact:** 5x–10x faster overlap accumulation compared to Python `defaultdict(int)` tuple indexing.
 - **Necessary Workload:**
   - `domain_finder.py`: ~35–50 lines changed in `calculate_target_overlaps` and `families`.
-
----
-
-## Summary of Re-Evaluated Roadmap Metrics
-
-| Tier 1 Optimization Step | Primary Memory Impact | Estimated RAM Savings | Estimated Workload (Lines) | Downstream Compatibility |
-| :--- | :--- | :--- | :--- | :--- |
-| **1. Streaming Generator Parsing** | Offloads global TSV dict to streaming buffer | ~390+ GB (< 10 MB RAM) | 50–70 lines | 100% GFF output match |
-| **2. Sequence String Interning / Int IDs** | Eliminates redundant sequence string objects | ~50–70 GB (60–80% string RAM) | 35–50 lines | 100% GFF output match |
-| **3. Query-by-Query Domain Extraction** | Discards raw alignment spans after local DPC | ~100–150 GB (100x peak RAM) | 45–60 lines | 100% GFF output match |
-| **4. Compact Structured NumPy Storage** | Replaces Python `Span` instances with arrays | ~15–20 GB (70–85% span RAM) | 75–105 lines | 100% GFF output match |
-| **5. Disk-Backed Intermediate Storage** | Offloads target overlap graph to SQLite disk DB | ~100+ GB (< 2–4 GB RAM bound) | 70–90 lines | 100% GFF output match |
-| **6. Vectorized Triplet Overlap Arrays** | Replaces dict tuple hashing with SciPy COO | ~15–35 GB (80–90% edge RAM) | 35–50 lines | 100% GFF output match |
-
-### Total Estimated System Impact:
-- **Peak Memory Usage:** Reduced from **~400+ GB RAM down to strictly < 5–15 GB RAM** for 400 GB TSV datasets (well below the required 200 GB peak RAM limit).
-- **Total Estimated Code Changes:** ~315–425 lines across `aligners.py`, `domain_finder.py`, and `clustering.py`.
-- **Downstream Efficiency & Speed:** Preserved and enhanced (no change to DPC math or GFF output; overall execution speed expected to increase by 2x–4x due to C-vectorized NumPy operations and reduced Python GC overhead).
