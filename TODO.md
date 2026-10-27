@@ -118,6 +118,8 @@
   - `domain_finder.py`: ~30–40 lines.
   - `clustering.py`: ~25–35 lines (`compare_sorted_spans` numpy vectorized overload).
 
+---
+
 ### 5. Vectorized Triplet Arrays for Overlap Graph Construction
 - **Problem:** In `DomainFinder.calculate_target_overlaps()`, edge accumulation executes `self.target_intersections[canonical_key] += intersect` inside nested loops over every overlapping target span pair. For tens of millions of target overlaps, constructing `(r, c)` tuple keys and performing dictionary lookups creates massive overhead in Python dictionary hash tables (~100–200 bytes per edge).
 - **Technical Re-evaluation:**
@@ -146,3 +148,124 @@
   - **Speed Impact:** 5x–10x faster overlap accumulation compared to Python `defaultdict(int)` tuple indexing.
 - **Necessary Workload:**
   - `domain_finder.py`: ~35–50 lines changed in `calculate_target_overlaps` and `families`.
+
+---
+
+# Detailed Risk Assessment & Architectural Evaluation
+
+This section presents an exhaustive technical risk analysis for all five proposed memory and speed optimization tiers. It highlights potential edge cases, risks of data corruption, efficiency losses, and subtle algorithmic dependencies across `aligners.py`, `domain_finder.py`, and `clustering.py`.
+
+---
+
+## Technical Risk Evaluation by Proposal
+
+### 1. Streaming Generator TSV Parsing (`parse_mmseqs_tsv_stream`)
+
+#### Technical Risks & Edge Cases
+- **Unsorted TSV Input Risk:** Standard MMseqs2 and RiboSeek outputs are grouped contiguously by query sequence ID (`fields[1]`). However, if an input TSV is pre-filtered, concatenated from multiple split search runs, or produced by a third-party aligner without query-grouping guarantees, a single-pass streaming parser will encounter duplicate query sequence IDs across disconnected line blocks.
+  - *Data Corruption Vector:* Disconnected query blocks will be processed and yielded as separate, partial query instances. Local Density Peak Clustering (DPC) will execute on incomplete alignment subsets, producing fragmented domain instances and incorrect cluster densities.
+- **Scattered Local Query Region Records:** Within a single query sequence block, target hits belonging to identical local query coordinates `(query_start, query_end)` are not guaranteed to be on adjacent lines. The accumulator must maintain `current_query_dict` across the entire sequence block before yielding.
+- **Generator State Leakage & Exception Safety:** If downstream domain extraction raises an unhandled exception or terminates early (e.g., during pipeline cancellation or timeout), file handles and partially consumed generator iterators may remain open, leading to file locks or resource leakage.
+
+#### Efficiency Loss & Unforeseen Consequences
+- **Loss of Total Progress Tracking:** Traditional parsing loads all hits upfront, providing an exact query count for progress bars (`tqdm(total=len(self.sorted_queries))`). A generator cannot determine total query count beforehand without pre-scanning the file, necessitating progress indicators based on line counts or file byte offsets rather than sequence counts.
+
+---
+
+### 2. String Interning (`sys.intern`) & Integer Sequence Indexing
+
+#### Technical Risks & Edge Cases
+- **Registry State Scope & Lifecycle Management:** If `SequenceRegistry` is implemented as a global singleton, string-to-int mappings persist across multiple pipeline executions in long-running processes (e.g., benchmark loops or Web API workers). This leads to unbounded memory growth and potential ID collision across unrelated sequence sets.
+- **Multiprocessing / Serialization Failure:** In multi-process benchmark or alignment pipelines (e.g., `multiprocessing` or `concurrent.futures`), integer sequence IDs mapped via process-local registries become completely invalid when passed across process boundaries. Re-encoding or pickling without the registry will cause catastrophic sequence misassignment in GFF export.
+- **Integer Type Boundary & Overflow:** Using `int32` for sequence indexing limits maximum unique sequences to $2^{31}-1$ (~2.14 billion). While sufficient for most datasets, large pangenomic alignments approaching billions of contigs require strict `int64` indexing to avoid silent integer rollover.
+
+#### Data Corruption Vectors
+- **Asymmetric String Decoding in GFF Export:** If `DomainInstance.seq_id` stores an integer but downstream tools or formatting functions (`DomainInstance.to_gff()`, `DomainInstance.to_dict()`) expect a string identifier without accessing the `SequenceRegistry`, raw integer strings (e.g., `"1042"`) will be written to GFF headers, corrupting downstream bioinformatic pipelines (e.g., `bedtools`, `gffread`).
+
+---
+
+### 3. Query-by-Query On-the-Fly Domain Extraction
+
+#### Technical Risks & Edge Cases
+- **Premature Partner Target Span Deletion:** In `domain_finder.py`, `DomainFinder` executes `merge_targets()` and `calculate_target_overlaps()` *after* all query domains are extracted. These downstream steps rely on target partner alignment spans stored inside `DomainInstance.partners`.
+  - *Critical Distinction:* A target sequence $T_j$ appears as a partner across alignments belonging to *different* query sequences $Q_i$. If raw alignment spans or target partner references are garbage-collected immediately after processing sequence $Q_i$, `merge_targets()` will fail or receive empty target lists, completely destroying the target overlap graph!
+- **Global Integer Domain ID Indexing Inconsistency:** In the original `filter_spurious_domains`, global domain IDs (`self.domain_index[next(dc)]`) are assigned after sequence-level domain filtering. In streaming query-by-query processing, integer domain IDs must be assigned sequentially and atomically during extraction to ensure `self.domain_index` and `self.domains_per_seq` remain perfectly synchronized.
+
+#### Efficiency Loss & Unforeseen Consequences
+- **Garbage Collection (GC) Thrashing:** Creating and explicitly deleting millions of small temporary dictionary and list objects per query sequence triggers frequent Python GC cycles, potentially degrading throughput if Python's generational collector scans large surviving heap regions repeatedly.
+
+---
+
+### 4. Compact Structural Storage for `Span` Objects (`__slots__` & NumPy Arrays)
+
+#### Technical Risks & Edge Cases
+- **Sorting Invariant Violation in Vectorized `compare_sorted_spans`:** The current `compare_sorted_spans` in `clustering.py` strictly relies on input spans being **sorted by start coordinate** (`start_i <= start_j`). This enables the critical early-exit optimization:
+  ```python
+  if start_j >= end_i:
+      break  # no further intersections possible
+  ```
+  If alignments are converted into 2D NumPy arrays without enforcing start-coordinate sorting, vectorized array operations (e.g., pairwise broadcasting or outer subtraction) will either produce incorrect overlap matrices or revert to $O(N^2)$ dense matrix checks, causing severe speed regressions for high-depth alignment regions ($N > 10,000$).
+- **`__slots__` Attribute Restriction:** Enforcing `__slots__` on `Span` and `DomainInstance` prevents dynamic assignment of arbitrary monkey-patched attributes (e.g., `span.temp_score = 0.5`). Any legacy or experimental code attempting dynamic attribute assignment will raise `AttributeError`.
+
+#### Data Corruption Vectors
+- **Strand Sign Inversion & Zero-Coordinate Bug:** Converting strand representations between integer values ($+1, -1, 0$) and GFF string characters (`'+'`, `'-'`, `'.'`) within fixed-width integer NumPy arrays (`int8` or `int32`) risks sign inversion if bitwise shifts or unsigned casts are mistakenly applied.
+
+---
+
+### 5. Vectorized Triplet Arrays for Overlap Graph Construction
+
+#### Technical Risks & Edge Cases
+- **Memory Spikes during Buffer Concatenation:** Accumulating overlap triplet arrays as a `list[np.ndarray]` and calling `np.concatenate()` requires temporary allocation of double the total edge array size. For 200 million overlap edges, concatenating row, column, and data arrays simultaneously can cause a sharp 4–8 GB memory spike.
+- **Canonical Upper-Triangular Edge Duplication:** In `DomainFinder.calculate_target_overlaps()`, overlap edges between domains $d_i$ and $d_j$ must be undirected and canonicalized ($r < c$).
+  - *Data Corruption Vector:* If edge orientation is inconsistent when appending to triplet arrays (e.g., appending both $(d_i, d_j)$ and $(d_j, d_i)$ across different target sequences), SciPy's `coo_matrix.sum_duplicates()` will fail to merge opposing directed edges. The resulting Jaccard overlap graph will treat $(d_i, d_j)$ and $(d_j, d_i)$ as independent edges, halving calculated edge weights and corrupting family-level DPC clustering!
+
+---
+
+# Warning Set for Future Jules Tasks
+
+Future engineering tasks and automated Jules agents modifying `aligners.py`, `domain_finder.py`, or `clustering.py` **MUST** strictly adhere to the following mandatory guidelines, invariants, and verification protocols.
+
+---
+
+## Mandatory Engineering Rules & Guidelines
+
+1. **Strict Line Ending & Formatter Compliance (`.gitattributes` & PEP 8):**
+   - All text and Python source files MUST maintain Unix LF line endings (`eol=lf`).
+   - Code changes MUST strictly comply with PEP 8 Visual Indent Style (delimiter-anchored alignment, max line length $\le 99$ characters, no post-bracket newlines) protected by `# fmt: off` / `# fmt: on` annotations.
+
+2. **Explicit Error Handling for Missing Bioinformatics Dependencies:**
+   - Alignment functions (`mmseq_easy_search`, `riboseek_easy_search`, `find_domains`) MUST raise clear, explicit errors containing the emoji `🛑` when required CLI tools (`mmseqs`, `riboseek`) are missing.
+   - **Silent fallbacks or mock data generation during benchmark execution are explicitly prohibited.**
+
+3. **Memory Ceiling Guarantee (< 200 GB RAM):**
+   - Peak memory consumption across all multi-GB TSV parsing, target merging, and graph construction operations MUST NOT exceed **200 GB RAM** under any workload.
+
+4. **Preserve Sequence ID Decode Invariants for Downstream GFF Output:**
+   - Any integer sequence indexing (`SequenceRegistry`) MUST be fully encapsulated. All methods producing user-facing or file output (`DomainInstance.to_gff()`, `DomainInstance.to_dict()`, log messages) MUST return valid decoded sequence string identifiers.
+
+5. **Canonical Undirected Overlap Graph Representation:**
+   - Overlap edge accumulation MUST strictly enforce canonical ordering $r < c$ for every domain pair $(d_r, d_c)$ before sparse matrix construction.
+   - Self-overlaps ($r == c$) MUST be asserted against or dropped immediately upon calculation.
+
+6. **Sorting Invariant Preservation in Local Intersection Computation:**
+   - Any optimized, NumPy-vectorized, or C-extension implementation of `compare_sorted_spans` MUST verify that input coordinate arrays are sorted by `start` position before executing range-bound intersection checks.
+
+7. **Query-Grouping Pre-condition Verification in Streaming TSVs:**
+   - `parse_mmseqs_tsv_stream` MUST assert or check that input lines are grouped contiguously by query ID. If an unsorted TSV is detected mid-stream, it MUST raise an explicit `ValueError` instructing the user to sort the TSV by query sequence ID.
+
+---
+
+## Required Verification & Test Procedures
+
+Before submitting any optimization code changes, the following test suite commands and verification steps MUST be executed and confirmed passing:
+
+```bash
+# 1. Run full pytest suite across alignment and domain finder modules
+python3 -m pytest tests/test_domain_finder.py tests/test_msa_benchmark.py -v
+
+# 2. Verify GFF export correctness and structural parity
+python3 domain_finder.py
+
+# 3. Check code formatting against pyproject.toml / formatting guidelines
+python3 -m flake8 aligners.py domain_finder.py clustering.py
+```
