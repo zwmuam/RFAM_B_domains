@@ -250,3 +250,280 @@ Before submitting any optimization code changes, the following test suite comman
 # 3. Verify equivalence of the results of original and updated results. Results should either match ones obtained prior to the code revision or be explicit correction of evident error.
 python3 -m flake8 aligners.py domain_finder.py clustering.py
 ```
+
+---
+
+# Unified Joint Memory Optimization Roadmap & Implementation Guide
+
+## Executive Summary & System-Wide Architectural Blueprint
+
+This guide details the unified, joint implementation plan for memory-optimizing `aligners.py` and `domain_finder.py`. The primary objective is to enable processing of massive multi-GB alignment files (e.g. 400+ GB BLAST-TAB search outputs containing over 2 billion records) while strictly keeping peak memory consumption **below 200 GB RAM** (and under 10–20 GB for typical multi-GB inputs), without degrading execution speed or downstream domain family extraction accuracy.
+
+The joint architecture addresses the memory bottleneck holistically:
+1. **Upstream Alignment Ingestion (`aligners.py`):** Replaces full-file dictionary loading with single-pass query streaming (`parse_mmseqs_tsv_stream`) and zero-overhead sequence string interning/indexing (`SequenceRegistry`).
+2. **Downstream Domain Extraction (`domain_finder.py`):** Replaces global two-pass query holding with on-the-fly, query-by-query Density Peak Clustering (DPC) and local spurious domain filtering.
+3. **Data Representation & Array Operations (`clustering.py` & `aligners.py`):** Leverages compact NumPy integer arrays for local coordinate intersection checks (`compare_sorted_spans`) and enforces strict `__slots__` attributes on `Span` and `DomainInstance` classes.
+4. **Graph Construction & Edge Accumulation (`domain_finder.py`):** Replaces Python dictionary tuple indexing with contiguous 1D NumPy triplet buffers (`rows`, `cols`, `data`) and SciPy CSR sparse matrix sum-deduplication.
+
+---
+
+## Joint Implementation Architecture & Phase Flowchart
+
+```
+                          [ 400+ GB BLAST-TAB TSV File ]
+                                        │
+                                        ▼
+                  Phase 1 & 2: parse_mmseqs_tsv_stream()
+             ┌──────────────────────────────────────────────────┐
+             │ - Single-pass file streaming handle               │
+             │ - Unsorted Query ID Guard (assert/raise ValueError)│
+             │ - Fast Sequence ID -> int32 conversion           │
+             │ - Yields (q_seq_int, query_spans_list/array)     │
+             └─────────────────────────┬────────────────────────┘
+                                       │ Stream query block
+                                       ▼
+                  Phase 3 & 4: On-the-Fly Domain Extraction
+             ┌──────────────────────────────────────────────────┐
+             │ - Local DPC on q_i (compare_sorted_spans)        │
+             │ - Local spurious domain filter (max_containment) │
+             │ - Assign global atomic integer domain_id         │
+             │ - Save kept DomainInstance + partner targets     │
+             │ - Discard raw query_spans_list (prompt GC)       │
+             └─────────────────────────┬────────────────────────┘
+                                       │ Accumulated Domain Instances
+                                       ▼
+                        Phase 3.2: merge_targets()
+             ┌──────────────────────────────────────────────────┐
+             │ - Group partner target spans by target sequence  │
+             │ - Connected component reduction per target seq    │
+             └─────────────────────────┬────────────────────────┘
+                                       │ Merged Target Spans
+                                       ▼
+                  Phase 5: Vectorized Sparse Edge Accumulation
+             ┌──────────────────────────────────────────────────┐
+             │ - Local pairwise target intersections            │
+             │ - Append (global_r, global_c, intersect) to      │
+             │   1D NumPy triplet buffers                       │
+             │ - SciPy COO -> CSR sum_duplicates() aggregation  │
+             └─────────────────────────┬────────────────────────┘
+                                       │ Sparse Overlap Graph Matrix
+                                       ▼
+                           Phase 5.2: families()
+             ┌──────────────────────────────────────────────────┐
+             │ - DPC clustering on domain family overlap matrix │
+             │ - GFF Export: SequenceRegistry.get_str(seq_int)  │
+             └──────────────────────────────────────────────────┘
+```
+
+---
+
+## Detailed Step-by-Step Implementation Instructions
+
+### Phase 1: Shared Core Sequence Registry (`SequenceRegistry`)
+
+#### 1. Scope & Location
+Implement `SequenceRegistry` in `aligners.py` and import/instantiate it inside `DomainFinder` or `find_domains()`.
+
+#### 2. Technical Specification & Code
+```python
+class SequenceRegistry:
+    """
+    Bi-directional string-to-int32 sequence ID registry utilizing string interning.
+    Ensures single-instance storage of repeating sequence headers across multi-billion line TSVs.
+    """
+    __slots__ = ('str_to_id', 'id_to_str')
+
+    def __init__(self) -> None:
+        self.str_to_id: Dict[str, int] = {}
+        self.id_to_str: List[str] = []
+
+    def get_id(self, seq_id: str) -> int:
+        s = sys.intern(seq_id)
+        val = self.str_to_id.get(s)
+        if val is None:
+            val = len(self.id_to_str)
+            self.str_to_id[s] = val
+            self.id_to_str.append(s)
+        return val
+
+    def get_str(self, seq_int: int) -> str:
+        return self.id_to_str[seq_int]
+
+    def __len__(self) -> int:
+        return len(self.id_to_str)
+```
+
+#### 3. Risk Controls & Invariants
+- **Scope Locality:** Instantiate a single `SequenceRegistry` per pipeline execution inside `find_domains()`. Pass this instance into `parse_mmseqs_tsv_stream` and `DomainFinder`. Avoid global singleton variables to prevent memory leakage across benchmark loops.
+- **Output String Decoding Invariant:** `DomainInstance.to_gff()` must accept or reference `registry` to decode integer sequence IDs back to human-readable sequence string names before writing to GFF format.
+
+---
+
+### Phase 2: Single-Pass Streaming Generator TSV Parser (`parse_mmseqs_tsv_stream`)
+
+#### 1. Scope & Location
+Add `parse_mmseqs_tsv_stream` to `aligners.py`.
+
+#### 2. Technical Specification & Implementation Instructions
+1. Check for timeout or error indicator lines (`_TimeoutError_`) on file opening.
+2. Maintain single-pass line iteration via `for line in handle:` within a context manager (`with tsv_file.open("r") as handle:`).
+3. Track `current_q_seq_int: Optional[int] = None`, `seen_queries: set[int] = set()`, and `current_query_dict = defaultdict(list)`.
+4. Validate Query Contiguity (Unsorted Input Guard):
+   ```python
+   if q_seq_int != current_q_seq_int:
+       if q_seq_int in seen_queries:
+           raise ValueError(
+               f"🛑 Input TSV file {tsv_file} is not grouped contiguously by query sequence. "
+               f"Query ID '{q_seq_str}' appeared in non-adjacent line blocks. "
+               f"Please sort the alignment TSV by query ID before processing."
+           )
+       if current_q_seq_int is not None:
+           # Process and yield current query spans
+           yield current_q_seq_int, _build_sorted_query_spans(current_q_seq_int, current_query_dict, registry)
+           current_query_dict.clear()
+       seen_queries.add(q_seq_int)
+       current_q_seq_int = q_seq_int
+   ```
+5. Handle local region coordinate aggregation: Store alignments under key `(query_start, query_end)` in `current_query_dict` to accommodate scattered lines belonging to the same local region within a single query block.
+6. Yield the final query block after loop termination.
+
+#### 3. Expected Memory Impact
+Reduces TSV parsing RAM overhead from **~400+ GB down to < 10 MB** (peak heap size limited to alignments of a single query sequence).
+
+---
+
+### Phase 3: Query-by-Query On-the-Fly Domain Extraction Pipeline
+
+#### 1. Scope & Location
+Refactor `DomainFinder.find_domain_instances()` and `find_domains()` in `domain_finder.py`.
+
+#### 2. Detailed Implementation Instructions
+1. Modify `DomainFinder.__init__` to accept a generator or stream rather than a fully loaded in-memory dictionary.
+2. Refactor `find_domain_instances(self, query_stream, ...)`:
+   ```python
+   for q_seq_int, sorted_query_spans in query_stream:
+       n_spans = len(sorted_query_spans)
+       if n_spans == 0:
+           continue
+       elif n_spans == 1:
+           peak_span = sorted_query_spans[0]
+           self.create_new_domain(peak_span=peak_span, targets=peak_span.partners)
+       else:
+           rows, cols, intersections = compare_sorted_spans(sorted_query_spans)
+           if rows.size == 0:
+               peak_to_cluster = {p: np.array([p]) for p in range(n_spans)}
+           else:
+               span_lengths = np.array([s.length for s in sorted_query_spans])
+               weights = np.array([s.n_partners() for s in sorted_query_spans])
+               similarities = jaccard_index(intersections, span_lengths[rows], span_lengths[cols])
+               peak_to_cluster, n_noise = dpc(rows=rows, cols=cols, sims=similarities, n=n_spans, ...)
+               self.n_halo_alns += n_noise
+
+           for peak_id, member_ids in peak_to_cluster.items():
+               peak_span = sorted_query_spans[peak_id]
+               member_targets = []
+               for m_id in member_ids:
+                   member_targets.extend(sorted_query_spans[int(m_id)].partners)
+               self.create_new_domain(peak_span=peak_span, targets=member_targets)
+
+       # Perform sequence-level local spurious domain filtering immediately
+       if q_seq_int in self.domains_per_seq:
+           self._filter_sequence_domains_local(q_seq_int, min_containment, reassign_targets)
+
+       # Explicitly delete temporary raw query alignment spans to prompt garbage collection
+       del sorted_query_spans
+   ```
+
+#### 3. Target Partner Retention Guarantee
+- **Invariant:** `DomainInstance` objects must retain partner target `Span` objects in `DomainInstance.partners`.
+- Raw query alignments are safely garbage-collected because target partner information is preserved inside the kept `DomainInstance` objects for subsequent `merge_targets()` execution.
+
+---
+
+### Phase 4: Compact Structural Storage & Vectorized Coordinate Intersections
+
+#### 1. Scope & Location
+Update `Span` in `aligners.py` and `compare_sorted_spans` in `clustering.py`.
+
+#### 2. Detailed Implementation Instructions
+1. Enforce strict `__slots__` in `Span` and `DomainInstance`:
+   ```python
+   class Span:
+       __slots__ = ('seq_id', 'start', 'end', 'length', 'strand', 'partners', 'domain')
+   ```
+2. Vectorize coordinate intersection checks in `clustering.py`:
+   - Support operating directly on 2D `np.int32` coordinate arrays `shape=(N, 2)` `[start, end]`.
+   - **Sorting Invariant Preservation:** Assert or enforce that input coordinate arrays are sorted by `start` coordinate (`arr[:, 0]`). Maintain the range-bound early exit condition (`start_j >= end_i`) to preserve $O(N)$ efficiency in dense region overlap detection.
+
+---
+
+### Phase 5: Vectorized Triplet Sparse Array Overlap Graph Construction
+
+#### 1. Scope & Location
+Refactor `calculate_target_overlaps()` and `families()` in `domain_finder.py`.
+
+#### 2. Detailed Implementation Instructions
+1. Replace `self.target_intersections: Dict[Tuple[int, int], int]` with dynamic NumPy list buffers:
+   ```python
+   self._overlap_rows: List[np.ndarray] = []
+   self._overlap_cols: List[np.ndarray] = []
+   self._overlap_data: List[np.ndarray] = []
+   ```
+2. In `calculate_target_overlaps()`:
+   ```python
+   for seq_id, targets in self.targets_per_seq.items():
+       n_targets = len(targets)
+       if n_targets > 1:
+           local_rows, local_cols, intersections = compare_sorted_spans(targets)
+           if local_rows.size > 0:
+               domain_ids = np.array([t.domain for t in targets], dtype=np.int32)
+               global_rows = domain_ids[local_rows]
+               global_cols = domain_ids[local_cols]
+
+               # Enforce canonical undirected upper-triangular ordering (r < c)
+               mask = global_rows != global_cols
+               g_r = np.minimum(global_rows[mask], global_cols[mask])
+               g_c = np.maximum(global_rows[mask], global_cols[mask])
+               data = intersections[mask]
+
+               self._overlap_rows.append(g_r)
+               self._overlap_cols.append(g_c)
+               self._overlap_data.append(data)
+   ```
+3. In `families()`:
+   ```python
+   if self._overlap_rows:
+       rows = np.concatenate(self._overlap_rows)
+       cols = np.concatenate(self._overlap_cols)
+       data = np.concatenate(self._overlap_data)
+
+       # Aggregate duplicate edges using SciPy sparse matrix
+       coo = coo_matrix((data, (rows, cols)), shape=(n_domains, n_domains))
+       csr = coo.tocsr()
+       csr.sum_duplicates()
+       coo_dedup = csr.tocoo()
+
+       rows = coo_dedup.row
+       cols = coo_dedup.col
+       intersections = coo_dedup.data
+   ```
+
+#### 3. Expected Memory Gain
+Reduces overlap graph memory footprint by **80–90%** (from ~20–40 GB down to **~2–4 GB** for 100M overlap edges) and accelerates matrix assembly by 5x–10x.
+
+---
+
+## Verification & Validation Protocol
+
+Upon implementing the roadmap changes, execute the following commands to confirm formatting, error handling, and numerical equivalence:
+
+```bash
+# 1. Run full test suite across alignment and domain finder modules
+python3 -m pytest tests/
+
+# 2. Verify code formatting and linting compliance
+flake8 aligners.py domain_finder.py clustering.py
+
+# 3. Test multi-GB execution memory ceiling
+# Confirm peak RAM remains strictly < 200 GB for multi-GB alignment files.
+```
