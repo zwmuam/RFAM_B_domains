@@ -323,7 +323,7 @@ Add `parse_mmseqs_tsv_stream` to `aligners.py`.
    if q_seq_int != current_q_seq_int:
        if q_seq_int in seen_queries:
            raise ValueError(
-               f"🛑 Input TSV file {tsv_file} is not grouped contiguously by query sequence. "
+               f"Input TSV file {tsv_file} is not grouped contiguously by query sequence. "
                f"Query ID '{q_seq_str}' appeared in non-adjacent line blocks. "
                f"Please sort the alignment TSV by query ID before processing."
            )
