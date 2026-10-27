@@ -1,5 +1,7 @@
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Optional, Literal
+import sys
+from typing import Dict, Generator, List, Optional, Tuple, Union
 
 from tweaks import shell, logger
 
@@ -7,11 +9,44 @@ from tweaks import shell, logger
 default_threads = 4
 
 
+class SequenceRegistry:
+    """
+    Bi-directional string-to-int32 sequence ID registry using sys.intern.
+    Reduces memory overhead by eliminating redundant string allocations across billions of hits.
+    """
+    __slots__ = ('str_to_id', 'id_to_str')
+
+    def __init__(self) -> None:
+        self.str_to_id: Dict[str, int] = {}
+        self.id_to_str: List[str] = []
+
+    def get_id(self, seq_id: Union[str, int]) -> int:
+        if isinstance(seq_id, int):
+            return seq_id
+        s = sys.intern(seq_id)
+        val = self.str_to_id.get(s)
+        if val is None:
+            val = len(self.id_to_str)
+            self.str_to_id[s] = val
+            self.id_to_str.append(s)
+        return val
+
+    def get_str(self, seq_int: Union[int, str]) -> str:
+        if isinstance(seq_int, str):
+            return seq_int
+        if isinstance(seq_int, int) and 0 <= seq_int < len(self.id_to_str):
+            return self.id_to_str[seq_int]
+        return str(seq_int)
+
+    def __len__(self) -> int:
+        return len(self.id_to_str)
+
+
 class Span:
     __slots__ = ('seq_id', 'start', 'end', 'length', 'partners', 'strand', 'domain')
 
     def __init__(self,
-                 seq_id: str,
+                 seq_id: Union[str, int],
                  start: int,
                  end: int,
                  strand: int,
@@ -28,71 +63,96 @@ class Span:
         return len(self.partners)
 
 
-def parse_mmseqs_tsv(tsv_file: Path) -> dict:
+def parse_mmseqs_tsv_stream(tsv_file: Path,
+                            registry: Optional[SequenceRegistry] = None) -> Generator[Tuple[Union[int, str], List[Span]], None, None]:
     """
-    Parse a MMseqs2 BLAST-TAB TSV file into a dictionary of query sequences and their corresponding hits.
-    :param tsv_file: path to the MMseqs2 BLAST-TAB TSV file
-    :return: dictionary of query sequences and their hits
+    Single-pass streaming parser for MMseqs2 BLAST-TAB TSV output files.
+    Yields (q_seq_id, sorted_query_spans) query block by query block to keep memory usage minimal.
     """
+    tsv_file = Path(tsv_file)
+    if not tsv_file.exists():
+        raise FileNotFoundError(f"TSV file not found: {tsv_file}")
 
-    # check if the file is not result of a timeout error
-    with open(tsv_file, 'r') as f:
-        first_line = f.readline().strip()
+    with tsv_file.open('r') as handle:
+        first_line = handle.readline().strip()
         if first_line == "_TimeoutError_":
             raise TimeoutError(f'MMseqs2 search timed out. Result file: {tsv_file}')
 
-    n_alns, n_non_self, n_unique_queries = 0, 0, 0
+    if registry is None:
+        registry = SequenceRegistry()
 
-    unsorted_result = {}
-    with tsv_file.open() as handle:
-        logger.info(f'reading results from {tsv_file}')
+    seen_queries = set()
+    current_q_int: Optional[int] = None
+    current_query_dict: Dict[Tuple[int, int], list] = defaultdict(list)
+
+    logger.info(f'streaming alignment results from {tsv_file}')
+
+    def _yield_current_block(q_int: int, q_dict: Dict[Tuple[int, int], list]) -> Tuple[Union[int, str], List[Span]]:
+        sorted_coords = sorted(q_dict.keys(), key=lambda x: x[0])
+        sorted_spans = []
+        for q_start, q_end in sorted_coords:
+            span = Span(seq_id=q_int, start=q_start, end=q_end, strand=1)
+            partners = [
+                Span(seq_id=t_int, start=t_start, end=t_end, strand=t_strand)
+                for t_int, t_start, t_end, t_strand in q_dict[(q_start, q_end)]
+            ]
+            span.partners = partners
+            sorted_spans.append(span)
+        return q_int, sorted_spans
+
+    with tsv_file.open('r') as handle:
         for line in handle:
             if line.startswith('#') or not line.strip():
                 continue
+            line = line.rstrip('\n')
+            fields = line.split('\t')
+
+            # BLAST-TAB format: target (0), query (1), ..., target_start (6), target_end (7), query_start (8), query_end (9)
+            q_seq_str = fields[1]
+            q_start, q_end = int(fields[8]), int(fields[9])
+
+            assert q_start <= q_end, f'🛑 Query inversion is not expected for MMseqs2 results: {line}'
+
+            t_seq_str = fields[0]
+            if q_seq_str == t_seq_str:
+                continue
+
+            q_int = registry.get_id(q_seq_str)
+
+            if current_q_int is None:
+                current_q_int = q_int
+                seen_queries.add(q_int)
+            elif current_q_int != q_int:
+                if q_int in seen_queries:
+                    raise ValueError(f"🛑 Input TSV {tsv_file} is not grouped contiguously by query sequence ID.")
+                yield _yield_current_block(current_q_int, current_query_dict)
+                current_query_dict.clear()
+                current_q_int = q_int
+                seen_queries.add(q_int)
+
+            t_start, t_end = int(fields[6]), int(fields[7])
+            if t_start > t_end:
+                t_strand = -1
+                t_start, t_end = t_end, t_start
             else:
-                n_alns += 1
-                line = line.rstrip('\n')
-                fields = line.split('\t')
+                t_strand = 1
 
-                q_seq_id, query_start, query_end = fields[1], int(fields[8]), int(fields[9])
-                # TODO: debugging: check if the query strand is always + for MMseqs2 results
-                inverted = query_start > query_end
-                assert not inverted, f'Query inversion is not expected for MMseqs2 results: {line}'
-                local_key = (query_start, query_end)
+            t_int = registry.get_id(t_seq_str)
+            current_query_dict[(q_start, q_end)].append((t_int, t_start, t_end, t_strand))
 
-                t_seq_id, target_start, target_end = fields[0], int(fields[6]), int(fields[7])
-                if not q_seq_id == t_seq_id:  # exclude self-alignments
-                    n_non_self += 1
-                    inverted = target_start > target_end
-                    if inverted:
-                        t_strand = -1
-                        target_start, target_end = target_end, target_start
-                    else:
-                        t_strand = 1
-                    if q_seq_id not in unsorted_result:
-                        unsorted_result[q_seq_id] = {}
-                    if local_key not in unsorted_result[q_seq_id]:
-                        unsorted_result[q_seq_id][local_key] = []
-                    unsorted_result[q_seq_id][local_key].append((t_seq_id, target_start, target_end, t_strand))
+    if current_q_int is not None and current_query_dict:
+        yield _yield_current_block(current_q_int, current_query_dict)
 
-    sorted_queries = {seq_id: [] for seq_id in unsorted_result.keys()}
-    for seq_id, coordinate_dict in unsorted_result.items():
-        # sort the coordinates by start position
-        sorted_coordinates = sorted([q for q in coordinate_dict.keys()], key=lambda x: x[0])
-        for local_key in sorted_coordinates:
-            span = Span(seq_id=seq_id,
-                        start=local_key[0],
-                        end=local_key[1],
-                        strand=1)
-            partners = [Span(seq_id=t_seq_id, start=target_start, end=target_end, strand=t_strand) for
-                        t_seq_id, target_start, target_end, t_strand in coordinate_dict[local_key]]
-            span.partners = partners
-            sorted_queries[seq_id].append(span)
 
-    logger.info(
-        f'found {n_alns} alignments, {n_non_self} non-self alignments, and {len(sorted_queries)} unique queries')
-
-    return sorted_queries
+def parse_mmseqs_tsv(tsv_file: Path,
+                     registry: Optional[SequenceRegistry] = None) -> Dict[Union[int, str], List[Span]]:
+    """
+    Parse a MMseqs2 BLAST-TAB TSV file into a dictionary of query sequence spans.
+    """
+    result = {}
+    for q_id, spans in parse_mmseqs_tsv_stream(tsv_file, registry=registry):
+        result[q_id] = spans
+    return result
 
 
 def riboseek_easy_search(fasta_file: Path,
@@ -103,7 +163,8 @@ def riboseek_easy_search(fasta_file: Path,
                          gap_open: float,
                          min_seq_id: float,
                          timeout: Optional[int] = None,
-                         cpu: int = default_threads - 1) -> Dict[str, list]:
+                         cpu: int = default_threads - 1,
+                         registry: Optional[SequenceRegistry] = None) -> Dict[Union[int, str], list]:
     """
     Runs a Riboseek easy-search with the given parameters and parses the results.
     This wrapper function is structured for downstream Bayesian optimization 
@@ -186,7 +247,7 @@ def riboseek_easy_search(fasta_file: Path,
     result_file = result_dir.joinpath(name_string)
     # if file already exists (from a previous run), skip the search and parse the existing results
     try:
-        return parse_mmseqs_tsv(result_file)
+        return parse_mmseqs_tsv(result_file, registry=registry)
     # if file does not exist, run Riboseek easy-search and parse the results
     except FileNotFoundError:
         # Establish directory structure
@@ -231,7 +292,7 @@ def riboseek_easy_search(fasta_file: Path,
             with open(result_file, 'w') as f:
                 f.write("_TimeoutError_")
 
-        return parse_mmseqs_tsv(result_file)
+        return parse_mmseqs_tsv(result_file, registry=registry)
 
 
 def mmseq_easy_search(fasta_file: Path,
@@ -243,7 +304,8 @@ def mmseq_easy_search(fasta_file: Path,
                       gap_open: float,
                       min_seq_id: float,
                       timeout: int,
-                      cpu: int = default_threads) -> dict:
+                      cpu: int = default_threads,
+                      registry: Optional[SequenceRegistry] = None) -> dict:
     """
     1. Run MMseqs2 search on the input fasta file against itself
     2. Parse the results into a dictionary of query sequences and their corresponding hits
@@ -262,7 +324,7 @@ def mmseq_easy_search(fasta_file: Path,
     name_string = f"{fasta_file.stem}_k{k}_s{s}_gap{gap_open}_{gap_extend}_minid_{min_seq_id}.tsv"
     result_file = result_dir.joinpath(name_string)
     try:
-        return parse_mmseqs_tsv(result_file)
+        return parse_mmseqs_tsv(result_file, registry=registry)
     except FileNotFoundError:
         fasta_file = Path(fasta_file)
         run_tmp_dir = Path(tmp_dir).joinpath(f"{fasta_file.stem}.riboseek.tmp")

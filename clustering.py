@@ -11,35 +11,46 @@ from scipy.sparse import csr_matrix
 from aligners import Span
 
 
-def compare_sorted_spans(spans: List[Span]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def compare_sorted_spans(spans: Union[List[Span], np.ndarray]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Extract positional intersections from local pairwise alignments on the single sequence.
-    If weights are requested, identical (start,end) spans are grouped and their counts are returned as weights.
-    :param spans: START-SORTED list of Spans (unique coordinates on a single sequence)
+    Extract positional intersections from local pairwise alignments on a single sequence.
+    Expects input to be start-position sorted. Maintains O(N) range-bound early exit.
+
+    :param spans: START-SORTED list of Spans or 2D NumPy array shape (N, 2) [[start, end], ...]
     :return: row_indices, col_indices, intersection_lengths
     """
-    if len(spans) < 2:
-        return np.array([], dtype=np.int64), np.array([], dtype=np.int64), np.array([], dtype=np.float64)
+    if isinstance(spans, np.ndarray):
+        n = spans.shape[0]
+        if n < 2:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+        starts = spans[:, 0]
+        ends = spans[:, 1]
     else:
         n = len(spans)
-        low_indices = []
-        high_indices = []
-        intersection_lengths = []
+        if n < 2:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+        starts = [s.start for s in spans]
+        ends = [s.end for s in spans]
 
-        # compute pairwise intersection lengths avoiding redundant calculations
-        for i in range(n):
-            start_i, end_i = spans[i].start, spans[i].end
-            for j in range(i + 1, n):
-                start_j, end_j = spans[j].start, spans[j].end
-                if start_j >= end_i:
-                    break  # no further intersections possible
-                intersection_length = max(0, min(end_i, end_j) - max(start_i, start_j))
-                if intersection_length > 0:
-                    low, high = min(i, j), max(i, j)
-                    low_indices.append(low), high_indices.append(high)
-                    intersection_lengths.append(intersection_length)
+    low_indices = []
+    high_indices = []
+    intersection_lengths = []
 
-        return np.array(low_indices), np.array(high_indices), np.array(intersection_lengths)
+    for i in range(n):
+        start_i, end_i = starts[i], ends[i]
+        for j in range(i + 1, n):
+            start_j, end_j = starts[j], ends[j]
+            if start_j >= end_i:
+                break  # Range-bound early exit because inputs are sorted by start position
+            inter_len = min(end_i, end_j) - max(start_i, start_j)
+            if inter_len > 0:
+                low_indices.append(i)
+                high_indices.append(j)
+                intersection_lengths.append(inter_len)
+
+    return (np.array(low_indices, dtype=np.int32),
+            np.array(high_indices, dtype=np.int32),
+            np.array(intersection_lengths, dtype=np.int32))
 
 
 def jaccard_index(intersections: np.ndarray,

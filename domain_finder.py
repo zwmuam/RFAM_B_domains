@@ -30,8 +30,8 @@ from scipy.sparse import coo_matrix, csgraph
 from tqdm import tqdm
 
 # internal repository/package imports
-from aligners import (Span, mmseq_easy_search, parse_mmseqs_tsv,
-                      riboseek_easy_search)
+from aligners import (SequenceRegistry, Span, mmseq_easy_search, parse_mmseqs_tsv,
+                      parse_mmseqs_tsv_stream, riboseek_easy_search)
 from clustering import (compare_sorted_spans, dpc, jaccard_index,
                         max_containment)
 from tweaks import default_threads, logger
@@ -65,11 +65,10 @@ class DomainInstance(Span):
 
     instance_counter = count()
 
-    __slots__ = ("seq_id", "start", "end", "length", "number", "strand",
-                 "targets", "source")
+    __slots__ = ("source",)
 
     def __init__(self,
-                 seq_id: str,
+                 seq_id: Any,
                  start: int,
                  summary_strand: int,
                  end: int,
@@ -78,7 +77,7 @@ class DomainInstance(Span):
         """
         Initialize a DomainInstance.
 
-        :param seq_id: Target sequence identifier.
+        :param seq_id: Target sequence identifier (string or integer index).
         :param start: 1-based start position.
         :param summary_strand: Net directionality sum across partners.
         :param end: 1-based end position.
@@ -94,15 +93,18 @@ class DomainInstance(Span):
         self.source = source
 
     def to_gff(self,
-               cluster_id: str) -> str:
+               cluster_id: str,
+               registry: Optional[SequenceRegistry] = None) -> str:
         """
         Format domain instance as a standard GFF3 string.
 
         :param cluster_id: Family/cluster identifier for the GFF attributes.
+        :param registry: Optional SequenceRegistry to decode integer sequence ID.
         :return: Tab-delimited GFF3 record.
         """
+        seq_str = registry.get_str(self.seq_id) if registry is not None else str(self.seq_id)
         strand_str = "+" if self.strand > 0 else "-" if self.strand < 0 else "."
-        return (f"{self.seq_id}\t{self.source}\tDomain\t{self.start}\t"
+        return (f"{seq_str}\t{self.source}\tDomain\t{self.start}\t"
                 f"{self.end}\t.\t{strand_str}\t.\tID={cluster_id}")
 
     def total_target_length(self) -> int:
@@ -129,23 +131,28 @@ class DomainFinder:
     """
 
     def __init__(self,
-                 search: Dict[str, List[Span]],
-                 source: str = "mmseqs2") -> None:
+                 search: Any,
+                 source: str = "mmseqs2",
+                 registry: Optional[SequenceRegistry] = None) -> None:
         """
         Initialize DomainFinder.
 
-        :param search: Dictionary mapping query IDs to lists of alignment spans.
+        :param search: Dictionary or Generator mapping query IDs to lists of alignment spans.
         :param source: Aligner source name used for GFF generation.
+        :param registry: Optional SequenceRegistry instance.
         :return: None
         """
-        self.sorted_queries = search
+        self.search = search
         self.source = source
-        self.domains_per_seq: Dict[str, List[DomainInstance]] = {}
+        self.registry = registry
+        self.domains_per_seq: Dict[Any, List[DomainInstance]] = {}
         self.n_domains = 0
         self.domain_index: Dict[int, DomainInstance] = {}
         self.domain_total_lengths: Dict[int, int] = {}
-        self.targets_per_seq: Dict[str, List[Span]] = {}
-        self.target_intersections: Dict[Tuple[int, int], int] = defaultdict(int)
+        self.targets_per_seq: Dict[Any, List[Span]] = {}
+        self._overlap_rows: List[np.ndarray] = []
+        self._overlap_cols: List[np.ndarray] = []
+        self._overlap_data: List[np.ndarray] = []
         self.n_halo_alns = 0
         self.n_halo_domains = 0
 
@@ -163,9 +170,18 @@ class DomainFinder:
         :param halo_method: Halo method ('traditional', 'knn', etc.) or None.
         :return: None
         """
-        with tqdm(total=len(self.sorted_queries),
-                  desc="Finding domain instances") as pbar:
-            for sorted_query_spans in self.sorted_queries.values():
+        query_iterable = (
+            self.search.items() if isinstance(self.search, dict) else self.search
+        )
+        total_queries = len(self.search) if isinstance(self.search, dict) else None
+
+        with tqdm(total=total_queries, desc="Finding domain instances") as pbar:
+            for item in query_iterable:
+                if isinstance(item, tuple) and len(item) == 2:
+                    q_seq_id, sorted_query_spans = item
+                else:
+                    sorted_query_spans = item
+
                 n_spans = len(sorted_query_spans)
                 if n_spans == 0:
                     pbar.update(1)
@@ -208,7 +224,7 @@ class DomainFinder:
                 pbar.update(1)
 
         logger.info(f"Found {self.n_domains} domain instances across "
-                    f"{len(self.sorted_queries)} query sequences")
+                    f"{len(self.domains_per_seq)} query sequences")
 
     def create_new_domain(self,
                           peak_span: Span,
@@ -379,16 +395,19 @@ class DomainFinder:
             for seq_id, targets in self.targets_per_seq.items():
                 n_targets = len(targets)
                 if n_targets > 1:
-                    local_rows, local_cols, intersections = compare_sorted_spans(targets)
+                    sorted_targets = sorted(targets, key=lambda s: s.start)
+                    local_rows, local_cols, intersections = compare_sorted_spans(sorted_targets)
                     if local_rows.size > 0:
-                        domain_ids = np.array([t.domain for t in targets])
+                        domain_ids = np.array([t.domain for t in sorted_targets], dtype=np.int32)
                         global_rows = domain_ids[local_rows]
                         global_cols = domain_ids[local_cols]
-                        for r, c, intersect in zip(global_rows, global_cols, intersections):
-                            canonical_key = tuple(sorted([r, c]))
-                            assert r != c, (f"Unexpected self-overlap for domain {r} "
-                                            f"in sequence {seq_id}")
-                            self.target_intersections[canonical_key] += intersect
+                        mask = global_rows != global_cols
+                        if np.any(mask):
+                            g_r = np.minimum(global_rows[mask], global_cols[mask])
+                            g_c = np.maximum(global_rows[mask], global_cols[mask])
+                            self._overlap_rows.append(g_r)
+                            self._overlap_cols.append(g_c)
+                            self._overlap_data.append(intersections[mask])
                 pbar.update(1)
 
     def families(self,
@@ -410,31 +429,32 @@ class DomainFinder:
         if n_domains == 0:
             return
 
-        if len(self.target_intersections) == 0:
+        if not self._overlap_rows:
             logger.warning("No edges in the overlap graph. "
                            "Yielding single-domain families.")
             rows = np.array([], dtype=np.int32)
             cols = np.array([], dtype=np.int32)
             similarities = np.array([], dtype=np.float64)
-            n_intersections = 0
         else:
-            n_intersections = len(self.target_intersections)
-            logger.info(f"Calculating Jaccard similarities for {n_domains} domains")
-            rows = np.zeros(n_intersections, dtype=np.int32)
-            cols = np.zeros(n_intersections, dtype=np.int32)
-            row_domain_lengths = np.zeros(n_intersections, dtype=np.int32)
-            col_domain_lengths = np.zeros(n_intersections, dtype=np.int32)
-            intersections = np.zeros(n_intersections, dtype=np.int32)
+            cat_rows = np.concatenate(self._overlap_rows)
+            cat_cols = np.concatenate(self._overlap_cols)
+            cat_data = np.concatenate(self._overlap_data)
 
-            for i, ((row, col), intersection) in enumerate(self.target_intersections.items()):
-                rows[i] = row
-                cols[i] = col
-                intersections[i] = intersection
-                row_domain_lengths[i] = self.domain_total_lengths[row]
-                col_domain_lengths[i] = self.domain_total_lengths[col]
-                if row_domain_lengths[i] <= 0 or col_domain_lengths[i] <= 0:
-                    raise ValueError(f"Unexpected non-positive domain length for "
-                                     f"domains {row} and {col}.")
+            # Deduplicate and sum duplicate edges using SciPy sparse matrix aggregation
+            coo = coo_matrix((cat_data, (cat_rows, cat_cols)), shape=(n_domains, n_domains))
+            csr = coo.tocsr()
+            csr.sum_duplicates()
+            coo_dedup = csr.tocoo()
+
+            rows = coo_dedup.row
+            cols = coo_dedup.col
+            intersections = coo_dedup.data
+
+            row_domain_lengths = np.array([self.domain_total_lengths[r] for r in rows], dtype=np.int32)
+            col_domain_lengths = np.array([self.domain_total_lengths[c] for c in cols], dtype=np.int32)
+
+            if np.any(row_domain_lengths <= 0) or np.any(col_domain_lengths <= 0):
+                raise ValueError("Unexpected non-positive domain length encountered.")
 
             similarities = jaccard_index(intersections=intersections,
                                          row_lengths=row_domain_lengths,
@@ -533,6 +553,9 @@ def find_domains(fasta_path: Path,
 
     norm_attrs = _normalize_attributes(attributes)
 
+    # Sequence registry for efficient string management
+    registry = SequenceRegistry()
+
     # Determine aligner and search strategy
     tsv_val = norm_attrs.get("tsv") or norm_attrs.get("tsv_path") or norm_attrs.get("read")
     aligner_setting = str(norm_attrs.get("aligner", "")).lower()
@@ -540,7 +563,7 @@ def find_domains(fasta_path: Path,
     if tsv_val and Path(tsv_val).exists():
         aligner_name = aligner_setting if aligner_setting and aligner_setting != "read" else "mmseqs2"
         logger.info(f"Reading pre-computed alignments from {tsv_val}")
-        search_hits = parse_mmseqs_tsv(Path(tsv_val))
+        search_stream = parse_mmseqs_tsv_stream(Path(tsv_val), registry=registry)
     elif aligner_setting == "riboseek":
         aligner_name = "riboseek"
         logger.info("Executing RiboSeek search")
@@ -553,8 +576,10 @@ def find_domains(fasta_path: Path,
             gap_open=float(norm_attrs.get("gap_open", 23.0)),
             min_seq_id=float(norm_attrs.get("min_seq_id", 0.0)),
             timeout=norm_attrs.get("timeout"),
-            cpu=int(norm_attrs.get("cpu", max(default_threads - 1, 1)))
+            cpu=int(norm_attrs.get("cpu", max(default_threads - 1, 1))),
+            registry=registry
         )
+        search_stream = search_hits
     else:
         aligner_name = "mmseqs2"
         logger.info("Executing MMseqs2 search")
@@ -568,8 +593,10 @@ def find_domains(fasta_path: Path,
             gap_open=float(norm_attrs.get("gap_open", 11.0)),
             min_seq_id=float(norm_attrs.get("min_seq_id", 0.0)),
             timeout=int(norm_attrs.get("timeout", 1800)),
-            cpu=int(norm_attrs.get("cpu", default_threads))
+            cpu=int(norm_attrs.get("cpu", default_threads)),
+            registry=registry
         )
+        search_stream = search_hits
 
     # Extract DPC parameters
     min_dom_sim = float(norm_attrs.get("min_dom_sim", 0.35))
@@ -585,7 +612,7 @@ def find_domains(fasta_path: Path,
     min_containment = float(norm_attrs.get("min_containment", 0.6))
 
     # Perform domain finding and clustering
-    finder = DomainFinder(search=search_hits, source=aligner_name)
+    finder = DomainFinder(search=search_stream, source=aligner_name, registry=registry)
     finder.find_domain_instances(min_dom_sim=min_dom_sim,
                                  halo_stringency=dom_halo,
                                  min_dom_dens=min_dom_dens,
@@ -602,7 +629,7 @@ def find_domains(fasta_path: Path,
                                                    min_fam_dens=min_fam_dens,
                                                    halo_method=halo_method):
             for domain in fam_domains:
-                gff_writer.write(domain.to_gff(cluster_id=fam_id) + "\n")
+                gff_writer.write(domain.to_gff(cluster_id=fam_id, registry=registry) + "\n")
 
     logger.info(f"Successfully exported domain families to {output_gff}")
     return output_gff
