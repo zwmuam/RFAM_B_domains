@@ -33,13 +33,13 @@
 - **Memory Savings:** **70–85% reduction** in alignment representation footprint.
 - **Implementation Complexity:** Medium.
 
-### 6. Disk-Backed Intermediate Storage for Target Overlaps
+### 5. Disk-Backed Intermediate Storage for Target Overlaps
 - **Problem:** `DomainFinder.target_intersections` stores pairwise domain overlaps in an in-memory dictionary `Dict[Tuple[int, int], int]` and `self.targets_per_seq` accumulates target spans for every domain.
 - **Proposed Solution:** Store intermediate target spans and overlap counts in a temporary SQLite or DuckDB table on disk (`tmp_dir / "intersections.duckdb"`). Query overlap sums during family clustering using aggregation queries.
 - **Memory Savings:** Bounded peak RAM footprint (< 2 GB RAM) for large-scale genome alignment graphs.
 - **Implementation Complexity:** Medium.
 
-### 7. Vectorized Triplet Arrays for Overlap Graph Construction
+### 6. Vectorized Triplet Arrays for Overlap Graph Construction
 - **Problem:** Constructing `self.target_intersections[canonical_key] += intersect` creates millions of 2-tuples and dictionary lookup operations.
 - **Proposed Solution:** Accumulate `global_rows`, `global_cols`, and `intersections` into contiguous NumPy 1D arrays (`int32`) and compress duplicate edges using `coo_matrix((data, (rows, cols)))` or `np.bincount` / COO aggregation.
 - **Memory Savings:** Eliminates dict/tuple hashing overhead (**saving ~100–200 bytes per graph edge**).
