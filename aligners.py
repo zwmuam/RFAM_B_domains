@@ -142,17 +142,6 @@ def parse_mmseqs_tsv_stream(tsv_file: Path,
         yield _yield_current_block(current_q_int, current_query_dict)
 
 
-def parse_mmseqs_tsv(tsv_file: Path,
-                     registry: Optional[SequenceRegistry] = None) -> Dict[Union[int, str], List[Span]]:
-    """
-    Parse a MMseqs2 BLAST-TAB TSV file into a dictionary of query sequence spans.
-    """
-    result = {}
-    for q_id, spans in parse_mmseqs_tsv_stream(tsv_file, registry=registry):
-        result[q_id] = spans
-    return result
-
-
 def riboseek_easy_search(fasta_file: Path,
                          tmp_dir: Path,
                          result_dir: Path,
