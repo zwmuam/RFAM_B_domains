@@ -95,6 +95,141 @@ def _process_query_batch(batch_items: Any,
     return batch_results, batch_halo_alns
 
 
+def _process_filter_spurious_batch(batch_items: Any,
+                                   min_containment: float,
+                                   reassign_targets: bool) -> Tuple[List[Tuple[Any, List[Span]]], int, int]:
+    """
+    Worker function to process a batch of (seq_id, domain_list) for spurious domain filtering.
+    """
+    if isinstance(batch_items, tuple) and len(batch_items) == 2 and not isinstance(batch_items[0], (tuple, list)):
+        batch_items = [batch_items]
+
+    batch_kept_domains = []
+    batch_discarded = 0
+    batch_kept_count = 0
+
+    for seq_id, domain_list in batch_items:
+        sorted_domains = sorted(domain_list, key=lambda d: d.start)
+        domain_lengths = np.array([s.length for s in sorted_domains])
+        rows, columns, intersections = compare_sorted_spans(sorted_domains)
+        if rows.size == 0:
+            connected_mask = np.array([], dtype=bool)
+        else:
+            containment = max_containment(intersections=intersections,
+                                          row_lengths=domain_lengths[rows],
+                                          column_lengths=domain_lengths[columns])
+            connected_mask = containment >= min_containment
+
+        if not np.any(connected_mask):
+            kept_domains = sorted_domains
+            batch_kept_count += len(kept_domains)
+        else:
+            sources, targets = rows[connected_mask], columns[connected_mask]
+            remaining_edges = [{s, t} for s, t in zip(sources, targets)]
+            indices_to_remove = set()
+            while remaining_edges:
+                connected_dom_indices = set()
+                for edge in remaining_edges:
+                    connected_dom_indices.update(edge)
+                connected_domains = {i: sorted_domains[i]
+                                     for i in connected_dom_indices}
+                scoring_dict = {i: (d.coverage(), -d.length)
+                                for i, d in connected_domains.items()}
+                weak_i = min(connected_domains,
+                             key=lambda i: scoring_dict[i])
+                indices_to_remove.add(weak_i)
+                if reassign_targets:
+                    removed_domain = sorted_domains[weak_i]
+                    removed_edges = [e for e in remaining_edges if weak_i in e]
+                    connected_to_removed = set()
+                    for edge in removed_edges:
+                        connected_to_removed.update(edge)
+                    connected_to_removed.discard(weak_i)
+                    if connected_to_removed:
+                        heir_domain = connected_domains[
+                            max(connected_to_removed,
+                                key=lambda i: scoring_dict[i])
+                        ]
+                        heir_domain.partners.extend(removed_domain.partners)
+                remaining_edges = [e for e in remaining_edges if weak_i not in e]
+
+            kept_domains = [d for i, d in enumerate(sorted_domains)
+                            if i not in indices_to_remove]
+            batch_discarded += len(indices_to_remove)
+            batch_kept_count += len(kept_domains)
+
+        batch_kept_domains.append((seq_id, kept_domains))
+
+    return batch_kept_domains, batch_discarded, batch_kept_count
+
+
+def _process_merge_targets_batch(batch_items: Any) -> Tuple[List[Tuple[Any, Span]], List[Tuple[int, int]], int, int, int]:
+    """
+    Worker function to merge overlapping target spans for a batch chunk of domains.
+    """
+    if isinstance(batch_items, tuple) and len(batch_items) == 2 and not isinstance(batch_items[0], (tuple, list)):
+        batch_items = [batch_items]
+
+    batch_targets = []
+    batch_domain_lengths = []
+    n_merged = 0
+    n_distinct = 0
+    n_singletons = 0
+
+    for d_id, domain in batch_items:
+        domain_total_length = 0
+        domain_targets_by_seq = defaultdict(list)
+        for target in domain.partners:
+            domain_targets_by_seq[target.seq_id].append(target)
+
+        for t_seq_id, targets in domain_targets_by_seq.items():
+            n_targets = len(targets)
+            if n_targets > 1:
+                sorted_group = sorted(targets, key=lambda s: s.start)
+                rows, cols, intersections = compare_sorted_spans(sorted_group)
+                similarity_matrix = coo_matrix(
+                    (intersections, (rows, cols)),
+                    shape=(n_targets, n_targets)
+                ).tocsr()
+                components, labels = csgraph.connected_components(
+                    similarity_matrix,
+                    directed=False,
+                    return_labels=True
+                )
+                for component_id in range(components):
+                    component_index = {
+                        i: s for i, s in enumerate(sorted_group)
+                        if labels[i] == component_id
+                    }
+                    if len(component_index) == 1:
+                        distinct_target, = component_index.values()
+                        distinct_target.domain = d_id
+                        batch_targets.append((t_seq_id, distinct_target))
+                        domain_total_length += distinct_target.length
+                        n_distinct += 1
+                    else:
+                        merged_start = min(s.start for s in component_index.values())
+                        merged_end = max(s.end for s in component_index.values())
+                        merged_target = Span(seq_id=t_seq_id,
+                                             start=merged_start,
+                                             end=merged_end,
+                                             strand=0)
+                        merged_target.domain = d_id
+                        batch_targets.append((t_seq_id, merged_target))
+                        domain_total_length += merged_target.length
+                        n_merged += len(component_index) - 1
+            else:
+                singleton_target, = targets
+                singleton_target.domain = d_id
+                batch_targets.append((t_seq_id, singleton_target))
+                domain_total_length += singleton_target.length
+                n_singletons += 1
+
+        batch_domain_lengths.append((d_id, domain_total_length))
+
+    return batch_targets, batch_domain_lengths, n_merged, n_distinct, n_singletons
+
+
 def _process_overlap_batch(batch_targets: Any,
                            n_domains: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -271,18 +406,23 @@ class DomainFinder:
         :param halo_method: Halo method ('traditional', 'knn', etc.) or None.
         :return: None
         """
-        query_iterable = (
-            list(self.search.items()) if isinstance(self.search, dict) else list(self.search)
-        )
-        total_queries = len(query_iterable)
-        if total_queries == 0:
-            return
+        if isinstance(self.search, dict):
+            query_iterable = list(self.search.items())
+        else:
+            query_iterable = self.search
 
-        batch_size = max(100, min(2000, total_queries // (default_threads * 4) if default_threads > 0 else 100))
-        query_batches = [
-            query_iterable[i:i + batch_size]
-            for i in range(0, total_queries, batch_size)
-        ]
+        def _batch_generator(iterable: Any, batch_size: int) -> Generator[List[Any], None, None]:
+            batch = []
+            for item in iterable:
+                batch.append(item)
+                if len(batch) >= batch_size:
+                    yield batch
+                    batch = []
+            if batch:
+                yield batch
+
+        batch_size = 200
+        query_batches = _batch_generator(query_iterable, batch_size)
 
         kwargs = {
             "min_dom_sim": min_dom_sim,
@@ -348,61 +488,38 @@ class DomainFinder:
         :param reassign_targets: Whether to reassign targets of removed domains.
         :return: Tuple of (number of discarded domains, number of kept domains).
         """
+        if not self.domains_per_seq:
+            return 0, 0
+
+        domain_items = list(self.domains_per_seq.items())
+        total_items = len(domain_items)
+        batch_size = max(50, min(1000, total_items // (default_threads * 4) if default_threads > 0 else 100))
+        item_batches = [
+            domain_items[i:i + batch_size]
+            for i in range(0, total_items, batch_size)
+        ]
+
+        kwargs = {
+            "min_containment": min_containment,
+            "reassign_targets": reassign_targets
+        }
+
+        p_runner = Parallel(parallelized_function=_process_filter_spurious_batch,
+                            input_collection=item_batches,
+                            kwargs=kwargs,
+                            description="Filtering spurious domains",
+                            bar=True)
+
         dc = count()
         n_discarded = 0
         n_kept = 0
-        for seq_id, domain_list in self.domains_per_seq.items():
-            sorted_domains = sorted(domain_list, key=lambda d: d.start)
-            domain_lengths = np.array([s.length for s in sorted_domains])
-            rows, columns, intersections = compare_sorted_spans(sorted_domains)
-            if rows.size == 0:
-                connected_mask = np.array([], dtype=bool)
-            else:
-                containment = max_containment(intersections=intersections,
-                                              row_lengths=domain_lengths[rows],
-                                              column_lengths=domain_lengths[columns])
-                connected_mask = containment >= min_containment
 
-            if not np.any(connected_mask):
-                kept_domains = sorted_domains
-                n_kept += len(kept_domains)
-            else:
-                sources, targets = rows[connected_mask], columns[connected_mask]
-                remaining_edges = [{s, t} for s, t in zip(sources, targets)]
-                indices_to_remove = set()
-                while remaining_edges:
-                    connected_dom_indices = set()
-                    for edge in remaining_edges:
-                        connected_dom_indices.update(edge)
-                    connected_domains = {i: sorted_domains[i]
-                                         for i in connected_dom_indices}
-                    scoring_dict = {i: (d.coverage(), -d.length)
-                                    for i, d in connected_domains.items()}
-                    weak_i = min(connected_domains,
-                                 key=lambda i: scoring_dict[i])
-                    indices_to_remove.add(weak_i)
-                    if reassign_targets:
-                        removed_domain = sorted_domains[weak_i]
-                        removed_edges = [e for e in remaining_edges if weak_i in e]
-                        connected_to_removed = set()
-                        for edge in removed_edges:
-                            connected_to_removed.update(edge)
-                        connected_to_removed.discard(weak_i)
-                        if connected_to_removed:
-                            heir_domain = connected_domains[
-                                max(connected_to_removed,
-                                    key=lambda i: scoring_dict[i])
-                            ]
-                            heir_domain.partners.extend(removed_domain.partners)
-                    remaining_edges = [e for e in remaining_edges if weak_i not in e]
-
-                kept_domains = [d for i, d in enumerate(sorted_domains)
-                                if i not in indices_to_remove]
-                n_discarded += len(indices_to_remove)
-                n_kept += len(kept_domains)
-
-            for d in kept_domains:
-                self.domain_index[next(dc)] = d
+        for batch_kept_domains, b_discarded, b_kept in p_runner.result:
+            n_discarded += b_discarded
+            n_kept += b_kept
+            for seq_id, kept_domains in batch_kept_domains:
+                for d in kept_domains:
+                    self.domain_index[next(dc)] = d
 
         return n_discarded, n_kept
 
@@ -412,66 +529,40 @@ class DomainFinder:
 
         :return: None
         """
-        logger.info(f"Merging overlapping targets for {len(self.domain_index)} domains")
-        n_merged = 0
-        n_distinct = 0
-        n_singletons = 0
-        with tqdm(total=len(self.domain_index),
-                  desc="Merging overlapping targets") as pbar:
-            for d_id, domain in self.domain_index.items():
-                self.domain_total_lengths[d_id] = 0
-                domain_targets_by_seq = defaultdict(list)
-                for target in domain.partners:
-                    domain_targets_by_seq[target.seq_id].append(target)
+        n_domains = len(self.domain_index)
+        logger.info(f"Merging overlapping targets for {n_domains} domains")
+        if n_domains == 0:
+            return
 
-                for t_seq_id, targets in domain_targets_by_seq.items():
-                    if t_seq_id not in self.targets_per_seq:
-                        self.targets_per_seq[t_seq_id] = []
-                    n_targets = len(targets)
-                    if n_targets > 1:
-                        sorted_group = sorted(targets, key=lambda s: s.start)
-                        rows, cols, intersections = compare_sorted_spans(sorted_group)
-                        similarity_matrix = coo_matrix(
-                            (intersections, (rows, cols)),
-                            shape=(n_targets, n_targets)
-                        ).tocsr()
-                        components, labels = csgraph.connected_components(
-                            similarity_matrix,
-                            directed=False,
-                            return_labels=True
-                        )
-                        for component_id in range(components):
-                            component_index = {
-                                i: s for i, s in enumerate(sorted_group)
-                                if labels[i] == component_id
-                            }
-                            if len(component_index) == 1:
-                                distinct_target, = component_index.values()
-                                distinct_target.domain = d_id
-                                self.targets_per_seq[t_seq_id].append(distinct_target)
-                                self.domain_total_lengths[d_id] += distinct_target.length
-                                n_distinct += 1
-                            else:
-                                merged_start = min(s.start for s in component_index.values())
-                                merged_end = max(s.end for s in component_index.values())
-                                merged_target = Span(seq_id=t_seq_id,
-                                                     start=merged_start,
-                                                     end=merged_end,
-                                                     strand=0)
-                                merged_target.domain = d_id
-                                self.targets_per_seq[t_seq_id].append(merged_target)
-                                self.domain_total_lengths[d_id] += merged_target.length
-                                n_merged += len(component_index) - 1
-                    else:
-                        singleton_target, = targets
-                        singleton_target.domain = d_id
-                        self.targets_per_seq[t_seq_id].append(singleton_target)
-                        self.domain_total_lengths[d_id] += singleton_target.length
-                        n_singletons += 1
-                pbar.update(1)
+        domain_items = list(self.domain_index.items())
+        batch_size = max(50, min(1000, n_domains // (default_threads * 4) if default_threads > 0 else 100))
+        domain_batches = [
+            domain_items[i:i + batch_size]
+            for i in range(0, n_domains, batch_size)
+        ]
 
-        logger.info(f"Merged: {n_merged}; Distinct: {n_distinct}; "
-                    f"Singletons: {n_singletons}")
+        p_runner = Parallel(parallelized_function=_process_merge_targets_batch,
+                            input_collection=domain_batches,
+                            description="Merging overlapping targets",
+                            bar=True)
+
+        tot_merged = 0
+        tot_distinct = 0
+        tot_singletons = 0
+
+        for b_targets, b_lengths, b_merged, b_distinct, b_singletons in p_runner.result:
+            tot_merged += b_merged
+            tot_distinct += b_distinct
+            tot_singletons += b_singletons
+            for d_id, d_len in b_lengths:
+                self.domain_total_lengths[d_id] = d_len
+            for t_seq_id, target in b_targets:
+                if t_seq_id not in self.targets_per_seq:
+                    self.targets_per_seq[t_seq_id] = []
+                self.targets_per_seq[t_seq_id].append(target)
+
+        logger.info(f"Merged: {tot_merged}; Distinct: {tot_distinct}; "
+                    f"Singletons: {tot_singletons}")
 
     def calculate_target_overlaps(self) -> None:
         """

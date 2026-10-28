@@ -4,6 +4,7 @@ import pytest
 from aligners import Span
 from domain_finder import (DomainFinder, DomainInstance, _normalize_attributes,
                            find_domains)
+import domain_finder_pecomputed
 
 
 def test_normalize_attributes():
@@ -111,6 +112,92 @@ def test_find_domains_with_tsv(tmp_path):
     assert output_gff.stat().st_size > 0
     content = output_gff.read_text()
     assert "seq1\tmmseqs2\tDomain\t" in content
+
+
+def test_find_domains_pecomputed(tmp_path):
+    tsv_content = (
+        "seq1\tseq2\t100.0\t100\t0\t0\t10\t100\t10\t100\t1e-10\t200\n"
+        "seq1\tseq3\t100.0\t100\t0\t0\t20\t90\t12\t98\t1e-10\t200\n"
+    )
+    tsv_file = tmp_path / "mock_search_pecomputed.tsv"
+    tsv_file.write_text(tsv_content)
+
+    fasta_file = tmp_path / "sequences.fna"
+    fasta_file.write_text(">seq1\nACGT\n>seq2\nACGT\n>seq3\nACGT\n")
+
+    output_gff = tmp_path / "output_pecomputed.gff"
+
+    domain_finder_pecomputed.find_domains(fasta_path=fasta_file,
+                                          aligner_name="mmseqs2",
+                                          tsv_val=tsv_file,
+                                          min_dom_sim=0.1,
+                                          dom_halo=0.5,
+                                          min_dom_dens=0.0,
+                                          min_fam_sim=0.1,
+                                          fam_halo=0.5,
+                                          min_fam_dens=0.0,
+                                          halo_method="knn",
+                                          reassign_targets=True,
+                                          min_containment=0.5,
+                                          output_gff=output_gff,
+                                          tmp_dir=tmp_path / "tmp",
+                                          result_dir=tmp_path / "results_tsvs")
+
+    assert output_gff.exists()
+    assert output_gff.stat().st_size > 0
+    content = output_gff.read_text()
+    assert "seq1\tmmseqs2\tDomain\t" in content
+
+
+def test_result_equivalence_between_modules(tmp_path):
+    sample_tsv = Path(__file__).parent / "fixtures" / "sample_subset.tsv"
+    assert sample_tsv.exists()
+
+    fasta_file = tmp_path / "sequences.fna"
+    fasta_file.write_text(">URS00036AA4AB\nACGT\n>URS00019BAC15\nACGT\n")
+
+    output_gff_df = tmp_path / "output_df.gff"
+    output_gff_pe = tmp_path / "output_pe.gff"
+
+    attributes = {
+        "aligner": "mmseqs2",
+        "tsv": str(sample_tsv),
+        "min_dom_sim": 0.1,
+        "dom_halo": 0.5,
+        "min_dom_dens": 0.0,
+        "min_fam_sim": 0.1,
+        "fam_halo": 0.5,
+        "min_fam_dens": 0.0,
+        "halo_method": "knn",
+        "reassign_targets": True,
+        "min_containment": 0.5,
+    }
+
+    find_domains(fasta_path=fasta_file,
+                 attributes=attributes,
+                 output_gff=output_gff_df,
+                 tmp_dir=tmp_path / "tmp1",
+                 result_dir=tmp_path / "results1")
+
+    domain_finder_pecomputed.find_domains(fasta_path=fasta_file,
+                                          aligner_name="mmseqs2",
+                                          tsv_val=sample_tsv,
+                                          min_dom_sim=0.1,
+                                          dom_halo=0.5,
+                                          min_dom_dens=0.0,
+                                          min_fam_sim=0.1,
+                                          fam_halo=0.5,
+                                          min_fam_dens=0.0,
+                                          halo_method="knn",
+                                          reassign_targets=True,
+                                          min_containment=0.5,
+                                          output_gff=output_gff_pe,
+                                          tmp_dir=tmp_path / "tmp2",
+                                          result_dir=tmp_path / "results2")
+
+    content_df = output_gff_df.read_text().strip()
+    content_pe = output_gff_pe.read_text().strip()
+    assert content_df == content_pe
 
 
 def test_parse_mmseqs_tsv_stream_reverse_strand(tmp_path):
