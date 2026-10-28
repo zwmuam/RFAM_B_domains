@@ -21,9 +21,12 @@ __email__ = "jakub.barylski@gmail.com"
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+# standard libraries
+from tqdm import tqdm
+
 # internal repository/package imports
 from aligners import SequenceRegistry, parse_mmseqs_tsv_stream
-from domain_finder import DomainFinder, DomainInstance
+from domain_finder import DomainFinder, DomainInstance, count_fasta_queries
 from tweaks import logger
 
 
@@ -77,11 +80,17 @@ def find_domains(fasta_path: Path,
     # Sequence registry for efficient string management
     registry = SequenceRegistry()
 
+    total_queries = count_fasta_queries(fasta_path)
     logger.info(f"Reading pre-computed alignments from {tsv_val}")
+    logger.info(f"Estimated work size: {total_queries} query sequences in {fasta_path.name}")
     search_stream = parse_mmseqs_tsv_stream(Path(tsv_val), registry=registry)
 
     # Perform domain finding and clustering
-    finder = DomainFinder(search=search_stream, source=aligner_name, registry=registry)
+    finder = DomainFinder(search=search_stream,
+                          source=aligner_name,
+                          registry=registry,
+                          fasta_path=fasta_path,
+                          total_queries=total_queries)
     finder.find_domain_instances(min_dom_sim=min_dom_sim,
                                  halo_stringency=dom_halo,
                                  min_dom_dens=min_dom_dens,
@@ -91,12 +100,17 @@ def find_domains(fasta_path: Path,
     finder.merge_targets()
     finder.calculate_target_overlaps()
 
+    families_list = list(finder.families(min_fam_sim=min_fam_sim,
+                                         halo_stringency=fam_halo,
+                                         min_fam_dens=min_fam_dens,
+                                         halo_method=halo_method))
+
     output_gff.parent.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Estimated work size for GFF3 export: {len(families_list)} domain families (to {output_gff.name})")
     with output_gff.open("w") as gff_writer:
-        for fam_id, fam_domains in finder.families(min_fam_sim=min_fam_sim,
-                                                   halo_stringency=fam_halo,
-                                                   min_fam_dens=min_fam_dens,
-                                                   halo_method=halo_method):
+        for fam_id, fam_domains in tqdm(families_list,
+                                       desc="Exporting domain families to GFF3",
+                                       unit="families"):
             for domain in fam_domains:
                 gff_writer.write(domain.to_gff(cluster_id=fam_id, registry=registry) + "\n")
 

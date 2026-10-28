@@ -7,6 +7,15 @@ from domain_finder import (DomainFinder, DomainInstance, _normalize_attributes,
 import domain_finder_pecomputed
 
 
+def test_count_fasta_queries(tmp_path):
+    from domain_finder import count_fasta_queries
+    fasta_file = tmp_path / "test.fasta"
+    fasta_file.write_text(">seq1\nACGT\n>seq2\nACGT\n>seq3\nACGT\n")
+    assert count_fasta_queries(fasta_file) == 3
+    non_existent = tmp_path / "non_existent.fasta"
+    assert count_fasta_queries(non_existent) == 0
+
+
 def test_normalize_attributes():
     raw_attrs = {
         "--aligner": "riboseek",

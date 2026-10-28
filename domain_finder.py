@@ -20,6 +20,7 @@ __email__ = "jakub.barylski@gmail.com"
 # built-ins
 from collections import defaultdict
 from itertools import count
+import math
 from pathlib import Path
 import re
 from typing import Any, Dict, Generator, List, Optional, Tuple
@@ -327,6 +328,24 @@ def _process_evaluate_cluster_batch(batch_items: Any,
     return batch_results
 
 
+def count_fasta_queries(fasta_path: Path) -> int:
+    """
+    Count the number of sequence header lines starting with '>' in a FASTA sequence file.
+
+    :param fasta_path: Path to the FASTA sequence file.
+    :return: Integer count of query sequence headers.
+    """
+    fasta_path = Path(fasta_path)
+    if not fasta_path.exists():
+        return 0
+    header_count = 0
+    with fasta_path.open("r", encoding="utf-8", errors="ignore") as fasta_file:
+        for line in fasta_file:
+            if line.startswith(">"):
+                header_count += 1
+    return header_count
+
+
 def _normalize_attributes(attributes: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize key names in the attributes dictionary.
@@ -423,18 +442,32 @@ class DomainFinder:
     def __init__(self,
                  search: Any,
                  source: str = "mmseqs2",
-                 registry: Optional[SequenceRegistry] = None) -> None:
+                 registry: Optional[SequenceRegistry] = None,
+                 fasta_path: Optional[Path] = None,
+                 total_queries: Optional[int] = None) -> None:
         """
         Initialize DomainFinder.
 
         :param search: Dictionary or Generator mapping query IDs to lists of alignment spans.
         :param source: Aligner source name used for GFF generation.
         :param registry: Optional SequenceRegistry instance.
+        :param fasta_path: Optional FASTA file path used for initial size estimations.
+        :param total_queries: Optional integer count of query sequences.
         :return: None
         """
         self.search = search
         self.source = source
         self.registry = registry
+        self.fasta_path = Path(fasta_path) if fasta_path else None
+        if total_queries is not None:
+            self.total_queries = total_queries
+        elif self.fasta_path:
+            self.total_queries = count_fasta_queries(self.fasta_path)
+        elif isinstance(search, dict):
+            self.total_queries = len(search)
+        else:
+            self.total_queries = None
+
         self.domains_per_seq: Dict[Any, List[DomainInstance]] = {}
         self.n_domains = 0
         self.domain_index: Dict[int, DomainInstance] = {}
@@ -445,6 +478,7 @@ class DomainFinder:
         self._overlap_data: List[np.ndarray] = []
         self.n_halo_alns = 0
         self.n_halo_domains = 0
+        self.n_clusters = 0
 
     def find_domain_instances(self,
                               min_dom_sim: float,
@@ -462,8 +496,16 @@ class DomainFinder:
         """
         if isinstance(self.search, dict):
             query_iterable = list(self.search.items())
+            total_queries = len(query_iterable)
         else:
             query_iterable = self.search
+            total_queries = self.total_queries
+
+        file_info = f" (from {self.fasta_path.name})" if self.fasta_path else ""
+        if total_queries is not None:
+            logger.info(f"Estimated work size for domain instance discovery: {total_queries} query sequences{file_info}")
+        else:
+            logger.info("Starting domain instance discovery")
 
         def _batch_generator(iterable: Any, batch_size: int) -> Generator[List[Any], None, None]:
             batch = []
@@ -476,11 +518,16 @@ class DomainFinder:
                 yield batch
 
         n_jobs = get_default_cpu_threads()
-        if isinstance(query_iterable, (list, tuple)):
+        if total_queries is not None and total_queries > 0:
+            batch_size = min(1000, max(1, total_queries // (n_jobs * 4)))
+            total_batches = math.ceil(total_queries / batch_size)
+        elif isinstance(query_iterable, (list, tuple)):
             total_queries = len(query_iterable)
             batch_size = min(1000, max(1, total_queries // (n_jobs * 4))) if total_queries > 0 else 1000
+            total_batches = math.ceil(total_queries / batch_size) if total_queries > 0 else None
         else:
             batch_size = 1000
+            total_batches = None
 
         query_batches = _batch_generator(query_iterable, batch_size)
 
@@ -496,7 +543,9 @@ class DomainFinder:
                             input_collection=query_batches,
                             kwargs=kwargs,
                             description="Finding domain instances",
-                            bar=True)
+                            bar=True,
+                            unit="batches",
+                            total=total_batches)
 
         for batch_res, batch_halo in p_runner.result:
             self.n_halo_alns += batch_halo
@@ -553,6 +602,9 @@ class DomainFinder:
 
         domain_items = list(self.domains_per_seq.items())
         total_items = len(domain_items)
+        file_info = f" (from {self.fasta_path.name})" if self.fasta_path else ""
+        logger.info(f"Estimated work size for spurious domain filtering: {total_items} sequence domain sets across {self.n_domains} candidate domains{file_info}")
+
         n_jobs = get_default_cpu_threads()
         batch_size = min(1000, max(1, total_items // (n_jobs * 4))) if total_items > 0 else 1000
         item_batches = [
@@ -569,7 +621,9 @@ class DomainFinder:
                             input_collection=item_batches,
                             kwargs=kwargs,
                             description="Filtering spurious domains",
-                            bar=True)
+                            bar=True,
+                            unit="batches",
+                            total=len(item_batches))
 
         dc = count()
         n_discarded = 0
@@ -591,7 +645,8 @@ class DomainFinder:
         :return: None
         """
         n_domains = len(self.domain_index)
-        logger.info(f"Merging overlapping targets for {n_domains} domains")
+        file_info = f" (from {self.fasta_path.name})" if self.fasta_path else ""
+        logger.info(f"Estimated work size for merging target spans: {n_domains} domain instances{file_info}")
         if n_domains == 0:
             return
 
@@ -606,7 +661,9 @@ class DomainFinder:
         p_runner = Parallel(parallelized_function=_process_merge_targets_batch,
                             input_collection=domain_batches,
                             description="Merging overlapping targets",
-                            bar=True)
+                            bar=True,
+                            unit="batches",
+                            total=len(domain_batches))
 
         tot_merged = 0
         tot_distinct = 0
@@ -638,6 +695,9 @@ class DomainFinder:
 
         target_items = list(self.targets_per_seq.items())
         total_targets = len(target_items)
+        file_info = f" (from {self.fasta_path.name})" if self.fasta_path else ""
+        logger.info(f"Estimated work size for target overlap calculation: {total_targets} target sequence groups{file_info}")
+
         n_jobs = get_default_cpu_threads()
         batch_size = min(1000, max(1, total_targets // (n_jobs * 4))) if total_targets > 0 else 1000
         target_batches = [
@@ -650,7 +710,9 @@ class DomainFinder:
                             input_collection=target_batches,
                             kwargs=kwargs,
                             description="Calculating target overlaps",
-                            bar=True)
+                            bar=True,
+                            unit="batches",
+                            total=len(target_batches))
 
         for b_rows, b_cols, b_data in p_runner.result:
             if b_rows.size > 0:
@@ -708,9 +770,8 @@ class DomainFinder:
                                          row_lengths=row_domain_lengths,
                                          column_lengths=col_domain_lengths)
 
-        logger.info(f"Clustering {n_domains} domains into families using DPC "
-                    f"with min_fam_sim={min_fam_sim}, halo_stringency={halo_stringency}, "
-                    f"min_fam_dens={min_fam_dens}, halo_method={halo_method}")
+        file_info = f" (from {self.fasta_path.name})" if self.fasta_path else ""
+        logger.info(f"Estimated work size for family clustering: {n_domains} domain instances{file_info}")
 
         peak_to_cluster, n_halo = dpc(rows=rows,
                                       cols=cols,
@@ -723,6 +784,9 @@ class DomainFinder:
                                       min_dens=min_fam_dens)
         self.n_halo_domains = n_halo
         n_clusters = len(peak_to_cluster)
+        self.n_clusters = n_clusters
+
+        logger.info(f"Estimated work size for cluster evaluation: {n_clusters} domain family clusters{file_info}")
 
         cluster_items = [
             (peak_id, [self.domain_index[int(d_id)] for d_id in member_ids])
@@ -740,7 +804,9 @@ class DomainFinder:
                             input_collection=cluster_batches,
                             kwargs=kwargs,
                             description="Evaluating clusters",
-                            bar=True)
+                            bar=True,
+                            unit="batches",
+                            total=len(cluster_batches))
 
         for batch_res in p_runner.result:
             for fam_id, component_domains in batch_res:
@@ -834,8 +900,16 @@ def find_domains(fasta_path: Path,
     reassign_targets = bool(norm_attrs.get("reassign_targets", True))
     min_containment = float(norm_attrs.get("min_containment", 0.6))
 
+    # Count FASTA sequence headers for initial size estimation
+    total_queries = count_fasta_queries(fasta_path)
+    logger.info(f"Estimated work size: {total_queries} query sequences in {fasta_path.name}")
+
     # Perform domain finding and clustering
-    finder = DomainFinder(search=search_stream, source=aligner_name, registry=registry)
+    finder = DomainFinder(search=search_stream,
+                          source=aligner_name,
+                          registry=registry,
+                          fasta_path=fasta_path,
+                          total_queries=total_queries)
     finder.find_domain_instances(min_dom_sim=min_dom_sim,
                                  halo_stringency=dom_halo,
                                  min_dom_dens=min_dom_dens,
@@ -845,12 +919,17 @@ def find_domains(fasta_path: Path,
     finder.merge_targets()
     finder.calculate_target_overlaps()
 
+    families_list = list(finder.families(min_fam_sim=min_fam_sim,
+                                         halo_stringency=fam_halo,
+                                         min_fam_dens=min_fam_dens,
+                                         halo_method=halo_method))
+
     output_gff.parent.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Estimated work size for GFF3 export: {len(families_list)} domain families (to {output_gff.name})")
     with output_gff.open("w") as gff_writer:
-        for fam_id, fam_domains in finder.families(min_fam_sim=min_fam_sim,
-                                                   halo_stringency=fam_halo,
-                                                   min_fam_dens=min_fam_dens,
-                                                   halo_method=halo_method):
+        for fam_id, fam_domains in tqdm(families_list,
+                                       desc="Exporting domain families to GFF3",
+                                       unit="families"):
             for domain in fam_domains:
                 gff_writer.write(domain.to_gff(cluster_id=fam_id, registry=registry) + "\n")
 
