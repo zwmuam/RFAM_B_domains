@@ -1,5 +1,3 @@
-# TODO: Unified Memory & Performance Optimization Guide for `aligners.py` and `domain_finder.py`
-
 ## Executive Summary & Joint Architectural Vision
 
 This guide provides a streamlined, step-by-step blueprint for a future Jules job to execute joint memory and performance optimizations across `aligners.py`, `domain_finder.py`, and `clustering.py`. The primary goal is to enable processing of massive multi-GB alignment files (e.g., 400+ GB BLAST-TAB TSV files with >2 billion records) while strictly keeping peak memory consumption **below 200 GB RAM** (and under 10–20 GB for typical datasets), without degrading downstream domain family extraction speed or accuracy.
