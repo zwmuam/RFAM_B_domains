@@ -1,9 +1,6 @@
 # High-Throughput Optimization & Safe Parallelization Plan (`aligners.py`, `domain_finder.py`, `clustering.py`, `executor.py`)
 
-## Executive Summary & Design Invariants
-This document provides a safe, mathematically verified, and memory-efficient implementation roadmap for optimizing alignment ingestion, span range comparisons, Density Peak Clustering (DPC), and target overlap graph construction across multi-GB alignment datasets.
-
-### Core System Invariants
+## Core System Invariants
 1. **Data & Coordinate Integrity:**
    - Exact preservation of 1-based start/end coordinates (`start`, `end`), strand orientation (`strand` $\in \{-1, 1\}$), partner alignment lists (`partners`), and sequence identifiers (`seq_id`).
    - Zero dropped alignment hits or corrupted coordinate spans.
