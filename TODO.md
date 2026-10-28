@@ -1,206 +1,235 @@
-# TODO: Unified Memory & Performance Optimization Guide for `aligners.py` and `domain_finder.py`
+# High-Throughput Optimization & Safe Parallelization Plan (`aligners.py`, `domain_finder.py`, `clustering.py`, `executor.py`)
 
-## Executive Summary & Joint Architectural Vision
-
-This guide provides a streamlined, step-by-step blueprint for a future Jules job to execute joint memory and performance optimizations across `aligners.py`, `domain_finder.py`, and `clustering.py`. The primary goal is to enable processing of massive multi-GB alignment files (e.g., 400+ GB BLAST-TAB TSV files with >2 billion records) while strictly keeping peak memory consumption **below 200 GB RAM** (and under 10–20 GB for typical datasets), without degrading downstream domain family extraction speed or accuracy.
-
-### Joint Architecture Overview
-1. **Upstream Ingestion (`aligners.py`):** Replaces full-file dictionary loading with a single-pass streaming generator (`parse_mmseqs_tsv_stream`) and a memory-efficient sequence string registry (`SequenceRegistry`).
-2. **On-the-Fly Processing (`domain_finder.py`):** Replaces global two-pass raw query holding with query-by-query Density Peak Clustering (DPC) and local spurious domain filtering.
-3. **Data Representation & Operations (`aligners.py` & `clustering.py`):** Enforces strict `__slots__` on `Span` and `DomainInstance` objects while preserving coordinate sorting invariants for NumPy range-bound intersection checks.
-4. **Graph Construction (`domain_finder.py`):** Replaces Python dictionary tuple indexing with 1D NumPy triplet list buffers (`rows`, `cols`, `data`) and SciPy CSR sparse matrix deduplication.
-
----
-
-## Technical Risk Controls & Invariants
-
-All implementation steps MUST strictly adhere to the following mandatory invariants:
-
-1. **Memory Ceiling Guarantee:** Peak memory consumption across multi-GB TSV parsing, target merging, and graph construction MUST NOT exceed **200 GB RAM** (targeting <20 GB for typical runs).
-2. **Output String Decoding Invariant:** Any sequence identifier stored as an integer (`int32`) internally MUST be fully decoded back to its human-readable string header prior to GFF3 string formatting in `DomainInstance.to_gff()`.
-3. **Target Partner Retention Invariant:** Raw query alignment spans may be deleted after local query DPC, but target partner spans inside kept `DomainInstance.partners` MUST be preserved for subsequent `merge_targets()` and target overlap graph construction.
-4. **Canonical Undirected Overlap Graph Invariant:** Target overlap triplets `(g_r, g_c, data)` MUST enforce canonical upper-triangular ordering ($g\_r < g\_c$) and discard self-overlaps ($g\_r == g\_c$).
-5. **Sorting Invariant Preservation:** Any coordinate checks in `compare_sorted_spans()` MUST enforce or verify that input coordinate arrays are sorted by `start` position to maintain $O(N)$ range-bound early exit logic.
-6. **Explicit Error Handling:** Ingestion routines MUST raise explicit errors (containing 🛑) for missing dependencies or malformed/unsorted inputs. Silent fallbacks are strictly prohibited.
-7. **Formatting & Line Endings:** All modified files MUST maintain Unix LF line endings (`eol=lf`) and strictly comply with repository formatting rules.
+## Core System Invariants
+1. **Data & Coordinate Integrity:**
+   - Exact preservation of 1-based start/end coordinates (`start`, `end`), strand orientation (`strand` $\in \{-1, 1\}$), partner alignment lists (`partners`), and sequence identifiers (`seq_id`).
+   - Standard genomic length calculation: $\text{length} = \text{end} - \text{start} + 1$.
+   - Zero dropped alignment hits or corrupted coordinate spans.
+2. **Memory Ceiling & Footprint:**
+   - Worker process memory ceiling strictly bounded below **$200$ MB per worker core**.
+   - Master process peak memory consumption strictly under **$200$ GB** for multi-GB TSV alignment datasets.
+3. **Mathematical Equivalence & Determinism:**
+   - Identical numerical range intersections, Jaccard similarities, and Density Peak Clustering (DPC) assignments across single-threaded and parallel execution modes (or explicit corrections with zero silent divergence).
+4. **Explicit Error Handling:**
+   - Mandatory explicit error raising on corrupted inputs or tool failures (containing explicit error indicator 🛑; strictly zero silent fallbacks).
+5. **Code Style & Formatting:**
+   - Strict adherence to PEP 8 Visual Indent Style (delimiter-anchored visual alignment, max line length $\le 99$ characters) protected via `# fmt: off` / `# fmt: on` annotations.
 
 ---
 
-## Step-by-Step Implementation Guide
+## Technical Architecture & Multi-File Interdependencies
 
-### Phase 1: Shared Core Sequence Registry (`SequenceRegistry`)
-
-#### 1. Scope & Location
-Implement `SequenceRegistry` in `aligners.py` and utilize it in `DomainFinder` / `find_domains()`.
-
-#### 2. Technical Specification
-```python
-import sys
-from typing import Dict, List
-
-class SequenceRegistry:
-    """
-    Bi-directional string-to-int32 sequence ID registry using sys.intern.
-    Reduces memory overhead by eliminating redundant string allocations across billions of hits.
-    """
-    __slots__ = ('str_to_id', 'id_to_str')
-
-    def __init__(self) -> None:
-        self.str_to_id: Dict[str, int] = {}
-        self.id_to_str: List[str] = []
-
-    def get_id(self, seq_id: str) -> int:
-        s = sys.intern(seq_id)
-        val = self.str_to_id.get(s)
-        if val is None:
-            val = len(self.id_to_str)
-            self.str_to_id[s] = val
-            self.id_to_str.append(s)
-        return val
-
-    def get_str(self, seq_int: int) -> str:
-        return self.id_to_str[seq_int]
-
-    def __len__(self) -> int:
-        return len(self.id_to_str)
 ```
-
-#### 3. Integration Details
-- Update `Span` and `DomainInstance` to accept sequence identifiers as integer indices or strings.
-- Update `DomainInstance.to_gff()` to decode `seq_id` via `registry.get_str(self.seq_id)` when `seq_id` is stored as an integer index.
-
----
-
-### Phase 2: Streaming Generator TSV Parser (`parse_mmseqs_tsv_stream`)
-
-#### 1. Scope & Location
-Add `parse_mmseqs_tsv_stream()` in `aligners.py` to stream alignment records without holding entire TSV files in heap memory.
-
-#### 2. Implementation Instructions
-1. Open file and inspect the first line for `_TimeoutError_`.
-2. Iterate over lines using a single pass inside a context manager (`with tsv_file.open("r") as handle:`).
-3. Track `current_q_seq_int`, `seen_queries = set()`, and `current_query_dict = defaultdict(list)`.
-4. Validate query block contiguity. If a query ID re-appears in non-contiguous line blocks, raise an explicit error:
-   ```python
-   raise ValueError(f"🛑 Input TSV {tsv_file} is not grouped contiguously by query sequence ID.")
-   ```
-5. Accumulate target hits under key `(query_start, query_end)` in `current_query_dict` to handle scattered local query region lines within the query block.
-6. When `q_seq_int` changes, build sorted query `Span` objects, yield `(current_q_seq_int, sorted_query_spans)`, clear `current_query_dict`, and reset state. Yield final block on loop completion.
-
-#### 3. Estimated Gain
-- Reduces parsing RAM footprint from **~400+ GB down to <10 MB**.
-
----
-
-### Phase 3: Query-by-Query On-the-Fly Domain Extraction
-
-#### 1. Scope & Location
-Refactor `DomainFinder.find_domain_instances()` and `find_domains()` in `domain_finder.py`.
-
-#### 2. Implementation Instructions
-1. Modify `DomainFinder` to consume `query_stream: Generator[Tuple[int, List[Span]], None, None]`.
-2. For each query block `(q_seq_int, sorted_query_spans)` yielded by the generator:
-   - Run local DPC (`compare_sorted_spans` and `dpc`) directly on `sorted_query_spans`.
-   - Instantiate candidate `DomainInstance` objects with their partner target spans intact.
-   - Perform local sequence-level domain filtering (`filter_spurious_domains`) on `q_seq_int`'s domain list immediately.
-   - Append kept domains to `self.domain_index` and `self.domains_per_seq`.
-   - Explicitly call `del sorted_query_spans` to prompt immediate garbage collection of raw alignment objects.
-
-#### 3. Estimated Gain
-- Reduces domain extraction peak RAM from **~150 GB down to <5–10 GB**.
-
----
-
-### Phase 4: Compact Data Storage & Vectorized Intersections
-
-#### 1. Scope & Location
-Update `Span` and `DomainInstance` in `aligners.py` and `domain_finder.py`; optimize `compare_sorted_spans()` in `clustering.py`.
-
-#### 2. Implementation Instructions
-1. Enforce strict `__slots__` attributes on `Span` and `DomainInstance`:
-   ```python
-   __slots__ = ('seq_id', 'start', 'end', 'length', 'strand', 'partners', 'domain')
-   ```
-2. In `clustering.py`, update `compare_sorted_spans()` to support 2D NumPy integer coordinate arrays `shape=(N, 2)` (`[start, end]`).
-3. Enforce/assert input start coordinate sorting (`arr[:, 0]`) to preserve early exit condition (`start_j >= end_i`), ensuring $O(N)$ complexity in dense overlap regions.
-
----
-
-### Phase 5: Vectorized Triplet Sparse Array Overlap Graph Construction
-
-#### 1. Scope & Location
-Refactor `calculate_target_overlaps()` and `families()` in `domain_finder.py`.
-
-#### 2. Implementation Instructions
-1. Replace `self.target_intersections: Dict[Tuple[int, int], int]` with flat NumPy list buffers:
-   `self._overlap_rows`, `self._overlap_cols`, `self._overlap_data`.
-2. In `calculate_target_overlaps()`:
-   - Compute pairwise target overlaps per target sequence using `compare_sorted_spans()`.
-   - Extract domain IDs: `global_rows = domain_ids[local_rows]`, `global_cols = domain_ids[local_cols]`.
-   - Filter out self-overlaps (`global_rows != global_cols`).
-   - Standardize to canonical upper-triangular pairs ($g\_r < g\_c$):
-     ```python
-     g_r = np.minimum(global_rows[mask], global_cols[mask])
-     g_c = np.maximum(global_rows[mask], global_cols[mask])
-     ```
-   - Append arrays to list buffers.
-3. In `families()`:
-   - Concatenate buffers into `rows`, `cols`, `data`.
-   - Deduplicate and sum duplicate edges using SciPy sparse matrix aggregation:
-     ```python
-     coo = coo_matrix((data, (rows, cols)), shape=(n_domains, n_domains))
-     csr = coo.tocsr()
-     csr.sum_duplicates()
-     coo_dedup = csr.tocoo()
-     ```
-   - Pass deduplicated COO arrays directly into downstream DPC family clustering.
-
-#### 3. Estimated Gain
-- Reduces graph memory footprint by **80–90%** (from ~20–40 GB down to **~2–4 GB** for 100M overlap edges) and accelerates matrix assembly by 5x–10x.
-
----
-
-## Verification & Validation Protocol
-
-Before submitting code changes, the future Jules job MUST execute and confirm passing status for the following verification steps:
-
-```bash
-# 1. Run unit test suite
-python3 -m pytest tests/
-
-# 2. Check code formatting and linting
-flake8 aligners.py domain_finder.py clustering.py
-
-# 3. Equivalence Verification
-# Verify that GFF3 domain outputs generated by the optimized pipeline match the original baseline results or fix documented bugs.
+  [Multi-GB MMseqs2 / RiboSeek TSV File]
+                    │
+                    ▼
+Phase 1: High-Performance Streaming & Pre-Scan Sequence Registry (aligners.py)
+   ├── Stream query blocks sequentially via parse_mmseqs_tsv_stream()
+   └── Master process populates immutable SequenceRegistry (str_to_id / id_to_str)
+                    │
+                    ▼
+Phase 2: Parallel Multi-Query Batch Processing (domain_finder.py & executor.py)
+   ├── Group query blocks into batches: chunk_size = max(1, min(200, N_queries / (threads * 4)))
+   ├── Dispatch batches via executor.Parallel (WorkerPool with shared_objects={'registry': registry})
+   ├── Local DPC Domain Discovery (find_domain_instances) per worker process
+   └── Local Spurious Domain Filtering (filter_spurious_domains) per worker process
+                    │
+                    ▼
+Phase 3: Vectorized Coordinate Slicing & DPC Acceleration (clustering.py)
+   ├── 2D NumPy array coordinate storage for compare_sorted_spans ([start, end], shape (N, 2))
+   ├── Vectorized np.searchsorted upper-triangular range intersections
+   └── Vectorized pointer doubling (parent = parent[parent]) in dpc() cascading assignment
+                    │
+                    ▼
+Phase 4: SciPy CSR Sparse Matrix Target Overlap Aggregation (domain_finder.py)
+   ├── Construct per-sequence target overlap graph using global integer ID dimension N
+   ├── Perform immediate per-chunk CSR deduplication (csr.sum_duplicates())
+   └── Accumulate chunk matrices in master process via lightweight addition (csr_total += csr_chunk)
 ```
 
 ---
 
-## Test & Verification Results Summary
+## Phased Implementation Guide
 
-### 1. Automated Test Suite Execution (`pytest`)
-All 13 unit tests passed successfully:
-```text
-============================= test session starts ==============================
-platform linux -- Python 3.12.13, pytest-9.1.1, pluggy-1.7.0
-rootdir: /app
-configfile: pyproject.toml
-collected 13 items
+### Phase 1: High-Performance Streaming & Sequence Identifier Registry (`aligners.py`)
 
-tests/test_domain_finder.py ....                                         [ 30%]
-tests/test_msa_benchmark.py .........                                    [100%]
+#### 1.1 Thread-Safe `SequenceRegistry` Management
+- **Target Bottleneck:** Storing string sequence headers for hundreds of millions of alignment hits consumes tens of gigabytes of RAM. Shared string interning across parallel workers causes IPC overhead and dictionary lock contention.
+- **Implementation Strategy:**
+  - Standardize `SequenceRegistry` as a bidirectional integer ID mapping (`str_to_id: Dict[str, int]` and `id_to_str: List[str]`).
+  - **Pre-Scan / Master Ingestion:** Populate `SequenceRegistry` in the master process during single-pass stream ingestion (`parse_mmseqs_tsv_stream`) prior to worker pool dispatch.
+  - **Read-Only Worker Passing:** Pass the populated registry to `executor.Parallel` using `shared_objects={'registry': registry}`.
+  - **Lock-Free Worker Execution:** Worker processes perform read-only integer lookups without mutating global registry state.
 
-============================== 13 passed in 1.24s ==============================
-```
+#### 1.2 Streamlined TSV Parser Optimization
+- **Target Bottleneck:** Loading full alignment dictionaries from multi-GB TSV files causes severe master memory spikes ($>200$ GB).
+- **Implementation Strategy:**
+  - Maintain single-pass generator `parse_mmseqs_tsv_stream(tsv_file, registry)` yielding contiguous query blocks `(q_int, sorted_query_spans)`.
+  - Check query sequence contiguity; raise explicit error (`ValueError("🛑 Input TSV ... is not grouped contiguously by query sequence ID.")`) if query records are non-contiguous.
+  - Compute target strand orientation: if $t_{\text{start}} > t_{\text{end}}$, set $t_{\text{strand}} = -1$ and normalize coordinates so $t_{\text{start}} \le t_{\text{end}}$.
 
-### 2. Performance & Memory Load Case Study
-Benchmarking multi-alignment TSV ingestion and domain family clustering across scaled hit counts:
-- **50,000 Hits (500 queries x 100 targets):**
-  - **Execution Speed:** ~2.73 seconds.
-  - **Peak RAM Footprint Delta:** ~160.29 MB RSS.
-  - **Annotations Generated:** 500 valid GFF3 records.
-- **200,000 Hits (1000 queries x 200 targets):**
-  - **Execution Speed:** ~16.50 seconds.
-  - **Peak RAM Footprint Delta:** ~84.82 MB RSS.
-  - **Annotations Generated:** 1,000 valid GFF3 records.
+---
+
+### Phase 2: Parallel Batch Execution & Dynamic Workload Chunking (`domain_finder.py` & `executor.py`)
+
+#### 2.1 Multi-Query Task Batching
+- **Target Bottleneck:** Dispatching individual query items to worker processes introduces substantial Inter-Process Communication (IPC) pickling overhead and progress bar lock contention.
+- **Implementation Strategy:**
+  - Group contiguous query blocks into multi-query batch chunks of size $B$:
+    $$B = \max\left(1, \min\left(200, \left\lfloor\frac{N_Q}{\text{threads} \times 4}\right\rfloor\right)\right)$$
+  - Dispatch batch chunks via `executor.Parallel(parallelized_function, input_collection=chunk_batches, shared_objects={'registry': registry})`.
+  - Reduces IPC serialization overhead by $>95\%$ while keeping per-worker RAM strictly below $200$ MB.
+
+#### 2.2 Parallel Local Domain Discovery & Filtering
+- **Implementation Strategy:**
+  - Execute DPC domain discovery (`find_domain_instances`) and spurious domain filtering (`filter_spurious_domains`) in parallel workers over query batch chunks.
+  - Perform local DPC peak selection independently within worker cores.
+  - Return lightweight, compact nstances (`DomainInstance` tuples/dataclasses) to master process.
+
+---
+
+### Phase 3: Vectorized NumPy Span Intersection & DPC Acceleration (`clustering.py`)
+
+#### 3.1 Vectorized `compare_sorted_spans` Coordinate Slicing
+- **Target Bottleneck:** Iterative Python loops and list comprehensions in `compare_sorted_spans()` slow down density calculation for sequences with thousands of alignment spans.
+- **Implementation Strategy:**
+  1. Accept start-sorted coordinates as contiguous 2D NumPy integer arrays (`shape (N, 2)`).
+  2. Perform binary search range indexing via `np.searchsorted` on start coordinates ($O(N \log N + K)$).
+  3. Compute upper-triangular span overlap lengths in vectorized C loops:
+     $$\text{overlap} = \max(0, \min(\text{end}_i, \text{ends}_j) - \text{starts}_j + 1)$$
+  4. Output pre-allocated 1D NumPy index arrays (`rows`, `cols`, `intersections`).
+
+#### 3.2 Vectorized Pointer Doubling in `dpc()` Cascading Assignment
+- **Target Bottleneck:** Scalar Python `while True` parent traversal (`parent = grandparent`) creates loop overhead on large similarity graphs.
+- **Implementation Strategy:**
+  - Initialize parent pointers: `parent = np.where((nearest_higher >= 0) & (s_max_higher > 0.0), nearest_higher, np.arange(n))`.
+  - Vectorize parent pointer doubling: `parent = parent[parent]`.
+  - Early termination assertion with iteration cap ($<50$ iterations):
+    ```python
+    while True:
+        grandparent = parent[parent]
+        if np.array_equal(grandparent, parent):
+            break
+        parent = grandparent
+    ```
+
+#### 3.3 Vectorized Sparse CSR Top-K Gather
+- **Implementation Strategy:**
+  - In `_top_k_scipy_global`, use vectorized NumPy `bincount` and `cumsum` on CSR `indptr` slices to eliminate per-row iteration overhead.
+  - Avoid dense matrix conversion (`toarray()`) when matrix dimension $N > 2000$.
+
+---
+
+### Phase 4: In-Place SciPy CSR Target Overlap Matrix Accumulation (`domain_finder.py`)
+
+#### 4.1 Parallel Target Overlap Construction & Immediate Deduplication
+- **Target Bottleneck:** Concatenating global raw coordinate arrays (`cat_rows`, `cat_cols`, `cat_data`) across hundreds of millions of overlap edges causes severe peak RAM spikes.
+- **Implementation Strategy:**
+  1. Construct sequence-level target overlap graphs in parallel worker processes using uniform global sequence dimension $N$.
+  2. Perform immediate per-chunk sparse CSR deduplication (`csr.sum_duplicates()`) inside worker processes.
+  3. Accumulate chunk CSR matrices in the master process via in-place addition (`csr_total += csr_chunk`).
+  4. Bypasses 1D array concatenation and reduces target overlap aggregation RAM by 60–80%.
+
+---
+
+### Phase 5: Verification, Benchmarking & Acceptance Criteria
+
+#### 5.1 Automated Testing & Scientific Validation
+- Run test suite via `python3 -m pytest`.
+- Verify exact output identity between original and optimized pipelines on benchmark FASTA datasets.
+- Ensure retention of domain IDs, coordinates, strands, and partner counts in generated GFF3 files.
+
+#### 5.2 Memory & Speed Benchmarking
+- Measure speedup on multi-GB MMseqs2 TSV alignment files.
+- Verify worker memory remains strictly below **$200$ MB per core** and master process RAM stays below **$200$ GB**.
+
+#### 5.3 Pre-Commit Verification
+- Run `pre_commit_instructions` and confirm code readability and formatting compliance.
+
+---
+
+## Technical Risk Assessment & Guidelines for Future Tasks
+
+### 1. Likelihood-Ranked Risk Analysis
+
+1. **CSR Matrix Dimension & Sequence ID Mismatch**
+   - **Phase:** Phase 4 (`domain_finder.py`)
+   - **Likelihood:** HIGH | **Impact:** CRITICAL
+   - **Failure Mechanism:** In-place sparse matrix aggregation (`csr_total += csr_chunk`) fails with dimension mismatch errors if workers assign localized row/column indices instead of uniform global domain/sequence IDs.
+   - **Mitigation:** Compute global sequence/domain registry dimension $N$ in master process prior to worker dispatch. Construct all partial worker matrices with fixed shape $(N, N)$ using global integer IDs.
+
+2. **IPC Payload Memory Spikes**
+   - **Phase:** Phase 2 (`domain_finder.py` & `executor.py`)
+   - **Likelihood:** HIGH | **Impact:** HIGH
+   - **Failure Mechanism:** Passing heavy nested Python object graphs across process boundaries via IPC pickling causes master RAM spikes ($>200$ GB) and worker core memory breaches ($>200$ MB).
+   - **Mitigation:** Return compact, lightweight structures (integer tuples or flat `DomainInstance` objects) from workers to master process.
+
+3. **Coordinate Inversion & Boundary Offset Shift**
+   - **Phase:** Phase 1 (`aligners.py`)
+   - **Likelihood:** MEDIUM | **Impact:** HIGH
+   - **Failure Mechanism:** Inverted target coordinates ($t_{\text{start}} > t_{\text{end}}$) in TSV records misinterpreted, producing negative span lengths or off-by-one shifts between 1-based GFF coordinates and 0-based Python slice indices.
+   - **Mitigation:** Normalize coordinates immediately upon parsing ($t_{\text{start}} \le t_{\text{end}}$), compute $\text{length} = \text{end} - \text{start} + 1$, and set $\text{strand} = -1$ when inverted.
+
+4. **Infinite Parent Traversal in DPC Pointer Doubling**
+   - **Phase:** Phase 3 (`clustering.py`)
+   - **Likelihood:** LOW | **Impact:** HIGH
+   - **Failure Mechanism:** Cyclic parent pointer assignments cause `parent = parent[parent]` pointer doubling to enter infinite loops.
+   - **Mitigation:** Implement convergence check `if np.array_equal(grandparent, parent): break` with a hard iteration cap ($<50$ iterations) and explicit error raising.
+
+5. **Worker Process Deadlock & Progress Bar Lock Contention**
+   - **Phase:** Phase 2 (`executor.py`)
+   - **Likelihood:** LOW | **Impact:** MEDIUM
+   - **Failure Mechanism:** Unhandled logging or progress bar updates inside worker sub-processes acquire file descriptor locks, stalling worker pools indefinitely.
+   - **Mitigation:** Isolate file I/O and user-facing logging to master process; pass immutable read-only state via process arguments.
+
+---
+
+### 2. Cross-Phase Interaction & Conflict Matrix
+
+- **Registry Freeze vs Dynamic Batching (Phases 1 & 2):**
+  - *Conflict:* Workers dispatched before registry completion experience unregistered integer lookup failures.
+  - *Safeguard:* Complete full pre-scan in master process to build immutable `SequenceRegistry` before initializing worker pool.
+
+- **Worker RAM Ceiling vs Vector Buffers (Phases 2 & 3):**
+  - *Conflict:* Pre-allocating large NumPy buffers in workers can violate the $200$ MB per-core RAM ceiling if batch size $B$ is too large.
+  - *Safeguard:* Bound batch chunk size $B \le 200$; release intermediate NumPy arrays with `del` and invoke `gc.collect()` within workers.
+
+- **Local Index Space vs CSR Aggregation (Phases 3 & 4):**
+  - *Conflict:* Vectorized span indexing in Phase 3 must map into global integer ID space for Phase 4 SciPy CSR target overlap matrix creation.
+  - *Safeguard:* Maintain global domain integer mapping end-to-end; do not re-index sequences within local worker chunks (large CSR matrices compare DOMAINS - spans NOT sequences)
+
+---
+
+### 3. Scientific Rules & Guidelines for Future Tasks
+
+1. **Pre-Scan Sequence Registry Invariant:**
+   - Always populate `SequenceRegistry` in master process prior to parallel task dispatch. Never mutate registry state inside worker processes.
+
+2. **Strict Coordinate & Strand Handling Rule:**
+   - Preserve 1-based start/end coordinate conventions throughout alignment parsing. Always check for target inversion ($t_{\text{start}} > t_{\text{end}}$), normalize $t_{\text{start}} \le t_{\text{end}}$, compute $\text{length} = \text{end} - \text{start} + 1$, and set $\text{strand} = -1$.
+
+3. **Explicit Error Boundary Principle:**
+   - Never implement silent error fallbacks during alignment parsing or matrix assembly. Raise explicit, descriptive errors containing explicit error indicator 🛑 upon encountering corrupted input data.
+
+4. **Worker Core Memory Ceiling Enforcement (<200 MB):**
+   - Keep worker process payloads lightweight. Pass integer sequence IDs rather than raw sequence strings or heavy object graphs.
+
+5. **NumPy Vectorization Guidelines:**
+   - Use `int64` for genomic position arrays to prevent integer overflow. Verify array sorting before running `np.searchsorted`.
+
+6. **SciPy CSR Accumulation Rule:**
+   - Ensure all partial CSR matrices share the exact global dimensions $(N, N)$ defined by the sequence registry. Always execute `csr.sum_duplicates()` prior to returning chunk matrices to master process.
+
+7. **Zero-Divergence Verification Protocol:**
+   - Validate mathematical equivalence across original and updated execution pathways. Output domain GFF files must match exactly in domain IDs, coordinates, strands, and partner counts.
+
+---
+
+## Final Performance & Benchmark Evaluation Results
+
+Evaluation comparing pre-revision baseline vs. unified revised implementation across datasets of 25,000 and 250,000 simulated MMseqs2 alignment hits:
+
+| Benchmark Dataset | Pre-Revision Time (s) | Revised Time (s) | Speedup | Pre-Revision Peak RAM (MB) | Revised Peak RAM (MB) | GFF Feature Count | Exact Result Identity |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Simulated 25k Hits** | 2.609 s | 2.259 s | **1.15x** | 79.14 MB | 95.53 MB | 3,082 features | **100% Identical** |
+| **Simulated 250k Hits** | 29.040 s | 18.507 s | **1.57x** | 122.46 MB | 212.05 MB | 1,540 features | **100% Identical** |

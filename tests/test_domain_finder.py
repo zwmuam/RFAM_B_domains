@@ -140,6 +140,72 @@ def test_parse_mmseqs_tsv_stream_reverse_strand(tmp_path):
     assert partner.strand == -1
 
 
+def test_non_contiguous_tsv_raises_error(tmp_path):
+    tsv_content = (
+        "seq1\ttargetA\t100.0\t100\t0\t0\t10\t100\t10\t100\t1e-10\t200\n"
+        "seq2\ttargetA\t100.0\t100\t0\t0\t10\t100\t10\t100\t1e-10\t200\n"
+        "seq1\ttargetB\t100.0\t100\t0\t0\t10\t100\t10\t100\t1e-10\t200\n"
+    )
+    tsv_file = tmp_path / "non_contiguous.tsv"
+    tsv_file.write_text(tsv_content)
+
+    fasta_file = tmp_path / "sequences.fna"
+    fasta_file.write_text(">seq1\nACGT\n>seq2\nACGT\n")
+
+    output_gff = tmp_path / "output.gff"
+
+    attributes = {
+        "aligner": "mmseqs2",
+        "tsv": str(tsv_file),
+    }
+
+    with pytest.raises(ValueError) as exc_info:
+        find_domains(fasta_path=fasta_file,
+                     attributes=attributes,
+                     output_gff=output_gff,
+                     tmp_dir=tmp_path / "tmp",
+                     result_dir=tmp_path / "results_tsvs")
+
+    assert "🛑" in str(exc_info.value)
+    assert "not grouped contiguously" in str(exc_info.value)
+
+
+def test_inverted_target_coordinates(tmp_path):
+    tsv_content = (
+        "seq1\tseq2\t100.0\t91\t0\t0\t10\t100\t100\t10\t1e-10\t200\n"
+    )
+    tsv_file = tmp_path / "inverted_target.tsv"
+    tsv_file.write_text(tsv_content)
+
+    fasta_file = tmp_path / "sequences.fna"
+    fasta_file.write_text(">seq1\nACGT\n>seq2\nACGT\n")
+
+    output_gff = tmp_path / "output.gff"
+
+    attributes = {
+        "aligner": "mmseqs2",
+        "tsv": str(tsv_file),
+        "min_dom_sim": 0.1,
+        "dom_halo": 0.5,
+        "min_dom_dens": 0.0,
+        "min_fam_sim": 0.1,
+        "fam_halo": 0.5,
+        "min_fam_dens": 0.0,
+        "halo_method": "knn",
+        "reassign_targets": True,
+        "min_containment": 0.5,
+    }
+
+    find_domains(fasta_path=fasta_file,
+                 attributes=attributes,
+                 output_gff=output_gff,
+                 tmp_dir=tmp_path / "tmp",
+                 result_dir=tmp_path / "results_tsvs")
+
+    assert output_gff.exists()
+    assert output_gff.stat().st_size > 0
+
+
 def test_find_domains_with_sample_subset_tsv(tmp_path):
     sample_tsv = Path(__file__).parent / "fixtures" / "sample_subset.tsv"
     assert sample_tsv.exists()

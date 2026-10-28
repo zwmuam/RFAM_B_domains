@@ -34,7 +34,108 @@ from aligners import (SequenceRegistry, Span, mmseq_easy_search, parse_mmseqs_ts
                       parse_mmseqs_tsv_stream, riboseek_easy_search)
 from clustering import (compare_sorted_spans, dpc, jaccard_index,
                         max_containment)
+from executor import Parallel
 from tweaks import default_threads, logger
+
+
+def _process_query_batch(batch_items: Any,
+                         min_dom_sim: float,
+                         halo_stringency: float,
+                         min_dom_dens: float,
+                         halo_method: Optional[str],
+                         source: str) -> Tuple[List[Tuple[Any, int, int, int, List[Span]]], int]:
+    """
+    Worker function to process a batch chunk of query sequences for domain discovery.
+    Returns tuple of (batch_results, batch_halo_alns).
+    """
+    if isinstance(batch_items, tuple) and len(batch_items) == 2 and not isinstance(batch_items[0], (tuple, list)):
+        batch_items = [batch_items]
+
+    batch_results = []
+    batch_halo_alns = 0
+    for q_seq_id, sorted_query_spans in batch_items:
+        n_spans = len(sorted_query_spans)
+        if n_spans == 0:
+            continue
+        elif n_spans == 1:
+            peak_span, = sorted_query_spans
+            targets = peak_span.partners + [peak_span]
+            strands = [t.strand for t in peak_span.partners]
+            batch_results.append((q_seq_id, peak_span.start, sum(strands), peak_span.end, targets))
+        else:
+            rows, cols, intersections = compare_sorted_spans(sorted_query_spans)
+            if rows.size == 0:
+                peak_to_cluster = {p: np.array([p]) for p in range(n_spans)}
+            else:
+                span_lengths = np.array([s.length for s in sorted_query_spans])
+                weights = np.array([s.n_partners() for s in sorted_query_spans])
+                similarities = jaccard_index(intersections=intersections,
+                                             row_lengths=span_lengths[rows],
+                                             column_lengths=span_lengths[cols])
+                peak_to_cluster, n_noise = dpc(rows=rows,
+                                               cols=cols,
+                                               sims=similarities,
+                                               n=n_spans,
+                                               min_sim=min_dom_sim,
+                                               weights=weights,
+                                               backend="numpy",
+                                               filter_transparency=halo_stringency,
+                                               halo_method=halo_method,
+                                               min_dens=min_dom_dens)
+                batch_halo_alns += n_noise
+
+            for peak_id, member_ids in peak_to_cluster.items():
+                peak_span = sorted_query_spans[peak_id]
+                member_targets = []
+                for m_id in member_ids:
+                    member_targets.extend(sorted_query_spans[int(m_id)].partners)
+                targets = member_targets + [peak_span]
+                strands = [t.strand for t in member_targets]
+                batch_results.append((q_seq_id, peak_span.start, sum(strands), peak_span.end, targets))
+    return batch_results, batch_halo_alns
+
+
+def _process_overlap_batch(batch_targets: Any,
+                           n_domains: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Worker function to process target sequence batches and return deduplicated sparse COO triplets.
+    """
+    if isinstance(batch_targets, tuple) and len(batch_targets) == 2 and not isinstance(batch_targets[0], (tuple, list)):
+        batch_targets = [batch_targets]
+
+    batch_rows, batch_cols, batch_data = [], [], []
+    for seq_id, targets in batch_targets:
+        n_targets = len(targets)
+        if n_targets > 1:
+            sorted_targets = sorted(targets, key=lambda s: s.start)
+            local_rows, local_cols, intersections = compare_sorted_spans(sorted_targets)
+            if local_rows.size > 0:
+                domain_ids = np.array([t.domain for t in sorted_targets], dtype=np.int32)
+                global_rows = domain_ids[local_rows]
+                global_cols = domain_ids[local_cols]
+                mask = global_rows != global_cols
+                if np.any(mask):
+                    g_r = np.minimum(global_rows[mask], global_cols[mask])
+                    g_c = np.maximum(global_rows[mask], global_cols[mask])
+                    coo = coo_matrix((intersections[mask], (g_r, g_c)), shape=(n_domains, n_domains))
+                    csr = coo.tocsr()
+                    csr.sum_duplicates()
+                    coo_dedup = csr.tocoo()
+                    batch_rows.append(coo_dedup.row)
+                    batch_cols.append(coo_dedup.col)
+                    batch_data.append(coo_dedup.data)
+
+    if not batch_rows:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+
+    cat_r = np.concatenate(batch_rows)
+    cat_c = np.concatenate(batch_cols)
+    cat_d = np.concatenate(batch_data)
+    coo_batch = coo_matrix((cat_d, (cat_r, cat_c)), shape=(n_domains, n_domains))
+    csr_batch = coo_batch.tocsr()
+    csr_batch.sum_duplicates()
+    coo_out = csr_batch.tocoo()
+    return coo_out.row, coo_out.col, coo_out.data
 
 
 def _normalize_attributes(attributes: Dict[str, Any]) -> Dict[str, Any]:
@@ -162,7 +263,7 @@ class DomainFinder:
                               min_dom_dens: float,
                               halo_method: Optional[str]) -> None:
         """
-        Identify candidate domain instances across query sequences via DPC density peaks.
+        Identify candidate domain instances across query sequences via DPC density peaks using parallel task batching.
 
         :param min_dom_sim: Minimum domain similarity threshold.
         :param halo_stringency: Halo stringency parameter.
@@ -171,57 +272,45 @@ class DomainFinder:
         :return: None
         """
         query_iterable = (
-            self.search.items() if isinstance(self.search, dict) else self.search
+            list(self.search.items()) if isinstance(self.search, dict) else list(self.search)
         )
-        total_queries = len(self.search) if isinstance(self.search, dict) else None
+        total_queries = len(query_iterable)
+        if total_queries == 0:
+            return
 
-        with tqdm(total=total_queries, desc="Finding domain instances") as pbar:
-            for item in query_iterable:
-                if isinstance(item, tuple) and len(item) == 2:
-                    q_seq_id, sorted_query_spans = item
-                else:
-                    sorted_query_spans = item
+        batch_size = max(100, min(2000, total_queries // (default_threads * 4) if default_threads > 0 else 100))
+        query_batches = [
+            query_iterable[i:i + batch_size]
+            for i in range(0, total_queries, batch_size)
+        ]
 
-                n_spans = len(sorted_query_spans)
-                if n_spans == 0:
-                    pbar.update(1)
-                    continue
-                elif n_spans == 1:
-                    peak_span, = sorted_query_spans
-                    self.create_new_domain(peak_span=peak_span,
-                                           targets=peak_span.partners)
-                else:
-                    rows, cols, intersections = compare_sorted_spans(sorted_query_spans)
-                    if rows.size == 0:
-                        peak_to_cluster = {p: np.array([p]) for p in range(n_spans)}
-                    else:
-                        span_lengths = np.array([s.length for s in sorted_query_spans])
-                        weights = np.array([s.n_partners() for s in sorted_query_spans])
+        kwargs = {
+            "min_dom_sim": min_dom_sim,
+            "halo_stringency": halo_stringency,
+            "min_dom_dens": min_dom_dens,
+            "halo_method": halo_method,
+            "source": self.source
+        }
 
-                        similarities = jaccard_index(intersections=intersections,
-                                                     row_lengths=span_lengths[rows],
-                                                     column_lengths=span_lengths[cols])
+        p_runner = Parallel(parallelized_function=_process_query_batch,
+                            input_collection=query_batches,
+                            kwargs=kwargs,
+                            description="Finding domain instances",
+                            bar=True)
 
-                        peak_to_cluster, n_noise = dpc(rows=rows,
-                                                       cols=cols,
-                                                       sims=similarities,
-                                                       n=n_spans,
-                                                       min_sim=min_dom_sim,
-                                                       weights=weights,
-                                                       backend="numpy",
-                                                       filter_transparency=halo_stringency,
-                                                       halo_method=halo_method,
-                                                       min_dens=min_dom_dens)
-                        self.n_halo_alns += n_noise
-
-                    for peak_id, member_ids in peak_to_cluster.items():
-                        peak_span = sorted_query_spans[peak_id]
-                        member_targets = []
-                        for m_id in member_ids:
-                            member_targets.extend(sorted_query_spans[int(m_id)].partners)
-                        self.create_new_domain(peak_span=peak_span,
-                                               targets=member_targets)
-                pbar.update(1)
+        for batch_res, batch_halo in p_runner.result:
+            self.n_halo_alns += batch_halo
+            for q_seq_id, start, summary_strand, end, targets in batch_res:
+                new_domain = DomainInstance(seq_id=q_seq_id,
+                                            start=start,
+                                            summary_strand=summary_strand,
+                                            end=end,
+                                            targets=targets,
+                                            source=self.source)
+                if new_domain.seq_id not in self.domains_per_seq:
+                    self.domains_per_seq[new_domain.seq_id] = []
+                self.domains_per_seq[new_domain.seq_id].append(new_domain)
+                self.n_domains += 1
 
         logger.info(f"Found {self.n_domains} domain instances across "
                     f"{len(self.domains_per_seq)} query sequences")
@@ -386,35 +475,34 @@ class DomainFinder:
 
     def calculate_target_overlaps(self) -> None:
         """
-        Calculate pairwise target overlaps across domains to construct overlap graph.
+        Calculate pairwise target overlaps across domains to construct overlap graph using parallel batching.
 
         :return: None
         """
         n_domains = len(self.domain_index)
-        with tqdm(total=len(self.targets_per_seq),
-                  desc="Calculating target overlaps") as pbar:
-            for seq_id, targets in self.targets_per_seq.items():
-                n_targets = len(targets)
-                if n_targets > 1:
-                    sorted_targets = sorted(targets, key=lambda s: s.start)
-                    local_rows, local_cols, intersections = compare_sorted_spans(sorted_targets)
-                    if local_rows.size > 0:
-                        domain_ids = np.array([t.domain for t in sorted_targets], dtype=np.int32)
-                        global_rows = domain_ids[local_rows]
-                        global_cols = domain_ids[local_cols]
-                        mask = global_rows != global_cols
-                        if np.any(mask):
-                            g_r = np.minimum(global_rows[mask], global_cols[mask])
-                            g_c = np.maximum(global_rows[mask], global_cols[mask])
-                            # Perform immediate local deduplication per sequence to keep memory minimal
-                            coo = coo_matrix((intersections[mask], (g_r, g_c)), shape=(n_domains, n_domains))
-                            csr = coo.tocsr()
-                            csr.sum_duplicates()
-                            coo_dedup = csr.tocoo()
-                            self._overlap_rows.append(coo_dedup.row)
-                            self._overlap_cols.append(coo_dedup.col)
-                            self._overlap_data.append(coo_dedup.data)
-                pbar.update(1)
+        if n_domains == 0 or not self.targets_per_seq:
+            return
+
+        target_items = list(self.targets_per_seq.items())
+        total_targets = len(target_items)
+        batch_size = max(100, min(2000, total_targets // (default_threads * 4) if default_threads > 0 else 100))
+        target_batches = [
+            target_items[i:i + batch_size]
+            for i in range(0, total_targets, batch_size)
+        ]
+
+        kwargs = {"n_domains": n_domains}
+        p_runner = Parallel(parallelized_function=_process_overlap_batch,
+                            input_collection=target_batches,
+                            kwargs=kwargs,
+                            description="Calculating target overlaps",
+                            bar=True)
+
+        for b_rows, b_cols, b_data in p_runner.result:
+            if b_rows.size > 0:
+                self._overlap_rows.append(b_rows)
+                self._overlap_cols.append(b_cols)
+                self._overlap_data.append(b_data)
 
     def families(self,
                  min_fam_sim: float,
