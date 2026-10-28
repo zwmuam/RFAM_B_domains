@@ -23,9 +23,9 @@ class SequenceRegistry:
     def get_id(self, seq_id: Union[str, int]) -> int:
         if isinstance(seq_id, int):
             return seq_id
-        s = sys.intern(seq_id)
-        val = self.str_to_id.get(s)
+        val = self.str_to_id.get(seq_id)
         if val is None:
+            s = sys.intern(seq_id)
             val = len(self.id_to_str)
             self.str_to_id[s] = val
             self.id_to_str.append(s)
@@ -111,7 +111,8 @@ def parse_mmseqs_tsv_stream(tsv_file: Path,
             q_seq_str = fields[1]
             q_start, q_end = int(fields[8]), int(fields[9])
 
-            assert q_start <= q_end, f'🛑 Query inversion is not expected for MMseqs2 results: {line}'
+            if q_start > q_end:
+                raise ValueError(f"🛑 Query inversion is not expected for MMseqs2 results: {line}")
 
             t_seq_str = fields[0]
             if q_seq_str == t_seq_str:
@@ -356,4 +357,4 @@ def mmseq_easy_search(fasta_file: Path,
             with open(result_file, 'w') as f:
                 f.write("_TimeoutError_")
 
-        return parse_mmseqs_tsv(result_file)
+        return parse_mmseqs_tsv(result_file, registry=registry)
