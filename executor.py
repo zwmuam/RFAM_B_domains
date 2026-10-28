@@ -117,17 +117,20 @@ class Parallel:
         if random_replicates:
             ss = np.random.SeedSequence()
             child_seeds = ss.spawn(random_replicates)
-            input_collection = [int(s.generate_state(1)[0]) for s in child_seeds]
+            input_list: Any = [int(s.generate_state(1)[0]) for s in child_seeds]
             description = f'{description} 🎲'
+        else:
+            input_list = input_collection
 
-        input_list = (list(input_collection) if not isinstance(input_collection, list)
-                      else input_collection)
-        total_items = len(input_list)
-
-        if chunk_size == 'auto':
-            if total_items > 0 and n_jobs > 0:
-                chunk_size = max(1, total_items // (n_jobs * 4))
-            else:
+        if isinstance(input_list, (list, tuple)):
+            total_items = len(input_list)
+            if chunk_size == 'auto':
+                if total_items > 0 and n_jobs > 0:
+                    chunk_size = max(1, total_items // (n_jobs * 4))
+                else:
+                    chunk_size = 1
+        else:
+            if chunk_size == 'auto':
                 chunk_size = 1
 
         worker_kwargs = {'shared_objects': shared_objects} if shared_objects else {}
