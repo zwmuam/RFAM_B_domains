@@ -107,16 +107,20 @@ def parse_mmseqs_tsv_stream(tsv_file: Path,
             line = line.rstrip('\n')
             fields = line.split('\t')
 
-            # BLAST-TAB format: target (0), query (1), ..., target_start (6), target_end (7), query_start (8), query_end (9)
-            q_seq_str = fields[1]
-            q_start, q_end = int(fields[8]), int(fields[9])
+            # BLAST-TAB format: query (0), target (1), ..., query_start (6), query_end (7), target_start (8), target_end (9)
+            q_seq_str = fields[0]
+            t_seq_str = fields[1]
 
-            if q_start > q_end:
-                raise ValueError(f"🛑 Query inversion is not expected for MMseqs2 results: {line}")
-
-            t_seq_str = fields[0]
             if q_seq_str == t_seq_str:
                 continue
+
+            q_start, q_end = int(fields[6]), int(fields[7])
+            t_start, t_end = int(fields[8]), int(fields[9])
+
+            # Determine relative alignment strand and normalize range endpoints
+            t_strand = -1 if (q_start > q_end) ^ (t_start > t_end) else 1
+            q_start, q_end = min(q_start, q_end), max(q_start, q_end)
+            t_start, t_end = min(t_start, t_end), max(t_start, t_end)
 
             q_int = registry.get_id(q_seq_str)
 
@@ -130,13 +134,6 @@ def parse_mmseqs_tsv_stream(tsv_file: Path,
                 current_query_dict.clear()
                 current_q_int = q_int
                 seen_queries.add(q_int)
-
-            t_start, t_end = int(fields[6]), int(fields[7])
-            if t_start > t_end:
-                t_strand = -1
-                t_start, t_end = t_end, t_start
-            else:
-                t_strand = 1
 
             t_int = registry.get_id(t_seq_str)
             current_query_dict[(q_start, q_end)].append((t_int, t_start, t_end, t_strand))
