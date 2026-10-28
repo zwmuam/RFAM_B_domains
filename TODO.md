@@ -249,16 +249,6 @@ Benchmarking multi-alignment TSV ingestion and domain family clustering across s
   - Pointer doubling reaches cluster peaks in logarithmic iterations ($O(\log D)$, where $D$ is max tree depth).
   - Exact match of cluster labels and halo noise assignments guaranteed.
 
----
-
-### Section 2: Comprehensive Proposal Evaluation Matrix
-
-| Proposal | Target Module(s) | Implementation Complexity | Potential Speedup / Throughput Gain | Memory & Data Integrity Risk | Overall Assessment |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Proposal 1: Vectorized Range Slicing** | `clustering.py` | Low (Modest array indexing refactor) | **2.5x – 4.0x** speedup in span overlap checks | **Zero Risk** (Identical coordinate math; zero extra memory) | **High Priority:** Quick win, zero risk, massive speedup for dense alignments. |
-| **Proposal 2: Parallel Batch Ingestion & DPC** | `aligners.py`, `domain_finder.py`, `executor.py` | Medium (Batch streaming & worker mapping) | **Linear Scaling** ($N_{\text{cores}} \times$ overall pipeline speedup) | **Zero Risk** (Worker RAM strictly bounded by chunk size) | **High Priority:** Unlocks full multi-core CPU utilization across multi-GB TSVs. |
-| **Proposal 3: SciPy CSR Chunk Aggregation** | `domain_finder.py` | Medium (Sparse CSR accumulator refactor) | **3.0x – 5.0x** speedup in overlap graph assembly | **Zero Risk** (Mathematically exact matrix addition $\mathbf{A}+\mathbf{B}$) | **High Priority:** Eliminates single-threaded target overlap bottleneck and RAM spikes. |
-| **Proposal 4: Vectorized Pointer Doubling & CSR Gather** | `clustering.py` | Low-Medium (NumPy array operations) | **1.8x – 2.5x** speedup in DPC execution | **Zero Risk** (Exact equivalence verified by unit tests) | **Medium-High Priority:** Accelerates DPC family clustering on massive graphs. |
 
 ---
 
