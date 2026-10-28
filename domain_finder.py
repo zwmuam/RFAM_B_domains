@@ -34,7 +34,7 @@ from aligners import (SequenceRegistry, Span, mmseq_easy_search, parse_mmseqs_ts
                       parse_mmseqs_tsv_stream, riboseek_easy_search)
 from clustering import (compare_sorted_spans, dpc, jaccard_index,
                         max_containment)
-from executor import Parallel
+from executor import Parallel, get_default_cpu_threads
 from tweaks import default_threads, logger
 
 
@@ -273,6 +273,60 @@ def _process_overlap_batch(batch_targets: Any,
     return coo_out.row, coo_out.col, coo_out.data
 
 
+def _process_evaluate_cluster_batch(batch_items: Any,
+                                    source: str) -> List[Tuple[str, List[Any]]]:
+    """
+    Worker function to evaluate domain family clusters in parallel.
+    """
+    if isinstance(batch_items, tuple) and len(batch_items) == 2 and not isinstance(batch_items[0], (tuple, list)):
+        batch_items = [batch_items]
+
+    batch_results = []
+    for peak_id, cluster_domains in batch_items:
+        cluster_domains_per_seq = defaultdict(list)
+        for d in cluster_domains:
+            cluster_domains_per_seq[d.seq_id].append(d)
+
+        component_domains = []
+        for seq_id, domains in cluster_domains_per_seq.items():
+            sorted_domains = sorted(domains, key=lambda d: d.start)
+            c_rows, c_cols, c_intersections = compare_sorted_spans(sorted_domains)
+            if c_rows.size == 0:
+                component_domains.extend(sorted_domains)
+            else:
+                similarity_matrix = coo_matrix(
+                    (c_intersections, (c_rows, c_cols)),
+                    shape=(len(sorted_domains), len(sorted_domains))
+                ).tocsr()
+                components, labels = csgraph.connected_components(
+                    similarity_matrix,
+                    directed=False,
+                    return_labels=True
+                )
+                for component_id in range(components):
+                    component_index = {
+                        i: s for i, s in enumerate(sorted_domains)
+                        if labels[i] == component_id
+                    }
+                    if len(component_index) == 1:
+                        distinct_domain, = component_index.values()
+                        component_domains.append(distinct_domain)
+                    else:
+                        merged_start = min(s.start for s in component_index.values())
+                        merged_end = max(s.end for s in component_index.values())
+                        merged_domain = DomainInstance(
+                            seq_id=seq_id,
+                            start=merged_start,
+                            summary_strand=0,
+                            end=merged_end,
+                            targets=list(component_index.values()),
+                            source=source
+                        )
+                        component_domains.append(merged_domain)
+        batch_results.append((f"{peak_id}", component_domains))
+    return batch_results
+
+
 def _normalize_attributes(attributes: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize key names in the attributes dictionary.
@@ -421,7 +475,13 @@ class DomainFinder:
             if batch:
                 yield batch
 
-        batch_size = 200
+        n_jobs = get_default_cpu_threads()
+        if isinstance(query_iterable, (list, tuple)):
+            total_queries = len(query_iterable)
+            batch_size = min(1000, max(1, total_queries // (n_jobs * 4))) if total_queries > 0 else 1000
+        else:
+            batch_size = 1000
+
         query_batches = _batch_generator(query_iterable, batch_size)
 
         kwargs = {
@@ -493,7 +553,8 @@ class DomainFinder:
 
         domain_items = list(self.domains_per_seq.items())
         total_items = len(domain_items)
-        batch_size = max(50, min(1000, total_items // (default_threads * 4) if default_threads > 0 else 100))
+        n_jobs = get_default_cpu_threads()
+        batch_size = min(1000, max(1, total_items // (n_jobs * 4))) if total_items > 0 else 1000
         item_batches = [
             domain_items[i:i + batch_size]
             for i in range(0, total_items, batch_size)
@@ -535,7 +596,8 @@ class DomainFinder:
             return
 
         domain_items = list(self.domain_index.items())
-        batch_size = max(50, min(1000, n_domains // (default_threads * 4) if default_threads > 0 else 100))
+        n_jobs = get_default_cpu_threads()
+        batch_size = min(1000, max(1, n_domains // (n_jobs * 4))) if n_domains > 0 else 1000
         domain_batches = [
             domain_items[i:i + batch_size]
             for i in range(0, n_domains, batch_size)
@@ -576,7 +638,8 @@ class DomainFinder:
 
         target_items = list(self.targets_per_seq.items())
         total_targets = len(target_items)
-        batch_size = max(100, min(2000, total_targets // (default_threads * 4) if default_threads > 0 else 100))
+        n_jobs = get_default_cpu_threads()
+        batch_size = min(1000, max(1, total_targets // (n_jobs * 4))) if total_targets > 0 else 1000
         target_batches = [
             target_items[i:i + batch_size]
             for i in range(0, total_targets, batch_size)
@@ -661,52 +724,27 @@ class DomainFinder:
         self.n_halo_domains = n_halo
         n_clusters = len(peak_to_cluster)
 
-        with tqdm(total=n_clusters, desc="Evaluating clusters") as pbar:
-            for peak_id, member_ids in peak_to_cluster.items():
-                cluster_domains_per_seq = defaultdict(list)
-                for d_id in member_ids:
-                    d = self.domain_index[int(d_id)]
-                    cluster_domains_per_seq[d.seq_id].append(d)
+        cluster_items = [
+            (peak_id, [self.domain_index[int(d_id)] for d_id in member_ids])
+            for peak_id, member_ids in peak_to_cluster.items()
+        ]
+        n_jobs = get_default_cpu_threads()
+        batch_size = min(1000, max(1, n_clusters // (n_jobs * 4))) if n_clusters > 0 else 1000
+        cluster_batches = [
+            cluster_items[i:i + batch_size]
+            for i in range(0, n_clusters, batch_size)
+        ]
 
-                component_domains = []
-                for seq_id, domains in cluster_domains_per_seq.items():
-                    sorted_domains = sorted(domains, key=lambda d: d.start)
-                    c_rows, c_cols, c_intersections = compare_sorted_spans(sorted_domains)
-                    if c_rows.size == 0:
-                        component_domains.extend(sorted_domains)
-                    else:
-                        similarity_matrix = coo_matrix(
-                            (c_intersections, (c_rows, c_cols)),
-                            shape=(len(sorted_domains), len(sorted_domains))
-                        ).tocsr()
-                        components, labels = csgraph.connected_components(
-                            similarity_matrix,
-                            directed=False,
-                            return_labels=True
-                        )
-                        for component_id in range(components):
-                            component_index = {
-                                i: s for i, s in enumerate(sorted_domains)
-                                if labels[i] == component_id
-                            }
-                            if len(component_index) == 1:
-                                distinct_domain, = component_index.values()
-                                component_domains.append(distinct_domain)
-                            else:
-                                merged_start = min(s.start for s in component_index.values())
-                                merged_end = max(s.end for s in component_index.values())
-                                merged_domain = DomainInstance(
-                                    seq_id=seq_id,
-                                    start=merged_start,
-                                    summary_strand=0,
-                                    end=merged_end,
-                                    targets=[self.domain_index[int(i)]
-                                             for i in component_index],
-                                    source=self.source
-                                )
-                                component_domains.append(merged_domain)
-                pbar.update(1)
-                yield f"{peak_id}", component_domains
+        kwargs = {"source": self.source}
+        p_runner = Parallel(parallelized_function=_process_evaluate_cluster_batch,
+                            input_collection=cluster_batches,
+                            kwargs=kwargs,
+                            description="Evaluating clusters",
+                            bar=True)
+
+        for batch_res in p_runner.result:
+            for fam_id, component_domains in batch_res:
+                yield fam_id, component_domains
 
 
 def find_domains(fasta_path: Path,

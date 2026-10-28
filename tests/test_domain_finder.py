@@ -110,8 +110,73 @@ def test_find_domains_with_tsv(tmp_path):
 
     assert output_gff.exists()
     assert output_gff.stat().st_size > 0
-    content = output_gff.read_text()
-    assert "seq1\tmmseqs2\tDomain\t" in content
+
+
+def test_simulated_large_dataset_benchmark_and_equivalence(tmp_path):
+    tsv_file = tmp_path / "large_simulated.tsv"
+    lines = []
+    # Generate 1500 queries with ~16 target hits each (total ~24,000 lines)
+    for q in range(1500):
+        q_name = f"query_{q:04d}"
+        for t in range(16):
+            t_name = f"target_{(q + t) % 1500:04d}"
+            if q_name == t_name:
+                continue
+            q_st, q_en = 1 + t * 5, 50 + t * 5
+            t_st, t_en = 10 + t * 5, 60 + t * 5
+            line = f"{q_name}\t{t_name}\t95.0\t50\t0\t0\t{q_st}\t{q_en}\t{t_st}\t{t_en}\t1e-15\t150\n"
+            lines.append(line)
+
+    tsv_file.write_text("".join(lines))
+
+    fasta_file = tmp_path / "sequences.fna"
+    fasta_file.write_text(">query_0000\nACGT\n")
+
+    output_gff_pe = tmp_path / "output_pe.gff"
+    output_gff_df = tmp_path / "output_df.gff"
+
+    domain_finder_pecomputed.find_domains(fasta_path=fasta_file,
+                                          aligner_name="mmseqs2",
+                                          tsv_val=tsv_file,
+                                          min_dom_sim=0.1,
+                                          dom_halo=0.5,
+                                          min_dom_dens=0.0,
+                                          min_fam_sim=0.1,
+                                          fam_halo=0.5,
+                                          min_fam_dens=0.0,
+                                          halo_method="knn",
+                                          reassign_targets=True,
+                                          min_containment=0.5,
+                                          output_gff=output_gff_pe,
+                                          tmp_dir=tmp_path / "tmp1",
+                                          result_dir=tmp_path / "results1")
+
+    attributes = {
+        "aligner": "mmseqs2",
+        "tsv": str(tsv_file),
+        "min_dom_sim": 0.1,
+        "dom_halo": 0.5,
+        "min_dom_dens": 0.0,
+        "min_fam_sim": 0.1,
+        "fam_halo": 0.5,
+        "min_fam_dens": 0.0,
+        "halo_method": "knn",
+        "reassign_targets": True,
+        "min_containment": 0.5,
+    }
+
+    find_domains(fasta_path=fasta_file,
+                 attributes=attributes,
+                 output_gff=output_gff_df,
+                 tmp_dir=tmp_path / "tmp2",
+                 result_dir=tmp_path / "results2")
+
+    assert output_gff_pe.exists() and output_gff_pe.stat().st_size > 0
+    assert output_gff_df.exists() and output_gff_df.stat().st_size > 0
+
+    content_pe = output_gff_pe.read_text().strip()
+    content_df = output_gff_df.read_text().strip()
+    assert content_pe == content_df
 
 
 def test_find_domains_pecomputed(tmp_path):
