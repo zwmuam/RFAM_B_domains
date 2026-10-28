@@ -76,8 +76,8 @@ def test_domain_finder_workflow(tmp_path):
 
 def test_find_domains_with_tsv(tmp_path):
     tsv_content = (
-        "seq2\tseq1\t100.0\t100\t0\t0\t10\t100\t10\t100\t1e-10\t200\n"
-        "seq3\tseq1\t100.0\t100\t0\t0\t20\t90\t12\t98\t1e-10\t200\n"
+        "seq1\tseq2\t100.0\t100\t0\t0\t10\t100\t10\t100\t1e-10\t200\n"
+        "seq1\tseq3\t100.0\t100\t0\t0\t20\t90\t12\t98\t1e-10\t200\n"
     )
     tsv_file = tmp_path / "mock_search.tsv"
     tsv_file.write_text(tsv_content)
@@ -111,4 +111,64 @@ def test_find_domains_with_tsv(tmp_path):
     assert output_gff.stat().st_size > 0
     content = output_gff.read_text()
     assert "seq1\tmmseqs2\tDomain\t" in content
+
+
+def test_parse_mmseqs_tsv_stream_reverse_strand(tmp_path):
+    from aligners import SequenceRegistry, parse_mmseqs_tsv_stream
+
+    tsv_content = (
+        "qseq1\ttseq1\t0.864\t103\t14\t0\t103\t1\t5\t107\t3.45e-27\t123\n"
+    )
+    tsv_file = tmp_path / "rev_strand.tsv"
+    tsv_file.write_text(tsv_content)
+
+    registry = SequenceRegistry()
+    blocks = list(parse_mmseqs_tsv_stream(tsv_file, registry=registry))
+    assert len(blocks) == 1
+    q_id, spans = blocks[0]
+    assert registry.get_str(q_id) == "qseq1"
+    assert len(spans) == 1
+    span = spans[0]
+    assert span.start == 1
+    assert span.end == 103
+    assert span.length == 103
+    assert len(span.partners) == 1
+    partner = span.partners[0]
+    assert registry.get_str(partner.seq_id) == "tseq1"
+    assert partner.start == 5
+    assert partner.end == 107
+    assert partner.strand == -1
+
+
+def test_find_domains_with_sample_subset_tsv(tmp_path):
+    sample_tsv = Path(__file__).parent / "fixtures" / "sample_subset.tsv"
+    assert sample_tsv.exists()
+
+    fasta_file = tmp_path / "sequences.fna"
+    fasta_file.write_text(">URS00036AA4AB\nACGT\n>URS00019BAC15\nACGT\n")
+
+    output_gff = tmp_path / "sample_output.gff"
+
+    attributes = {
+        "aligner": "mmseqs2",
+        "tsv": str(sample_tsv),
+        "min_dom_sim": 0.1,
+        "dom_halo": 0.5,
+        "min_dom_dens": 0.0,
+        "min_fam_sim": 0.1,
+        "fam_halo": 0.5,
+        "min_fam_dens": 0.0,
+        "halo_method": "knn",
+        "reassign_targets": True,
+        "min_containment": 0.5,
+    }
+
+    find_domains(fasta_path=fasta_file,
+                 attributes=attributes,
+                 output_gff=output_gff,
+                 tmp_dir=tmp_path / "tmp",
+                 result_dir=tmp_path / "results_tsvs")
+
+    assert output_gff.exists()
+    assert output_gff.stat().st_size > 0
 # fmt: on
