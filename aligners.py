@@ -5,10 +5,6 @@ from typing import Dict, Generator, List, Optional, Tuple, Union
 
 from tweaks import shell, logger
 
-# Mock or imported default thread settings
-default_threads = 4
-
-
 class SequenceRegistry:
     """
     Bi-directional string-to-int32 sequence ID registry using sys.intern.
