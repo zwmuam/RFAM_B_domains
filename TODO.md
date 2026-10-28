@@ -136,3 +136,182 @@ Phase 4: SciPy CSR Sparse Matrix Target Overlap Aggregation (domain_finder.py)
 
 #### 5.3 Pre-Commit Verification
 - Run `pre_commit_instructions` and confirm code readability and formatting compliance.
+
+---
+
+## Comprehensive Risk Assessment & Guidelines for Future Tasks
+
+### 1. Likelihood-Ranked Risk Analysis for Multi-GB MMseqs2 TSV Datasets
+
+1. **Non-Contiguous TSV Query Stream Interleaving (Risk ID: R-01)**
+   - **Phase:** Phase 1 (`aligners.py`)
+   - **Likelihood:** HIGH | **Impact:** CRITICAL
+   - **Failure Mechanism:** TSV files generated across parallel search runs may interleave records
+     for the same query sequence across non-adjacent lines. Stream parsers yielding query blocks
+     on query ID transitions will split single queries into multiple fragmented chunks, corrupting
+     Density Peak Clustering (DPC) local neighborhood counts and dropping partner alignment hits.
+   - **Preventive Mitigation:** Enforce single-pass pre-scan tracking seen query IDs in master
+     process. Raise explicit error (`raise ValueError("Input TSV is not grouped...")`) if
+     a query sequence ID reappears after yielding.
+
+2. **CSR Matrix Dimension & Sequence ID Mismatch (Risk ID: R-02)**
+   - **Phase:** Phase 4 (`domain_finder.py`)
+   - **Likelihood:** HIGH | **Impact:** CRITICAL
+   - **Failure Mechanism:** In-place sparse matrix aggregation (`csr_total += csr_chunk`) fails
+     with dimension mismatch errors or silently misaligns target sequence overlap graph nodes if
+     worker processes dynamically assign local row/column integer IDs instead of uniform global
+     sequence IDs.
+   - **Preventive Mitigation:** Compute total global target sequence registry dimension N in master
+     process prior to worker dispatch. Construct all worker chunk matrices with fixed shape
+     (N, N) using global sequence ID integers.
+
+3. **Inter-Process Communication Payload Memory Overhead (Risk ID: R-03)**
+   - **Phase:** Phase 2 (`domain_finder.py` & `executor.py`)
+   - **Likelihood:** HIGH | **Impact:** HIGH
+   - **Failure Mechanism:** Passing heavy nested Python object graphs (e.g. `Span` instances with
+     full `partners` lists) across process boundaries via IPC pickling causes severe master
+     process RAM spikes (>200 GB) and worker core memory breaches (>50 MB).
+   - **Preventive Mitigation:** Return compact lightweight structures (e.g. integer tuples or
+     flat `DomainInstance` dataclasses) from worker processes to master process.
+
+4. **Genomic Coordinate Integer Overflow (Risk ID: R-04)**
+   - **Phase:** Phase 3 (`clustering.py`)
+   - **Likelihood:** MEDIUM | **Impact:** CRITICAL
+   - **Failure Mechanism:** Standard signed 32-bit integer arrays (`int32`) overflow on
+     chromosome span calculations exceeding 2.14 billion bp, wrapping into negative coordinate
+     values and causing non-deterministic span comparison failures or memory segmentation faults.
+   - **Preventive Mitigation:** Cast all genomic start/end coordinate arrays explicitly to
+     `int64` dtypes during 2D NumPy array construction.
+
+5. **Coordinate Inversion & 1-Based Boundary Offset Shift (Risk ID: R-05)**
+   - **Phase:** Phase 1 (`aligners.py`)
+   - **Likelihood:** MEDIUM | **Impact:** HIGH
+   - **Failure Mechanism:** Inverted target coordinates (`target_start > target_end`) in TSV
+     records misinterpreted during parsing, producing negative span lengths (`end - start < 0`) or
+     off-by-one shifts between 1-based GFF coordinates and 0-based Python slice indices.
+   - **Preventive Mitigation:** Normalize coordinates immediately upon parsing (`start <= end`),
+     explicitly calculate `length = end - start + 1`, and set `strand = -1` when inverted.
+
+6. **Repetitive Element Density Matrix Explosion (Risk ID: R-06)**
+   - **Phase:** Phase 4 (`domain_finder.py`)
+   - **Likelihood:** MEDIUM | **Impact:** HIGH
+   - **Failure Mechanism:** Highly repetitive non-coding RNA elements generate dense alignment
+     graphs with millions of pairwise target overlaps, turning sparse CSR matrices into dense
+     representations and exhausting available memory during `csr.sum_duplicates()`.
+   - **Preventive Mitigation:** Apply E-value and ungapped score candidate pre-filtering prior
+     to sparse graph assembly; store overlap weights using single-precision `float32`.
+
+7. **Infinite Parent Traversal in DPC Pointer Doubling (Risk ID: R-07)**
+   - **Phase:** Phase 3 (`clustering.py`)
+   - **Likelihood:** LOW | **Impact:** HIGH
+   - **Failure Mechanism:** Cyclic or non-monotonic parent pointer assignments in DPC tree
+     cascading cause `parent = parent[parent]` pointer doubling loops to enter infinite recursion.
+   - **Preventive Mitigation:** Implement convergence assertions (`if np.array_equal(parent,
+     grandparent): break`) with a hard iteration cap (<50 iterations) and explicit error raising.
+
+8. **Worker Pool Process Deadlock & Progress Bar Lock Contention (Risk ID: R-08)**
+   - **Phase:** Phase 2 (`executor.py`)
+   - **Likelihood:** LOW | **Impact:** MEDIUM
+   - **Failure Mechanism:** Unhandled stdout/stderr logging or progress bar updates inside worker
+     sub-processes acquire GIL or file descriptor locks, stalling worker pools indefinitely.
+   - **Preventive Mitigation:** Isolate all file I/O and user-facing logging to master process;
+     pass immutable read-only state via process arguments.
+
+---
+
+### 2. Detailed Optimization Phase Risk Evaluation & Failure Modes
+
+#### Phase 1: High-Performance Streaming & Sequence Identifier Registry (`aligners.py`)
+- **Primary Risk:** Multi-GB MMseqs2 BLAST-TAB TSV files generated across multi-threaded runs can
+  contain non-contiguously grouped query records. Parsing non-contiguous streams yields partial
+  query blocks, corrupting Density Peak Clustering (DPC) local neighborhood counts and splitting
+  alignment partner lists.
+- **Data Integrity Risk:** Converting 1-based TSV genomic coordinates into internal
+  representations risks 0-based boundary drift. Target strand inversion
+  (`target_start > target_end`) must set `strand = -1` while normalizing start <= end.
+- **Memory Risk:** Mutating `SequenceRegistry` inside worker processes breaks lock-free isolation,
+  leading to non-deterministic string-to-integer mappings across workers.
+
+#### Phase 2: Parallel Batch Execution & Dynamic Chunking (`domain_finder.py` & `executor.py`)
+- **Primary Risk:** Sub-optimal chunk size B = max(1, min(200, floor(N_Q / (4 * threads)))) can
+  cause extreme performance degradation. Overly small B incurs excessive Inter-Process
+  Communication (IPC) overhead, whereas excessively large B exceeds the <50 MB RAM ceiling per
+  worker core.
+- **Process Memory Risk:** Transferring large nested Python dictionaries or full `Span` object
+  graphs through IPC pickling causes severe master process memory spikes, breaching the 200 GB
+  memory ceiling.
+
+#### Phase 3: Vectorized NumPy Span Intersection & DPC Acceleration (`clustering.py`)
+- **Primary Risk:** Multi-GB coordinate array slicing via `np.searchsorted` requires strict
+  start-coordinate sorting. Unsorted or partially sorted inputs yield corrupted upper-triangular
+  range intersections, distorting DPC local density (rho) and delta values.
+- **Mathematical Equivalence Risk:** Vectorized pointer doubling (`parent = parent[parent]`) must
+  produce identical cluster assignments to sequential scalar loops. Incomplete convergence
+  criteria can orphan valid cluster members or create disconnected graph components.
+
+#### Phase 4: In-Place SciPy CSR Target Overlap Matrix Accumulation (`domain_finder.py`)
+- **Primary Risk:** Sparse matrix aggregation (`csr_total += csr_chunk`) requires identical
+  global shape dimensions (N, N). If worker processes build sparse matrices using localized
+  sequence indices instead of global registry integer IDs, in-place addition corrupts
+  matrix layout.
+- **Efficiency Risk:** Un-deduplicated coordinate lists concatenated globally cause peak RAM
+  spikes during `families()` clustering. Intermediate CSR `sum_duplicates()` within worker
+  processes is mandatory.
+
+---
+
+### 3. Cross-Phase Interaction & Conflict Matrix
+
+- **Registry Freeze vs Dynamic Batching (Phases 1 & 2):**
+  - *Conflict:* Phase 2 worker dispatch before Phase 1 registry completion causes unregistered
+    integer lookup failures in workers.
+  - *Safeguard:* Complete full single-pass pre-scan in master process to build immutable
+    `SequenceRegistry` before initializing worker pool.
+
+- **Worker RAM Ceiling vs Vector Buffers (Phases 2 & 3):**
+  - *Conflict:* Phase 3 flat buffer pre-allocation in worker processes can violate Phase 2
+    <50 MB RAM ceiling if batch size B is too large.
+  - *Safeguard:* Bound batch chunk size B <= 200; release intermediate NumPy arrays with `del`
+    and invoke `gc.collect()` within workers.
+
+- **Local Index Space vs CSR Aggregation (Phases 3 & 4):**
+  - *Conflict:* Vectorized span indexing in Phase 3 must map into global integer ID space for
+    Phase 4 SciPy CSR target overlap matrix creation.
+  - *Safeguard:* Maintain global sequence ID integer mapping end-to-end; do not re-index
+    sequences within local worker chunks.
+
+---
+
+### 4. Scientific Rules & Preventive Guidelines for Future Tasks
+
+1. **Pre-Scan Sequence Registry Invariant:**
+   - Always populate `SequenceRegistry` in the master process prior to parallel task dispatch.
+     Never mutate the registry inside worker processes.
+
+2. **Strict Coordinate & Strand Handling Rule:**
+   - Preserve 1-based start/end coordinate conventions throughout alignment parsing. Always check
+     for target inversion (`t_start > t_end`), normalize t_start <= t_end, and explicitly assign
+     `strand = -1`.
+
+3. **Explicit Error Boundary Principle:**
+   - Never implement silent error suppression or fallback mechanisms during alignment parsing or
+     matrix assembly. Raise explicit, descriptive errors containing error markers upon
+     encountering invalid or non-contiguous input data.
+
+4. **Worker Core Memory Ceiling Enforcement (<50 MB):**
+   - Keep worker process payloads lightweight. Pass integer sequence IDs rather than raw sequence
+     strings or heavy object graphs.
+
+5. **NumPy Vectorization Safety Guidelines:**
+   - Use `int64` for all genomic position arrays to prevent integer overflow. Verify array
+     sorting before running `np.searchsorted`.
+
+6. **SciPy CSR Accumulation Rule:**
+   - Ensure all partial CSR matrices share the exact global dimensions (N, N) defined by the
+     immutable sequence registry. Always execute `csr.sum_duplicates()` prior to returning chunk
+     matrices to the master process.
+
+7. **Zero-Divergence Verification Protocol:**
+   - Validate mathematical equivalence across single-threaded and parallel execution pathways.
+     Output domain GFF files must match exactly in domain IDs, coordinates, strands, and partner
+     counts.
