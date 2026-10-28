@@ -64,7 +64,7 @@ Phase 4: SciPy CSR Sparse Matrix Target Overlap Aggregation (domain_finder.py)
 - **Target Bottleneck:** Full dictionary loading of multi-GB TSV files causes severe RAM spikes.
 - **Implementation Strategy:**
   - Maintain single-pass generator `parse_mmseqs_tsv_stream(tsv_file, registry)` yielding contiguous query blocks `(q_int, sorted_query_spans)`.
-  - Assert contiguous query ID grouping in input TSV; raise explicit error (`🛑 Input TSV ... is not grouped contiguously`) if query records are interspersed.
+  - Assert contiguous query ID grouping in input TSV; raise explicit error (`Input TSV ... is not grouped contiguously`) if query records are interspersed.
   - Compute strand orientation as `-1` when target start > target end, normalizing target coordinates so `start <= end`.
 
 ---
