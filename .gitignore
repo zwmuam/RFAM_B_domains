@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+benchmark_tmp/
+run_baseline.py
+run_benchmark.py

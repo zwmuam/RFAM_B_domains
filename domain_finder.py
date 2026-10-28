@@ -391,6 +391,9 @@ class DomainFinder:
         :return: None
         """
         n_domains = len(self.domain_index)
+        if n_domains == 0 or not self.targets_per_seq:
+            return
+
         with tqdm(total=len(self.targets_per_seq),
                   desc="Calculating target overlaps") as pbar:
             for seq_id, targets in self.targets_per_seq.items():

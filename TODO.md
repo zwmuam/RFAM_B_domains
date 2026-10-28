@@ -222,3 +222,14 @@ Phase 4: SciPy CSR Sparse Matrix Target Overlap Aggregation (domain_finder.py)
 
 7. **Zero-Divergence Verification Protocol:**
    - Validate mathematical equivalence across original and updated execution pathways. Output domain GFF files must match exactly in domain IDs, coordinates, strands, and partner counts.
+
+---
+
+## Final Performance & Benchmark Evaluation Results
+
+Evaluation comparing pre-revision baseline vs. unified revised implementation across datasets of 20,000 and 200,000 simulated MMseqs2 alignment hits:
+
+| Benchmark Dataset | Pre-Revision Time (s) | Revised Time (s) | Speedup | Pre-Revision Peak RAM (MB) | Revised Peak RAM (MB) | GFF Feature Count | Exact Result Identity |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Simulated 20k Hits** | 2.418 s | 2.298 s | **1.05x** | 79.14 MB | 80.45 MB | 3,276 features | **100% Identical** |
+| **Simulated 200k Hits** | 20.050 s | 19.622 s | **1.02x** | 124.17 MB | 124.50 MB | 1,560 features | **100% Identical** |
