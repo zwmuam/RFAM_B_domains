@@ -139,14 +139,24 @@ class Parallel:
             item = args[0] if len(args) == 1 else args
             return parallelized_function(item, **kwargs)
 
+        extra_kwargs.pop('total', None)
+        extra_kwargs.pop('iterable_len', None)
+
         with WorkerPool(n_jobs=n_jobs, **worker_kwargs) as pool:
             pbar_opts = {'desc': description, 'colour': bar_color} if bar else {}
+            if bar and 'unit' in extra_kwargs:
+                pbar_opts['unit'] = extra_kwargs.pop('unit')
+
+            map_kwargs: Dict[str, Any] = {
+                'progress_bar': bar,
+                'progress_bar_options': pbar_opts if bar else None,
+                'chunk_size': chunk_size
+            }
+
             map_func = pool.map if keep_order else pool.map_unordered
             self.result: List[Any] = map_func(_worker_wrapper,
                                               input_list,
-                                              progress_bar=bar,
-                                              progress_bar_options=pbar_opts if bar else None,
-                                              chunk_size=chunk_size)
+                                              **map_kwargs)
 
 
 def run_external(command: Union[Sequence[Any], Sequence[Sequence[Any]]],
