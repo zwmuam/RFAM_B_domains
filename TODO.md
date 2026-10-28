@@ -84,7 +84,7 @@ Phase 4: SciPy CSR Sparse Matrix Target Overlap Aggregation (domain_finder.py)
 - **Implementation Strategy:**
   - Execute DPC domain discovery (`find_domain_instances`) and spurious domain filtering (`filter_spurious_domains`) in parallel workers over query batch chunks.
   - Perform local DPC peak selection independently within worker cores.
-  - Return lightweight, compact domain instances (`DomainInstance` tuples/dataclasses) to master process.
+  - Return lightweight, compact nstances (`DomainInstance` tuples/dataclasses) to master process.
 
 ---
 
@@ -196,7 +196,7 @@ Phase 4: SciPy CSR Sparse Matrix Target Overlap Aggregation (domain_finder.py)
 
 - **Local Index Space vs CSR Aggregation (Phases 3 & 4):**
   - *Conflict:* Vectorized span indexing in Phase 3 must map into global integer ID space for Phase 4 SciPy CSR target overlap matrix creation.
-  - *Safeguard:* Maintain global sequence/domain integer mapping end-to-end; do not re-index sequences within local worker chunks.
+  - *Safeguard:* Maintain global domain integer mapping end-to-end; do not re-index sequences within local worker chunks (large CSR matrices compare DOMAINS - spans NOT sequences)
 
 ---
 
