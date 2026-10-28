@@ -117,5 +117,5 @@ def run_baseline_benchmark(dataset_name: str, n_hits: int):
 
 
 if __name__ == "__main__":
-    run_baseline_benchmark("simulated_20k", 20000)
-    run_baseline_benchmark("simulated_200k", 200000)
+    run_baseline_benchmark("simulated_25k", 25000)
+    run_baseline_benchmark("simulated_250k", 250000)
