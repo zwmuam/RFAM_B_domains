@@ -143,18 +143,7 @@ Phase 4: SciPy CSR Sparse Matrix Target Overlap Aggregation (domain_finder.py)
 
 ### 1. Likelihood-Ranked Risk Analysis for Multi-GB MMseqs2 TSV Datasets
 
-1. **Non-Contiguous TSV Query Stream Interleaving (Risk ID: R-01)**
-   - **Phase:** Phase 1 (`aligners.py`)
-   - **Likelihood:** HIGH | **Impact:** CRITICAL
-   - **Failure Mechanism:** TSV files generated across parallel search runs may interleave records
-     for the same query sequence across non-adjacent lines. Stream parsers yielding query blocks
-     on query ID transitions will split single queries into multiple fragmented chunks, corrupting
-     Density Peak Clustering (DPC) local neighborhood counts and dropping partner alignment hits.
-   - **Preventive Mitigation:** Enforce single-pass pre-scan tracking seen query IDs in master
-     process. Raise explicit error (`raise ValueError("Input TSV is not grouped...")`) if
-     a query sequence ID reappears after yielding.
-
-2. **CSR Matrix Dimension & Sequence ID Mismatch (Risk ID: R-02)**
+**CSR Matrix Dimension & Sequence ID Mismatch**
    - **Phase:** Phase 4 (`domain_finder.py`)
    - **Likelihood:** HIGH | **Impact:** CRITICAL
    - **Failure Mechanism:** In-place sparse matrix aggregation (`csr_total += csr_chunk`) fails
@@ -163,9 +152,8 @@ Phase 4: SciPy CSR Sparse Matrix Target Overlap Aggregation (domain_finder.py)
      sequence IDs.
    - **Preventive Mitigation:** Compute total global target sequence registry dimension N in master
      process prior to worker dispatch. Construct all worker chunk matrices with fixed shape
-     (N, N) using global sequence ID integers.
-
-3. **Inter-Process Communication Payload Memory Overhead (Risk ID: R-03)**
+     (N, N) using global DOMAIN/ALIGNMENT ID integers (NOT sequence id - the matrices represent spans or primary domain instances, not sequences).
+**Inter-Process Communication Payload Memory Overhead**
    - **Phase:** Phase 2 (`domain_finder.py` & `executor.py`)
    - **Likelihood:** HIGH | **Impact:** HIGH
    - **Failure Mechanism:** Passing heavy nested Python object graphs (e.g. `Span` instances with
@@ -174,16 +162,7 @@ Phase 4: SciPy CSR Sparse Matrix Target Overlap Aggregation (domain_finder.py)
    - **Preventive Mitigation:** Return compact lightweight structures (e.g. integer tuples or
      flat `DomainInstance` dataclasses) from worker processes to master process.
 
-4. **Genomic Coordinate Integer Overflow (Risk ID: R-04)**
-   - **Phase:** Phase 3 (`clustering.py`)
-   - **Likelihood:** MEDIUM | **Impact:** CRITICAL
-   - **Failure Mechanism:** Standard signed 32-bit integer arrays (`int32`) overflow on
-     chromosome span calculations exceeding 2.14 billion bp, wrapping into negative coordinate
-     values and causing non-deterministic span comparison failures or memory segmentation faults.
-   - **Preventive Mitigation:** Cast all genomic start/end coordinate arrays explicitly to
-     `int64` dtypes during 2D NumPy array construction.
-
-5. **Coordinate Inversion & 1-Based Boundary Offset Shift (Risk ID: R-05)**
+**Coordinate Inversion & 1-Based Boundary Offset Shift**
    - **Phase:** Phase 1 (`aligners.py`)
    - **Likelihood:** MEDIUM | **Impact:** HIGH
    - **Failure Mechanism:** Inverted target coordinates (`target_start > target_end`) in TSV
@@ -192,24 +171,16 @@ Phase 4: SciPy CSR Sparse Matrix Target Overlap Aggregation (domain_finder.py)
    - **Preventive Mitigation:** Normalize coordinates immediately upon parsing (`start <= end`),
      explicitly calculate `length = end - start + 1`, and set `strand = -1` when inverted.
 
-6. **Repetitive Element Density Matrix Explosion (Risk ID: R-06)**
-   - **Phase:** Phase 4 (`domain_finder.py`)
-   - **Likelihood:** MEDIUM | **Impact:** HIGH
-   - **Failure Mechanism:** Highly repetitive non-coding RNA elements generate dense alignment
-     graphs with millions of pairwise target overlaps, turning sparse CSR matrices into dense
-     representations and exhausting available memory during `csr.sum_duplicates()`.
-   - **Preventive Mitigation:** Apply E-value and ungapped score candidate pre-filtering prior
-     to sparse graph assembly; store overlap weights using single-precision `float32`.
-
-7. **Infinite Parent Traversal in DPC Pointer Doubling (Risk ID: R-07)**
+**Infinite Parent Traversal in DPC Pointer Doubling**
    - **Phase:** Phase 3 (`clustering.py`)
    - **Likelihood:** LOW | **Impact:** HIGH
    - **Failure Mechanism:** Cyclic or non-monotonic parent pointer assignments in DPC tree
      cascading cause `parent = parent[parent]` pointer doubling loops to enter infinite recursion.
    - **Preventive Mitigation:** Implement convergence assertions (`if np.array_equal(parent,
      grandparent): break`) with a hard iteration cap (<50 iterations) and explicit error raising.
+     Try, to prevent upstream logic from generation of cyclic pointer arrangements.
 
-8. **Worker Pool Process Deadlock & Progress Bar Lock Contention (Risk ID: R-08)**
+**Worker Pool Process Deadlock & Progress Bar Lock Contention (Risk ID: R-08)**
    - **Phase:** Phase 2 (`executor.py`)
    - **Likelihood:** LOW | **Impact:** MEDIUM
    - **Failure Mechanism:** Unhandled stdout/stderr logging or progress bar updates inside worker
@@ -252,7 +223,7 @@ Phase 4: SciPy CSR Sparse Matrix Target Overlap Aggregation (domain_finder.py)
 #### Phase 4: In-Place SciPy CSR Target Overlap Matrix Accumulation (`domain_finder.py`)
 - **Primary Risk:** Sparse matrix aggregation (`csr_total += csr_chunk`) requires identical
   global shape dimensions (N, N). If worker processes build sparse matrices using localized
-  sequence indices instead of global registry integer IDs, in-place addition corrupts
+  span indices instead of global registry integer IDs, in-place addition corrupts
   matrix layout.
 - **Efficiency Risk:** Un-deduplicated coordinate lists concatenated globally cause peak RAM
   spikes during `families()` clustering. Intermediate CSR `sum_duplicates()` within worker
@@ -298,7 +269,7 @@ Phase 4: SciPy CSR Sparse Matrix Target Overlap Aggregation (domain_finder.py)
      matrix assembly. Raise explicit, descriptive errors containing error markers upon
      encountering invalid or non-contiguous input data.
 
-4. **Worker Core Memory Ceiling Enforcement (<50 MB):**
+4. **Worker Core Memory Ceiling Enforcement (<200 MB):**
    - Keep worker process payloads lightweight. Pass integer sequence IDs rather than raw sequence
      strings or heavy object graphs.
 
@@ -312,6 +283,6 @@ Phase 4: SciPy CSR Sparse Matrix Target Overlap Aggregation (domain_finder.py)
      matrices to the master process.
 
 7. **Zero-Divergence Verification Protocol:**
-   - Validate mathematical equivalence across single-threaded and parallel execution pathways.
+   - Validate mathematical equivalence across original and updated parallel execution pathways.
      Output domain GFF files must match exactly in domain IDs, coordinates, strands, and partner
      counts.
