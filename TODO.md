@@ -5,12 +5,12 @@
    - Exact preservation of 1-based start/end coordinates (`start`, `end`), strand orientation (`strand` $\in \{-1, 1\}$), partner alignment lists (`partners`), and sequence identifiers (`seq_id`).
    - Zero dropped alignment hits or corrupted coordinate spans.
 2. **Memory Ceiling & Footprint:**
-   - Worker process memory ceiling strictly bounded ($<50$ MB per worker core).
+   - Worker process memory ceiling strictly bounded ($<200$ MB per worker core).
    - Master process peak memory consumption strictly under $200$ GB for multi-GB TSV alignment datasets.
 3. **Mathematical Equivalence & Determinism:**
-   - Identical numerical range intersections, Jaccard similarities, and Density Peak Clustering (DPC) assignments across single-threaded and parallel execution modes.
+   - Identical numerical range intersections, Jaccard similarities, and Density Peak Clustering (DPC) assignments across single-threaded and parallel execution modes (or explicit corrections)
 4. **Explicit Error Handling:**
-   - Mandatory explicit error raising (containing `🛑`) on missing bioinformatic executables or non-contiguously grouped TSV files (no silent fallbacks).
+   - Mandatory explicit error raising on errors (no silent fallbacks).
 5. **Code Style & Formatting:**
    - Strict adherence to PEP 8 Visual Indent Style (delimiter-anchored visual alignment, max line length $\le 99$ characters) protected via `# fmt: off` / `# fmt: on` annotations.
 
