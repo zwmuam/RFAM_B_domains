@@ -227,9 +227,9 @@ Phase 4: SciPy CSR Sparse Matrix Target Overlap Aggregation (domain_finder.py)
 
 ## Final Performance & Benchmark Evaluation Results
 
-Evaluation comparing pre-revision baseline vs. unified revised implementation across datasets of 20,000 and 200,000 simulated MMseqs2 alignment hits:
+Evaluation comparing pre-revision baseline vs. unified revised implementation across datasets of 25,000 and 250,000 simulated MMseqs2 alignment hits:
 
 | Benchmark Dataset | Pre-Revision Time (s) | Revised Time (s) | Speedup | Pre-Revision Peak RAM (MB) | Revised Peak RAM (MB) | GFF Feature Count | Exact Result Identity |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Simulated 20k Hits** | 2.418 s | 2.298 s | **1.05x** | 79.14 MB | 80.45 MB | 3,276 features | **100% Identical** |
-| **Simulated 200k Hits** | 20.050 s | 19.622 s | **1.02x** | 124.17 MB | 124.50 MB | 1,560 features | **100% Identical** |
+| **Simulated 25k Hits** | 2.609 s | 2.259 s | **1.15x** | 79.14 MB | 95.53 MB | 3,082 features | **100% Identical** |
+| **Simulated 250k Hits** | 29.040 s | 18.507 s | **1.57x** | 122.46 MB | 212.05 MB | 1,540 features | **100% Identical** |

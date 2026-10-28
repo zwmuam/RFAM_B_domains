@@ -111,4 +111,72 @@ def test_find_domains_with_tsv(tmp_path):
     assert output_gff.stat().st_size > 0
     content = output_gff.read_text()
     assert "seq1\tmmseqs2\tDomain\t" in content
+
+
+def test_non_contiguous_tsv_raises_error(tmp_path):
+    # Non-contiguous query block (seq1 appears, then seq2, then seq1 again)
+    tsv_content = (
+        "targetA\tseq1\t100.0\t100\t0\t0\t10\t100\t10\t100\t1e-10\t200\n"
+        "targetA\tseq2\t100.0\t100\t0\t0\t10\t100\t10\t100\t1e-10\t200\n"
+        "targetB\tseq1\t100.0\t100\t0\t0\t10\t100\t10\t100\t1e-10\t200\n"
+    )
+    tsv_file = tmp_path / "non_contiguous.tsv"
+    tsv_file.write_text(tsv_content)
+
+    fasta_file = tmp_path / "sequences.fna"
+    fasta_file.write_text(">seq1\nACGT\n>seq2\nACGT\n")
+
+    output_gff = tmp_path / "output.gff"
+
+    attributes = {
+        "aligner": "mmseqs2",
+        "tsv": str(tsv_file),
+    }
+
+    with pytest.raises(ValueError) as exc_info:
+        find_domains(fasta_path=fasta_file,
+                     attributes=attributes,
+                     output_gff=output_gff,
+                     tmp_dir=tmp_path / "tmp",
+                     result_dir=tmp_path / "results_tsvs")
+
+    assert "🛑" in str(exc_info.value)
+    assert "not grouped contiguously" in str(exc_info.value)
+
+
+def test_inverted_target_coordinates(tmp_path):
+    # Inverted target coordinates (t_start > t_end: 100 to 10)
+    tsv_content = (
+        "seq2\tseq1\t100.0\t91\t0\t0\t100\t10\t10\t100\t1e-10\t200\n"
+    )
+    tsv_file = tmp_path / "inverted_target.tsv"
+    tsv_file.write_text(tsv_content)
+
+    fasta_file = tmp_path / "sequences.fna"
+    fasta_file.write_text(">seq1\nACGT\n>seq2\nACGT\n")
+
+    output_gff = tmp_path / "output.gff"
+
+    attributes = {
+        "aligner": "mmseqs2",
+        "tsv": str(tsv_file),
+        "min_dom_sim": 0.1,
+        "dom_halo": 0.5,
+        "min_dom_dens": 0.0,
+        "min_fam_sim": 0.1,
+        "fam_halo": 0.5,
+        "min_fam_dens": 0.0,
+        "halo_method": "knn",
+        "reassign_targets": True,
+        "min_containment": 0.5,
+    }
+
+    find_domains(fasta_path=fasta_file,
+                 attributes=attributes,
+                 output_gff=output_gff,
+                 tmp_dir=tmp_path / "tmp",
+                 result_dir=tmp_path / "results_tsvs")
+
+    assert output_gff.exists()
+    assert output_gff.stat().st_size > 0
 # fmt: on
