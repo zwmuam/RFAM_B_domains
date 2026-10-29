@@ -2,8 +2,10 @@
 from pathlib import Path
 import pytest
 from aligners import Span
-from domain_finder import (DomainFinder, DomainInstance, _normalize_attributes,
-                           find_domains)
+from domain_finder import (DomainInstance, evaluate_cluster_batch,
+                           filter_spurious_batch, find_domains,
+                           merge_targets_batch, normalize_attributes,
+                           process_overlap_batch, process_query_batch)
 import domain_finder_pecomputed
 
 
@@ -23,7 +25,7 @@ def test_normalize_attributes():
         "-min-seq-id": 0.5,
         "min.dom.sim": 0.25,
     }
-    normalized = _normalize_attributes(raw_attrs)
+    normalized = normalize_attributes(raw_attrs)
     assert normalized["aligner"] == "riboseek"
     assert normalized["gap_open"] == 11.0
     assert normalized["min_seq_id"] == 0.5
@@ -51,8 +53,7 @@ def test_domain_instance():
     assert "seqA\triboseek\tDomain\t5\t100\t.\t+\t.\tID=0" in gff_line
 
 
-def test_domain_finder_workflow(tmp_path):
-    # Setup mock search hits
+def test_unwrapped_stage_functions():
     span1 = Span(seq_id="seq1", start=10, end=100, strand=1)
     target1 = Span(seq_id="seq2", start=15, end=95, strand=1)
     span1.partners = [target1]
@@ -61,27 +62,41 @@ def test_domain_finder_workflow(tmp_path):
     target2 = Span(seq_id="seq3", start=20, end=90, strand=1)
     span2.partners = [target2]
 
-    search_hits = {"seq1": [span1, span2]}
+    batch_input = [("seq1", [span1, span2])]
+    res, halo_alns = process_query_batch(batch_input,
+                                         min_dom_sim=0.1,
+                                         halo_stringency=0.5,
+                                         min_dom_dens=0.0,
+                                         halo_method="knn",
+                                         source="mmseqs2")
+    assert len(res) > 0
 
-    finder = DomainFinder(search=search_hits, source="mmseqs2")
-    finder.find_domain_instances(min_dom_sim=0.1,
-                                 halo_stringency=0.5,
-                                 min_dom_dens=0.0,
-                                 halo_method="knn")
-    assert finder.n_domains > 0
+    domains = [
+        DomainInstance(seq_id=q_seq_id,
+                       start=st,
+                       summary_strand=strand,
+                       end=en,
+                       targets=targets,
+                       source="mmseqs2")
+        for q_seq_id, st, strand, en, targets in res
+    ]
 
-    discarded, kept = finder.filter_spurious_domains(min_containment=0.5,
-                                                      reassign_targets=True)
+    filter_input = [("seq1", domains)]
+    kept_domains_batch, discarded, kept = filter_spurious_batch(filter_input,
+                                                                 min_containment=0.5,
+                                                                 reassign_targets=True)
     assert kept > 0
 
-    finder.merge_targets()
-    finder.calculate_target_overlaps()
+    domain_dict = {i: d for i, d in enumerate(kept_domains_batch[0][1])}
+    targets, lengths, merged, distinct, singletons = merge_targets_batch(list(domain_dict.items()))
+    assert len(targets) > 0
 
-    families = list(finder.families(min_fam_sim=0.1,
-                                    min_fam_dens=0.0,
-                                    halo_stringency=0.5,
-                                    halo_method="knn"))
-    assert len(families) > 0
+    rows, cols, data = process_overlap_batch([("seq2", [t[1] for t in targets if t[0] == "seq2"])],
+                                             n_domains=len(domain_dict))
+    assert rows is not None
+
+    clusters = evaluate_cluster_batch([("0", list(domain_dict.values()))], source="mmseqs2")
+    assert len(clusters) == 1
 
 
 def test_find_domains_with_tsv(tmp_path):
