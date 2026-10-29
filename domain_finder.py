@@ -113,11 +113,11 @@ class DomainInstance(Span):
 
 
 def process_query(batch_items: Any,
-                        min_dom_sim: float,
-                        halo_stringency: float,
-                        min_dom_dens: float,
-                        halo_method: Optional[str],
-                        source: str) -> Tuple[List[Tuple[Any, int, int, int, List[Span]]], int]:
+                  min_dom_sim: float,
+                  halo_stringency: float,
+                  min_dom_dens: float,
+                  halo_method: Optional[str],
+                  source: str) -> Tuple[List[Tuple[Any, int, int, int, List[Span]]], int]:
     """
     Worker function to process a batch chunk of query sequences for domain discovery.
     Returns tuple of (batch_results, batch_halo_alns).
@@ -173,8 +173,8 @@ def process_query(batch_items: Any,
 
 
 def filter_spurious(batch_items: Any,
-                           min_containment: float,
-                           reassign_targets: bool) -> Tuple[List[Tuple[Any, List[Span]]], int, int]:
+                    min_containment: float,
+                    reassign_targets: bool) -> Tuple[List[Tuple[Any, List[Span]]], int, int]:
     """
     Worker function to process a batch of (seq_id, domain_list) for spurious domain filtering.
     """
@@ -314,7 +314,7 @@ def merge_targets(batch_items: Any) -> Tuple[List[Tuple[Any, Span]], List[Tuple[
 
 
 def process_overlap(batch_targets: Any,
-                          n_domains: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                    n_domains: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Worker function to process target sequence batches and return deduplicated sparse COO triplets.
     """
@@ -360,7 +360,7 @@ def process_overlap(batch_targets: Any,
 
 
 def evaluate_cluster(batch_items: Any,
-                           source: str) -> List[Tuple[str, List[Any]]]:
+                     source: str) -> List[Tuple[str, List[Any]]]:
     """
     Worker function to evaluate domain family clusters in parallel.
     """
