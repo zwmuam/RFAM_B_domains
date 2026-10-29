@@ -38,43 +38,6 @@ from clustering import (compare_sorted_spans, dpc, jaccard_index,
 from executor import Parallel, get_default_cpu_threads
 from tweaks import default_threads, logger
 
-
-def count_fasta_queries(fasta_path: Path) -> int:
-    """
-    Count the number of sequence header lines starting with '>' in a FASTA sequence file.
-
-    :param fasta_path: Path to the FASTA sequence file.
-    :return: Integer count of query sequence headers.
-    """
-    fasta_path = Path(fasta_path)
-    if not fasta_path.exists():
-        return 0
-    header_count = 0
-    with fasta_path.open("r", encoding="utf-8", errors="ignore") as fasta_file:
-        for line in fasta_file:
-            if line.startswith(">"):
-                header_count += 1
-    return header_count
-
-
-def normalize_attributes(attributes: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize key names in the attributes dictionary.
-
-    Strips leading non-alphanumeric characters (such as dashes) and replaces
-    non-alphanumeric characters with underscores.
-
-    :param attributes: Input dictionary with search and clustering parameters.
-    :return: Normalized attributes dictionary with cleaned keys.
-    """
-    normalized: Dict[str, Any] = {}
-    for key, val in attributes.items():
-        clean_key = key.lstrip("-")
-        clean_key = re.sub(r"[^a-zA-Z0-9_]", "_", clean_key)
-        normalized[clean_key] = val
-    return normalized
-
-
 class DomainInstance(Span):
     """
     Represents a candidate domain instance mapped to a sequence region.
