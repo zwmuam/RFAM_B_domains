@@ -3,6 +3,8 @@ from pathlib import Path
 import sys
 from typing import Dict, Generator, List, Optional, Tuple, Union
 
+import numpy as np
+
 from tweaks import shell, logger, default_threads
 
 class SequenceRegistry:
@@ -76,7 +78,7 @@ def count_fasta_queries(fasta_path: Path) -> int:
     return header_count
 
 def parse_mmseqs_tsv_stream(tsv_file: Path,
-                            registry: Optional[SequenceRegistry] = None) -> Generator[Tuple[Union[int, str], List[Span]], None, None]:
+                            fasta_file) -> Generator[Tuple[str, Tuple[np.ndarray]], None, None]:
     """
     Single-pass streaming parser for MMseqs2 BLAST-TAB TSV output files.
     Yields (q_seq_id, sorted_query_spans) query block by query block to keep memory usage minimal.
@@ -84,42 +86,25 @@ def parse_mmseqs_tsv_stream(tsv_file: Path,
     tsv_file = Path(tsv_file)
     if not tsv_file.exists():
         raise FileNotFoundError(f"TSV file not found: {tsv_file}")
+        
+    registry = SequenceRegistry()
 
     with tsv_file.open('r') as handle:
         first_line = handle.readline().strip()
         if first_line == "_TimeoutError_":
-            raise TimeoutError(f'MMseqs2 search timed out. Result file: {tsv_file}')
-
-    if registry is None:
-        registry = SequenceRegistry()
+            raise TimeoutError(f'MMseqs2 search timed out. Result file: {tsv_file}')        
 
     seen_queries = set()
-    current_q_int: Optional[int] = None
-    current_query_dict: Dict[Tuple[int, int], list] = defaultdict(list)
+    current_q_int = None
+    current_query_hits = []
 
     logger.info(f'streaming alignment results from {tsv_file}')
 
-    def _yield_current_block(q_int: int, q_dict: Dict[Tuple[int, int], list]) -> Tuple[Union[int, str], List[Span]]:
-        sorted_coords = sorted(q_dict.keys(), key=lambda x: x[0])
-        sorted_spans = []
-        for q_start, q_end in sorted_coords:
-            span = Span(seq_id=q_int, start=q_start, end=q_end, strand=1)
-            partners = [
-                Span(seq_id=t_int, start=t_start, end=t_end, strand=t_strand)
-                for t_int, t_start, t_end, t_strand in q_dict[(q_start, q_end)]
-            ]
-            span.partners = partners
-            sorted_spans.append(span)
-        return q_int, sorted_spans
-
     with tsv_file.open('r') as handle:
         for line in handle:
-            if line.startswith('#') or not line.strip():
-                continue
             line = line.rstrip('\n')
             fields = line.split('\t')
-
-            # BLAST-TAB format: query (0), target (1), ..., query_start (6), query_end (7), target_start (8), target_end (9)
+            
             q_seq_str = fields[0]
             t_seq_str = fields[1]
 
@@ -141,7 +126,7 @@ def parse_mmseqs_tsv_stream(tsv_file: Path,
                 seen_queries.add(q_int)
             elif current_q_int != q_int:
                 if q_int in seen_queries:
-                    raise ValueError(f"🛑 Input TSV {tsv_file} is not grouped contiguously by query sequence ID.")
+                    raise ValueError(f"Input TSV {tsv_file} is not grouped contiguously by query sequence ID.")
                 yield _yield_current_block(current_q_int, current_query_dict)
                 current_query_dict.clear()
                 current_q_int = q_int
