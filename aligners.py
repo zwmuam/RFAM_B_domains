@@ -58,6 +58,22 @@ class Span:
     def n_partners(self) -> int:
         return len(self.partners)
 
+def count_fasta_queries(fasta_path: Path) -> int:
+    """
+    Count the number of sequence header lines starting with '>' in a FASTA sequence file.
+
+    :param fasta_path: Path to the FASTA sequence file.
+    :return: Integer count of query sequence headers.
+    """
+    fasta_path = Path(fasta_path)
+    if not fasta_path.exists():
+        return 0
+    header_count = 0
+    with fasta_path.open("r", encoding="utf-8", errors="ignore") as fasta_file:
+        for line in fasta_file:
+            if line.startswith(">"):
+                header_count += 1
+    return header_count
 
 def parse_mmseqs_tsv_stream(tsv_file: Path,
                             registry: Optional[SequenceRegistry] = None) -> Generator[Tuple[Union[int, str], List[Span]], None, None]:
