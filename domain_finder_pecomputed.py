@@ -19,15 +19,10 @@ __email__ = "jakub.barylski@gmail.com"
 
 # built-ins
 from pathlib import Path
-from typing import Any, Dict, Optional
-
-# standard libraries
-from tqdm import tqdm
+from typing import Optional
 
 # internal repository/package imports
-from aligners import SequenceRegistry, parse_mmseqs_tsv_stream
-from domain_finder import DomainFinder, DomainInstance, count_fasta_queries
-from tweaks import logger
+from domain_finder import find_domains as df_find_domains
 
 
 def find_domains(fasta_path: Path,
@@ -48,9 +43,7 @@ def find_domains(fasta_path: Path,
     """
     Find domain families from a FASTA sequence file given parameter attributes.
 
-    Runs MMseqs2 or RiboSeek (or reads pre-computed TSV), filters spurious domain
-    instances, merges target spans, constructs domain overlap graphs, and clusters
-    domain instances into domain families written out to GFF format.
+    Delegates processing to domain_finder.find_domains using explicit parameters.
 
     :param fasta_path: Path to input FASTA file containing query sequences.
     :param aligner_name: Name of the alignment tool used (e.g., "mmseqs2" or "riboseek").
@@ -69,53 +62,25 @@ def find_domains(fasta_path: Path,
     :param result_dir: Optional directory path for alignment TSV output files.
     :return: Path to the written output GFF3 file.
     """
-    fasta_path = Path(fasta_path)
-    output_gff = Path(output_gff)
+    attributes = {
+        "aligner": aligner_name,
+        "tsv": str(tsv_val),
+        "min_dom_sim": min_dom_sim,
+        "dom_halo": dom_halo,
+        "min_dom_dens": min_dom_dens,
+        "min_fam_sim": min_fam_sim,
+        "fam_halo": fam_halo,
+        "min_fam_dens": min_fam_dens,
+        "halo_method": halo_method,
+        "reassign_targets": reassign_targets,
+        "min_containment": min_containment,
+    }
 
-    tmp_dir = Path(tmp_dir) if tmp_dir else fasta_path.parent / "tmp"
-    result_dir = Path(result_dir) if result_dir else fasta_path.parent / "results_tsvs"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    result_dir.mkdir(parents=True, exist_ok=True)
-
-    # Sequence registry for efficient string management
-    registry = SequenceRegistry()
-
-    total_queries = count_fasta_queries(fasta_path)
-    logger.info(f"Reading pre-computed alignments from {tsv_val}")
-    logger.info(f"Estimated work size: {total_queries} query sequences in {fasta_path.name}")
-    search_stream = parse_mmseqs_tsv_stream(Path(tsv_val), registry=registry)
-
-    # Perform domain finding and clustering
-    finder = DomainFinder(search=search_stream,
-                          source=aligner_name,
-                          registry=registry,
-                          fasta_path=fasta_path,
-                          total_queries=total_queries)
-    finder.find_domain_instances(min_dom_sim=min_dom_sim,
-                                 halo_stringency=dom_halo,
-                                 min_dom_dens=min_dom_dens,
-                                 halo_method=halo_method)
-    finder.filter_spurious_domains(min_containment=min_containment,
-                                   reassign_targets=reassign_targets)
-    finder.merge_targets()
-    finder.calculate_target_overlaps()
-
-    families_list = list(finder.families(min_fam_sim=min_fam_sim,
-                                         halo_stringency=fam_halo,
-                                         min_fam_dens=min_fam_dens,
-                                         halo_method=halo_method))
-
-    output_gff.parent.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Estimated work size for GFF3 export: {len(families_list)} domain families (to {output_gff.name})")
-    with output_gff.open("w") as gff_writer:
-        for fam_id, fam_domains in tqdm(families_list,
-                                       desc="Exporting domain families to GFF3",
-                                       unit="families"):
-            for domain in fam_domains:
-                gff_writer.write(domain.to_gff(cluster_id=fam_id, registry=registry) + "\n")
-
-    logger.info(f"Successfully exported domain families to {output_gff}")
-    return output_gff
+    return df_find_domains(fasta_path=fasta_path,
+                           attributes=attributes,
+                           output_gff=output_gff,
+                           tmp_dir=tmp_dir,
+                           result_dir=result_dir)
 
 
 if __name__ == "__main__":

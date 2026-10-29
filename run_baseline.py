@@ -53,7 +53,8 @@ def generate_simulated_tsv(tsv_path: Path, fasta_path: Path, n_hits: int, n_quer
 
                 pident = 95.0
                 length = abs(q_end - q_start) + 1
-                line = f"{t}\t{q}\t{pident}\t{length}\t0\t0\t{t_start}\t{t_end}\t{q_start}\t{q_end}\t1e-10\t200.0\n"
+                # BLAST-TAB standard: field 0 is query, field 1 is target
+                line = f"{q}\t{t}\t{pident}\t{length}\t0\t0\t{q_start}\t{q_end}\t{t_start}\t{t_end}\t1e-10\t200.0\n"
                 f.write(line)
 
 
