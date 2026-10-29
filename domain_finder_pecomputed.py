@@ -90,20 +90,5 @@ if __name__ == "__main__":
     TMP_DIR = Path("/media/solificatus/10 TB/RFAMB/DeRep_pedro/output/tmp")
     RESULT_DIR = Path("/media/solificatus/10 TB/RFAMB/DeRep_pedro/output/results_tsvs")
 
-    if FASTA_PATH.exists() and MM_TSV.exists():
-        find_domains(fasta_path=FASTA_PATH,
-                     aligner_name="mmseqs2",
-                     min_dom_sim=0.5,
-                     dom_halo=0.5,
-                     min_dom_dens=0.1,
-                     min_fam_sim=0.5,
-                     fam_halo=0.5,
-                     min_fam_dens=0.1,
-                     halo_method="traditional",
-                     reassign_targets=True,
-                     min_containment=0.5,
-                     tsv_val=MM_TSV,
-                     output_gff=OUTPUT_GFF,
-                     tmp_dir=TMP_DIR,
-                     result_dir=RESULT_DIR)
+
 # fmt: on
