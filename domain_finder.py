@@ -936,36 +936,4 @@ def find_domains(fasta_path: Path,
     logger.info(f"Successfully exported domain families to {output_gff}")
     return output_gff
 
-
-if __name__ == "__main__":
-    FASTA_PATH = Path("original_datasets/sequences.fna")
-    OUTPUT_GFF = Path("output/domain_families.gff")
-    TMP_DIR = Path("output/tmp")
-    RESULT_DIR = Path("output/results_tsvs")
-
-    attributes = {
-        "aligner": "mmseqs2",
-        "k": 7,
-        "s": 5.7,
-        "gap_open": 11.0,
-        "gap_extend": 1.0,
-        "min_seq_id": 0.0,
-        "num_iterations": 1,
-        "min_dom_sim": 0.35,
-        "dom_halo": 0.5,
-        "min_dom_dens": 1.0,
-        "min_fam_sim": 0.25,
-        "fam_halo": 0.5,
-        "min_fam_dens": 1.0,
-        "halo_method": "knn",
-        "reassign_targets": True,
-        "min_containment": 0.6,
-    }
-
-    if FASTA_PATH.exists():
-        find_domains(fasta_path=FASTA_PATH,
-                     attributes=attributes,
-                     output_gff=OUTPUT_GFF,
-                     tmp_dir=TMP_DIR,
-                     result_dir=RESULT_DIR)
 # fmt: on
