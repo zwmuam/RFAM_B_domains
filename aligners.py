@@ -132,8 +132,8 @@ def parse_mmseqs_tsv_stream(tsv_file: Path,
                 seen_queries.add(q_int)
             elif current_q_int != q_int:
                 if q_int in seen_queries:
-                    # TODO SORT QUERIES BY DOWNSTREAM DOMAIN FINDING CONVENTION
                     raise ValueError(f"Input TSV {tsv_file} is not grouped contiguously by query sequence ID.")
+                # TODO SORT QUERIES BY DOWNSTREAM DOMAIN FINDING CONVENTION
                 yield current_q_int, np.array(current_query_hits), np.array(current_target_hits)
                 current_query_hits.clear(), current_target_hits.clear()
                 current_q_int = q_int
@@ -142,7 +142,8 @@ def parse_mmseqs_tsv_stream(tsv_file: Path,
             t_int = registry.get_id(t_seq_str)
             current_query_hits.append((q_start, q_end))
             current_target_hits.append((t_int, t_start, t_end, t_strand))
-    yield q_int, np.array(current_query_hits), np.array(current_target_hits)  
+    # TODO SORT QUERIES BY DOWNSTREAM DOMAIN FINDING CONVENTION
+    yield current_q_int, np.array(current_query_hits), np.array(current_target_hits)
 
 
 def riboseek_easy_search(fasta_file: Path,
