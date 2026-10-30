@@ -132,8 +132,9 @@ def parse_mmseqs_tsv_stream(tsv_file: Path,
                 seen_queries.add(q_int)
             elif current_q_int != q_int:
                 if q_int in seen_queries:
+                    # TODO SORT QUERIES BY DOWNSTREAM DOMAIN FINDING CONVENTION
                     raise ValueError(f"Input TSV {tsv_file} is not grouped contiguously by query sequence ID.")
-                yield q_int, np.array(current_query_hits), np.array(current_target_hits)
+                yield current_q_int, np.array(current_query_hits), np.array(current_target_hits)
                 current_query_hits.clear(), current_target_hits.clear()
                 current_q_int = q_int
                 seen_queries.add(q_int)
