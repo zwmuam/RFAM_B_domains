@@ -60,7 +60,7 @@ class Span:
     def n_partners(self) -> int:
         return len(self.partners)
 
-def count_fasta_queries(fasta_path: Path) -> int:
+def count_fasta(fasta_path: Path) -> int:
     """
     Count the number of sequence header lines starting with '>' in a FASTA sequence file.
 
@@ -78,7 +78,7 @@ def count_fasta_queries(fasta_path: Path) -> int:
     return header_count
 
 def parse_mmseqs_tsv_stream(tsv_file: Path,
-                            fasta_file) -> Generator[Tuple[str, Tuple[np.ndarray]], None, None]:
+                            fasta_file: Path) -> Generator[Tuple[str, Tuple[np.ndarray, np.ndarray]], None, None]:
     """
     Single-pass streaming parser for MMseqs2 BLAST-TAB TSV output files.
     Yields (q_seq_id, sorted_query_spans) query block by query block to keep memory usage minimal.
@@ -86,6 +86,11 @@ def parse_mmseqs_tsv_stream(tsv_file: Path,
     tsv_file = Path(tsv_file)
     if not tsv_file.exists():
         raise FileNotFoundError(f"TSV file not found: {tsv_file}")
+        
+    if fasta_file.exists():
+        n_sequences = count_fasta(fasta_file)
+    else:
+        n_sequences = 0
         
     registry = SequenceRegistry()
 
@@ -97,6 +102,7 @@ def parse_mmseqs_tsv_stream(tsv_file: Path,
     seen_queries = set()
     current_q_int = None
     current_query_hits = []
+    current_target_hits = []
 
     logger.info(f'streaming alignment results from {tsv_file}')
 
@@ -127,16 +133,15 @@ def parse_mmseqs_tsv_stream(tsv_file: Path,
             elif current_q_int != q_int:
                 if q_int in seen_queries:
                     raise ValueError(f"Input TSV {tsv_file} is not grouped contiguously by query sequence ID.")
-                yield _yield_current_block(current_q_int, current_query_dict)
-                current_query_dict.clear()
+                yield q_int, np.array(current_query_hits), np.array(current_target_hits)
+                current_query_hits.clear(), current_target_hits.clear()
                 current_q_int = q_int
                 seen_queries.add(q_int)
 
             t_int = registry.get_id(t_seq_str)
-            current_query_dict[(q_start, q_end)].append((t_int, t_start, t_end, t_strand))
-
-    if current_q_int is not None and current_query_dict:
-        yield _yield_current_block(current_q_int, current_query_dict)
+            current_query_hits.append((q_start, q_end))
+            current_target_hits.append((t_int, t_start, t_end, t_strand))
+    yield q_int, np.array(current_query_hits), np.array(current_target_hits)  
 
 
 def riboseek_easy_search(fasta_file: Path,
