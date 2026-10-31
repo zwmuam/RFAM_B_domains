@@ -135,3 +135,27 @@ The updated `domain_finder.py` pipeline is mathematically equivalent to the theo
 - **Vectorized, multi-process parallel scalability**.
 - **Complete GFF3 result equivalence** across all evaluated density regimes.
 - **Robust safeguards against data corruption and memory choke**.
+
+---
+
+## Coordinate System Consistency Analysis Across the Pipeline
+
+### 1. Does the Pipeline Assume 0-based or 1-based Coordinates?
+- **MMseqs2 TSV Input:** MMseqs2 BLAST-TAB generates standard 1-based inclusive genomic coordinates: `qstart`, `qend`, `sstart`, `send`.
+- **Pipeline Coordinate Convention:**
+  - `aligners.py` streams spans as integer pairs `[start, end]`.
+  - In NumPy operations throughout `clustering.py` and `domain_finder.py`, intervals are treated continuously:
+    - **Length:** `length = end - start`
+    - **Intersection:** `intersection = min(end1, end2) - max(start1, start2)`
+    - **Union:** `union = length1 + length2 - intersection`
+    - **Jaccard:** $\text{sim} = \frac{\text{intersection}}{\text{union}}$
+- **Mathematical Consistency:**
+  - Under the continuous $[s, e]$ model, for identical spans $[10, 50]$ and $[10, 50]$:
+    - `length = 40`, `intersection = 40`, `union = 40`, `Jaccard = 1.0` (exact identity).
+  - For abutting intervals $[10, 50]$ and $[50, 90]$:
+    - `intersection = min(50, 90) - max(10, 50) = 0`, `Jaccard = 0.0`.
+  - In `merge_overlapping_spans`:
+    - Gaps between non-abutting intervals (e.g. $[10, 50]$ and $[51, 90]$) are recognized via `s[1:] > e_cum[:-1]` ($51 > 50$), correctly preventing disjoint intervals from merging.
+- **GFF3 Output Export:**
+  - GFF3 standard requires 1-based inclusive coordinates $[start, end]$.
+  - The pipeline writes the coordinates `[start, end]` directly to the GFF3 output columns (e.g. `start\tend`), maintaining 1:1 round-trip identity with the input alignment coordinates.
