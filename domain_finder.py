@@ -1,5 +1,5 @@
 # fmt: off
-# !/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -21,7 +21,8 @@ __email__ = "jakub.barylski@gmail.com"
 from collections import defaultdict
 from itertools import count
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+import re
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 # standard libraries
 import numpy as np
@@ -29,636 +30,734 @@ from scipy.sparse import coo_matrix, csgraph
 from tqdm import tqdm
 
 # internal repository/package imports
-from aligners import (SequenceRegistry, count_fasta,
-                      populate_registry_from_fasta,
-                      batch_parse_mmseqs_tsv)
-from clustering import (compare_sorted_spans,
-                        jaccard_index, max_containment,
-                        dpc)
-from tweaks import Parallel, default_threads, logger
+from aligners import (SequenceRegistry, Span, mmseq_easy_search, parse_mmseqs_tsv,
+                      parse_mmseqs_tsv_stream, riboseek_easy_search)
+from clustering import (compare_sorted_spans, dpc, jaccard_index,
+                        max_containment)
+from executor import Parallel
+from tweaks import default_threads, logger
 
 
-def count_fasta_queries(fasta_path: Path) -> int:
+def _process_query_batch(batch_items: Any,
+                         min_dom_sim: float,
+                         halo_stringency: float,
+                         min_dom_dens: float,
+                         halo_method: Optional[str],
+                         source: str) -> Tuple[List[Tuple[Any, int, int, int, List[Span]]], int]:
     """
-    Count sequence headers (starting with '>') in a FASTA sequence file.
-
-    :param fasta_path: Path to the FASTA sequence file.
-    :return: Integer count of query sequence headers.
+    Worker function to process a batch chunk of query sequences for domain discovery.
+    Returns tuple of (batch_results, batch_halo_alns).
     """
-    return count_fasta(fasta_path=fasta_path)
+    if isinstance(batch_items, tuple) and len(batch_items) == 2 and not isinstance(batch_items[0], (tuple, list)):
+        batch_items = [batch_items]
 
-
-def determine_strand(strands: np.ndarray) -> str:
-    """
-    Determine the consensus strand of a domain instance based on its target hits.
-
-    Minimizes opposite strand targets: if majority of targets are -1, then the domain
-    itself is on the '-' strand; otherwise '+'.
-
-    :param strands: 1D NumPy array of alignment strands (-1 or 1).
-    :return: Consensus strand string ('+' or '-').
-    """
-    if strands.size == 0:
-        return "+"
-    neg_count = np.sum(strands == -1)
-    pos_count = np.sum(strands == 1)
-    return "-" if neg_count > pos_count else "+"
-
-
-def filter_spurious_domains(cluster_map: np.ndarray,
-                            suspect_rows: np.ndarray,
-                            suspect_cols: np.ndarray,
-                            suspect_intersections: np.ndarray,
-                            suspect_lengths: np.ndarray,
-                            min_containment: float,
-                            reassign_targets: bool) -> np.ndarray:
-    """
-    Filter out low-scoring overlapping domains.
-
-    :param cluster_map: Cluster map to filter.
-    :param suspect_rows: Indices of the suspect overlaps (in the unique_spans array).
-    :param suspect_cols: Indices of the suspect overlaps (in the unique_spans array).
-    :param suspect_intersections: Intersection lengths of suspect domain instances.
-    :param suspect_lengths: Lengths of unique domain instances.
-    :param min_containment: Minimum containment threshold for filtering.
-    :param reassign_targets: Whether targets should be reassigned to strongest neighbors.
-    :return: Refined cluster map with spurious domains removed or reassigned.
-    """
-    containment = max_containment(intersections=suspect_intersections,
-                                  row_lengths=suspect_lengths[suspect_rows],
-                                  column_lengths=suspect_lengths[suspect_cols])
-    connected_mask = containment >= min_containment
-
-    source_nodes = suspect_rows[connected_mask]
-    target_nodes = suspect_cols[connected_mask]
-
-    node_weights = {node: weight for node, weight in enumerate(suspect_lengths)}
-
-    neighbors = defaultdict(set)
-    for source, target in zip(np.asarray(source_nodes).tolist(), np.asarray(target_nodes).tolist()):
-        if source != target:
-            neighbors[source].add(target)
-            neighbors[target].add(source)
-
-    removed_nodes = []
-    for node in sorted(neighbors, key=lambda n: (node_weights[n], n)):
-        live_neighbors = neighbors.pop(node)
-        if live_neighbors:
-            removed_nodes.append(node)
-            if reassign_targets:
-                best_neighbor = max(live_neighbors, key=lambda n: node_weights[n])
-                cluster_map[cluster_map == node] = best_neighbor
+    batch_results = []
+    batch_halo_alns = 0
+    for q_seq_id, sorted_query_spans in batch_items:
+        n_spans = len(sorted_query_spans)
+        if n_spans == 0:
+            continue
+        elif n_spans == 1:
+            peak_span, = sorted_query_spans
+            targets = peak_span.partners + [peak_span]
+            strands = [t.strand for t in peak_span.partners]
+            batch_results.append((q_seq_id, peak_span.start, sum(strands), peak_span.end, targets))
+        else:
+            rows, cols, intersections = compare_sorted_spans(sorted_query_spans)
+            if rows.size == 0:
+                peak_to_cluster = {p: np.array([p]) for p in range(n_spans)}
             else:
-                cluster_map[cluster_map == node] = -1
-            for neighbor in live_neighbors:
-                neighbors[neighbor].remove(node)
+                span_lengths = np.array([s.length for s in sorted_query_spans])
+                weights = np.array([s.n_partners() for s in sorted_query_spans])
+                similarities = jaccard_index(intersections=intersections,
+                                             row_lengths=span_lengths[rows],
+                                             column_lengths=span_lengths[cols])
+                peak_to_cluster, n_noise = dpc(rows=rows,
+                                               cols=cols,
+                                               sims=similarities,
+                                               n=n_spans,
+                                               min_sim=min_dom_sim,
+                                               weights=weights,
+                                               backend="numpy",
+                                               filter_transparency=halo_stringency,
+                                               halo_method=halo_method,
+                                               min_dens=min_dom_dens)
+                batch_halo_alns += n_noise
 
-    return cluster_map
+            for peak_id, member_ids in peak_to_cluster.items():
+                peak_span = sorted_query_spans[peak_id]
+                member_targets = []
+                for m_id in member_ids:
+                    member_targets.extend(sorted_query_spans[int(m_id)].partners)
+                targets = member_targets + [peak_span]
+                strands = [t.strand for t in member_targets]
+                batch_results.append((q_seq_id, peak_span.start, sum(strands), peak_span.end, targets))
+    return batch_results, batch_halo_alns
 
 
-def domain_instances_on_query(query_id: int,
-                              sorted_query_spans: np.ndarray,
-                              target_spans: np.ndarray,
+def _process_overlap_batch(batch_targets: Any,
+                           n_domains: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Worker function to process target sequence batches and return deduplicated sparse COO triplets.
+    """
+    if isinstance(batch_targets, tuple) and len(batch_targets) == 2 and not isinstance(batch_targets[0], (tuple, list)):
+        batch_targets = [batch_targets]
+
+    batch_rows, batch_cols, batch_data = [], [], []
+    for seq_id, targets in batch_targets:
+        n_targets = len(targets)
+        if n_targets > 1:
+            sorted_targets = sorted(targets, key=lambda s: s.start)
+            local_rows, local_cols, intersections = compare_sorted_spans(sorted_targets)
+            if local_rows.size > 0:
+                domain_ids = np.array([t.domain for t in sorted_targets], dtype=np.int32)
+                global_rows = domain_ids[local_rows]
+                global_cols = domain_ids[local_cols]
+                mask = global_rows != global_cols
+                if np.any(mask):
+                    g_r = np.minimum(global_rows[mask], global_cols[mask])
+                    g_c = np.maximum(global_rows[mask], global_cols[mask])
+                    coo = coo_matrix((intersections[mask], (g_r, g_c)), shape=(n_domains, n_domains))
+                    csr = coo.tocsr()
+                    csr.sum_duplicates()
+                    coo_dedup = csr.tocoo()
+                    batch_rows.append(coo_dedup.row)
+                    batch_cols.append(coo_dedup.col)
+                    batch_data.append(coo_dedup.data)
+
+    if not batch_rows:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+
+    cat_r = np.concatenate(batch_rows)
+    cat_c = np.concatenate(batch_cols)
+    cat_d = np.concatenate(batch_data)
+    coo_batch = coo_matrix((cat_d, (cat_r, cat_c)), shape=(n_domains, n_domains))
+    csr_batch = coo_batch.tocsr()
+    csr_batch.sum_duplicates()
+    coo_out = csr_batch.tocoo()
+    return coo_out.row, coo_out.col, coo_out.data
+
+
+def _normalize_attributes(attributes: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize key names in the attributes dictionary.
+
+    Strips leading non-alphanumeric characters (such as dashes) and replaces
+    non-alphanumeric characters with underscores.
+
+    :param attributes: Input dictionary with search and clustering parameters.
+    :return: Normalized attributes dictionary with cleaned keys.
+    """
+    normalized: Dict[str, Any] = {}
+    for key, val in attributes.items():
+        clean_key = key.lstrip("-")
+        clean_key = re.sub(r"[^a-zA-Z0-9_]", "_", clean_key)
+        normalized[clean_key] = val
+    return normalized
+
+
+class DomainInstance(Span):
+    """
+    Represents a candidate domain instance mapped to a sequence region.
+
+    Extends Span to represent genomic domain coordinates, partner target
+    alignments, and the originating aligner tool name.
+    """
+
+    instance_counter = count()
+
+    __slots__ = ("source", "number", "targets")
+
+    def __init__(self,
+                 seq_id: Any,
+                 start: int,
+                 summary_strand: int,
+                 end: int,
+                 targets: List[Span],
+                 source: str = "mmseqs2") -> None:
+        """
+        Initialize a DomainInstance.
+
+        :param seq_id: Target sequence identifier (string or integer index).
+        :param start: 1-based start position.
+        :param summary_strand: Net directionality sum across partners.
+        :param end: 1-based end position.
+        :param targets: List of partner alignment spans.
+        :param source: Name of the alignment tool (e.g. mmseqs2 or riboseek).
+        :return: None
+        """
+        super().__init__(seq_id=seq_id,
+                         start=start,
+                         end=end,
+                         strand=(summary_strand > 0) - (summary_strand < 0),
+                         partners=targets)
+        self.source = source
+
+    def to_gff(self,
+               cluster_id: str,
+               registry: Optional[SequenceRegistry] = None) -> str:
+        """
+        Format domain instance as a standard GFF3 string.
+
+        :param cluster_id: Family/cluster identifier for the GFF attributes.
+        :param registry: Optional SequenceRegistry to decode integer sequence ID.
+        :return: Tab-delimited GFF3 record.
+        """
+        seq_str = registry.get_str(self.seq_id) if registry is not None else str(self.seq_id)
+        strand_str = "+" if self.strand > 0 else "-" if self.strand < 0 else "."
+        return (f"{seq_str}\t{self.source}\tDomain\t{self.start}\t"
+                f"{self.end}\t.\t{strand_str}\t.\tID={cluster_id}")
+
+    def total_target_length(self) -> int:
+        """
+        Calculate total sequence length of partner targets.
+
+        :return: Sum of length of partner target spans.
+        """
+        return sum(target.length for target in self.partners)
+
+    def coverage(self) -> float:
+        """
+        Return the number of partner targets as alignment coverage proxy.
+
+        :return: Count of partner target spans.
+        """
+        return len(self.partners)
+
+
+class DomainFinder:
+    """
+    Selects representative conserved domain instances from alignment spans and
+    clusters them into domain families using Density Peak Clustering.
+    """
+
+    def __init__(self,
+                 search: Any,
+                 source: str = "mmseqs2",
+                 registry: Optional[SequenceRegistry] = None) -> None:
+        """
+        Initialize DomainFinder.
+
+        :param search: Dictionary or Generator mapping query IDs to lists of alignment spans.
+        :param source: Aligner source name used for GFF generation.
+        :param registry: Optional SequenceRegistry instance.
+        :return: None
+        """
+        self.search = search
+        self.source = source
+        self.registry = registry
+        self.domains_per_seq: Dict[Any, List[DomainInstance]] = {}
+        self.n_domains = 0
+        self.domain_index: Dict[int, DomainInstance] = {}
+        self.domain_total_lengths: Dict[int, int] = {}
+        self.targets_per_seq: Dict[Any, List[Span]] = {}
+        self._overlap_rows: List[np.ndarray] = []
+        self._overlap_cols: List[np.ndarray] = []
+        self._overlap_data: List[np.ndarray] = []
+        self.n_halo_alns = 0
+        self.n_halo_domains = 0
+
+    def find_domain_instances(self,
                               min_dom_sim: float,
-                              min_containment: float,
-                              reassign_targets: bool,
                               halo_stringency: float,
                               min_dom_dens: float,
-                              halo_method: Optional[str]) \
-        -> Tuple[List[Tuple[int, int, int, str]], np.ndarray]:
-    """
-    Process a query sequence and identify conserved domain instances using DPC.
+                              halo_method: Optional[str]) -> None:
+        """
+        Identify candidate domain instances across query sequences via DPC density peaks using parallel task batching.
 
-    :param query_id: Integer sequence ID of the query.
-    :param sorted_query_spans: Sorted 2D NumPy array of query alignment spans (start, end).
-    :param target_spans: 2D NumPy array of target hits (t_seq_int, t_start, t_end, t_strand).
-    :param min_dom_sim: Minimum similarity for domain identification.
-    :param min_containment: Minimum containment for domain filtering.
-    :param reassign_targets: Whether to reassign targets of removed spurious domains.
-    :param halo_stringency: Stringency for halo filtering.
-    :param min_dom_dens: Minimum density for domain identification.
-    :param halo_method: Halo filtering algorithm.
-    :return: Tuple of:
-             - local_domains: List of (query_id, peak_start, peak_end, consensus_strand)
-             - all_targets: 2D NumPy array of (t_seq_int, t_start, t_end, local_domain_id)
-    """
-    unique_query_spans, cluster_map, weights = np.unique(sorted_query_spans,
-                                                         axis=0,
-                                                         return_inverse=True,
-                                                         return_counts=True)
-    n_spans = unique_query_spans.shape[0]
-    span_lengths = unique_query_spans[:, 1] - unique_query_spans[:, 0]
+        :param min_dom_sim: Minimum domain similarity threshold.
+        :param halo_stringency: Halo stringency parameter.
+        :param min_dom_dens: Minimum domain density threshold.
+        :param halo_method: Halo method ('traditional', 'knn', etc.) or None.
+        :return: None
+        """
+        query_iterable = (
+            list(self.search.items()) if isinstance(self.search, dict) else list(self.search)
+        )
+        total_queries = len(query_iterable)
+        if total_queries == 0:
+            return
 
-    if n_spans == 1:
-        cluster_map[:] = 0
-        peak_indices = np.array([0], dtype=np.int32)
-    else:
-        rows, cols, intersections = compare_sorted_spans(unique_query_spans)
-        if rows.size == 0:
-            peak_indices = np.arange(n_spans, dtype=np.int32)
+        batch_size = max(100, min(2000, total_queries // (default_threads * 4) if default_threads > 0 else 100))
+        query_batches = [
+            query_iterable[i:i + batch_size]
+            for i in range(0, total_queries, batch_size)
+        ]
+
+        kwargs = {
+            "min_dom_sim": min_dom_sim,
+            "halo_stringency": halo_stringency,
+            "min_dom_dens": min_dom_dens,
+            "halo_method": halo_method,
+            "source": self.source
+        }
+
+        p_runner = Parallel(parallelized_function=_process_query_batch,
+                            input_collection=query_batches,
+                            kwargs=kwargs,
+                            description="Finding domain instances",
+                            bar=True)
+
+        for batch_res, batch_halo in p_runner.result:
+            self.n_halo_alns += batch_halo
+            for q_seq_id, start, summary_strand, end, targets in batch_res:
+                new_domain = DomainInstance(seq_id=q_seq_id,
+                                            start=start,
+                                            summary_strand=summary_strand,
+                                            end=end,
+                                            targets=targets,
+                                            source=self.source)
+                if new_domain.seq_id not in self.domains_per_seq:
+                    self.domains_per_seq[new_domain.seq_id] = []
+                self.domains_per_seq[new_domain.seq_id].append(new_domain)
+                self.n_domains += 1
+
+        logger.info(f"Found {self.n_domains} domain instances across "
+                    f"{len(self.domains_per_seq)} query sequences")
+
+    def create_new_domain(self,
+                          peak_span: Span,
+                          targets: List[Span]) -> None:
+        """
+        Create a new DomainInstance based on a density peak span and target partners.
+
+        :param peak_span: Span representing the density peak.
+        :param targets: Target spans aligned to the cluster members.
+        :return: None
+        """
+        strands = [target.strand for target in targets]
+        supplemented_targets = targets + [peak_span]
+        new_domain = DomainInstance(seq_id=peak_span.seq_id,
+                                    start=peak_span.start,
+                                    summary_strand=sum(strands),
+                                    end=peak_span.end,
+                                    targets=supplemented_targets,
+                                    source=self.source)
+        if new_domain.seq_id not in self.domains_per_seq:
+            self.domains_per_seq[new_domain.seq_id] = []
+        self.domains_per_seq[new_domain.seq_id].append(new_domain)
+        self.n_domains += 1
+
+    def filter_spurious_domains(self,
+                                min_containment: float,
+                                reassign_targets: bool) -> Tuple[int, int]:
+        """
+        Filter spurious domain instances formed by random overlap of adjacent domains.
+
+        :param min_containment: Jaccard containment threshold.
+        :param reassign_targets: Whether to reassign targets of removed domains.
+        :return: Tuple of (number of discarded domains, number of kept domains).
+        """
+        dc = count()
+        n_discarded = 0
+        n_kept = 0
+        for seq_id, domain_list in self.domains_per_seq.items():
+            sorted_domains = sorted(domain_list, key=lambda d: d.start)
+            domain_lengths = np.array([s.length for s in sorted_domains])
+            rows, columns, intersections = compare_sorted_spans(sorted_domains)
+            if rows.size == 0:
+                connected_mask = np.array([], dtype=bool)
+            else:
+                containment = max_containment(intersections=intersections,
+                                              row_lengths=domain_lengths[rows],
+                                              column_lengths=domain_lengths[columns])
+                connected_mask = containment >= min_containment
+
+            if not np.any(connected_mask):
+                kept_domains = sorted_domains
+                n_kept += len(kept_domains)
+            else:
+                sources, targets = rows[connected_mask], columns[connected_mask]
+                remaining_edges = [{s, t} for s, t in zip(sources, targets)]
+                indices_to_remove = set()
+                while remaining_edges:
+                    connected_dom_indices = set()
+                    for edge in remaining_edges:
+                        connected_dom_indices.update(edge)
+                    connected_domains = {i: sorted_domains[i]
+                                         for i in connected_dom_indices}
+                    scoring_dict = {i: (d.coverage(), -d.length)
+                                    for i, d in connected_domains.items()}
+                    weak_i = min(connected_domains,
+                                 key=lambda i: scoring_dict[i])
+                    indices_to_remove.add(weak_i)
+                    if reassign_targets:
+                        removed_domain = sorted_domains[weak_i]
+                        removed_edges = [e for e in remaining_edges if weak_i in e]
+                        connected_to_removed = set()
+                        for edge in removed_edges:
+                            connected_to_removed.update(edge)
+                        connected_to_removed.discard(weak_i)
+                        if connected_to_removed:
+                            heir_domain = connected_domains[
+                                max(connected_to_removed,
+                                    key=lambda i: scoring_dict[i])
+                            ]
+                            heir_domain.partners.extend(removed_domain.partners)
+                    remaining_edges = [e for e in remaining_edges if weak_i not in e]
+
+                kept_domains = [d for i, d in enumerate(sorted_domains)
+                                if i not in indices_to_remove]
+                n_discarded += len(indices_to_remove)
+                n_kept += len(kept_domains)
+
+            for d in kept_domains:
+                self.domain_index[next(dc)] = d
+
+        return n_discarded, n_kept
+
+    def merge_targets(self) -> None:
+        """
+        Merge overlapping target spans for each domain to prepare for overlap matrix generation.
+
+        :return: None
+        """
+        logger.info(f"Merging overlapping targets for {len(self.domain_index)} domains")
+        n_merged = 0
+        n_distinct = 0
+        n_singletons = 0
+        with tqdm(total=len(self.domain_index),
+                  desc="Merging overlapping targets") as pbar:
+            for d_id, domain in self.domain_index.items():
+                self.domain_total_lengths[d_id] = 0
+                domain_targets_by_seq = defaultdict(list)
+                for target in domain.partners:
+                    domain_targets_by_seq[target.seq_id].append(target)
+
+                for t_seq_id, targets in domain_targets_by_seq.items():
+                    if t_seq_id not in self.targets_per_seq:
+                        self.targets_per_seq[t_seq_id] = []
+                    n_targets = len(targets)
+                    if n_targets > 1:
+                        sorted_group = sorted(targets, key=lambda s: s.start)
+                        rows, cols, intersections = compare_sorted_spans(sorted_group)
+                        similarity_matrix = coo_matrix(
+                            (intersections, (rows, cols)),
+                            shape=(n_targets, n_targets)
+                        ).tocsr()
+                        components, labels = csgraph.connected_components(
+                            similarity_matrix,
+                            directed=False,
+                            return_labels=True
+                        )
+                        for component_id in range(components):
+                            component_index = {
+                                i: s for i, s in enumerate(sorted_group)
+                                if labels[i] == component_id
+                            }
+                            if len(component_index) == 1:
+                                distinct_target, = component_index.values()
+                                distinct_target.domain = d_id
+                                self.targets_per_seq[t_seq_id].append(distinct_target)
+                                self.domain_total_lengths[d_id] += distinct_target.length
+                                n_distinct += 1
+                            else:
+                                merged_start = min(s.start for s in component_index.values())
+                                merged_end = max(s.end for s in component_index.values())
+                                merged_target = Span(seq_id=t_seq_id,
+                                                     start=merged_start,
+                                                     end=merged_end,
+                                                     strand=0)
+                                merged_target.domain = d_id
+                                self.targets_per_seq[t_seq_id].append(merged_target)
+                                self.domain_total_lengths[d_id] += merged_target.length
+                                n_merged += len(component_index) - 1
+                    else:
+                        singleton_target, = targets
+                        singleton_target.domain = d_id
+                        self.targets_per_seq[t_seq_id].append(singleton_target)
+                        self.domain_total_lengths[d_id] += singleton_target.length
+                        n_singletons += 1
+                pbar.update(1)
+
+        logger.info(f"Merged: {n_merged}; Distinct: {n_distinct}; "
+                    f"Singletons: {n_singletons}")
+
+    def calculate_target_overlaps(self) -> None:
+        """
+        Calculate pairwise target overlaps across domains to construct overlap graph using parallel batching.
+
+        :return: None
+        """
+        n_domains = len(self.domain_index)
+        if n_domains == 0 or not self.targets_per_seq:
+            return
+
+        target_items = list(self.targets_per_seq.items())
+        total_targets = len(target_items)
+        batch_size = max(100, min(2000, total_targets // (default_threads * 4) if default_threads > 0 else 100))
+        target_batches = [
+            target_items[i:i + batch_size]
+            for i in range(0, total_targets, batch_size)
+        ]
+
+        kwargs = {"n_domains": n_domains}
+        p_runner = Parallel(parallelized_function=_process_overlap_batch,
+                            input_collection=target_batches,
+                            kwargs=kwargs,
+                            description="Calculating target overlaps",
+                            bar=True)
+
+        for b_rows, b_cols, b_data in p_runner.result:
+            if b_rows.size > 0:
+                self._overlap_rows.append(b_rows)
+                self._overlap_cols.append(b_cols)
+                self._overlap_data.append(b_data)
+
+    def families(self,
+                 min_fam_sim: float,
+                 min_fam_dens: float,
+                 halo_stringency: float,
+                 halo_method: Optional[str]) -> Generator[Tuple[str, List[DomainInstance]],
+                                                         None, None]:
+        """
+        Cluster domains into domain families using DPC on target overlap similarities.
+
+        :param min_fam_sim: Minimum family similarity threshold.
+        :param min_fam_dens: Minimum family density threshold.
+        :param halo_stringency: Halo stringency parameter.
+        :param halo_method: Halo method ('traditional', 'knn', etc.) or None.
+        :return: Generator yielding tuples of (family_id, list of DomainInstances).
+        """
+        n_domains = len(self.domain_index)
+        if n_domains == 0:
+            return
+
+        if not self._overlap_rows:
+            logger.warning("No edges in the overlap graph. "
+                           "Yielding single-domain families.")
+            rows = np.array([], dtype=np.int32)
+            cols = np.array([], dtype=np.int32)
+            similarities = np.array([], dtype=np.float64)
         else:
+            cat_rows = np.concatenate(self._overlap_rows)
+            cat_cols = np.concatenate(self._overlap_cols)
+            cat_data = np.concatenate(self._overlap_data)
+
+            # Deduplicate and sum duplicate edges using SciPy sparse matrix aggregation
+            coo = coo_matrix((cat_data, (cat_rows, cat_cols)), shape=(n_domains, n_domains))
+            csr = coo.tocsr()
+            csr.sum_duplicates()
+            coo_dedup = csr.tocoo()
+
+            rows = coo_dedup.row
+            cols = coo_dedup.col
+            intersections = coo_dedup.data
+
+            row_domain_lengths = np.array([self.domain_total_lengths[r] for r in rows], dtype=np.int32)
+            col_domain_lengths = np.array([self.domain_total_lengths[c] for c in cols], dtype=np.int32)
+
+            if np.any(row_domain_lengths <= 0) or np.any(col_domain_lengths <= 0):
+                raise ValueError("Unexpected non-positive domain length encountered.")
+
             similarities = jaccard_index(intersections=intersections,
-                                         row_lengths=span_lengths[rows],
-                                         column_lengths=span_lengths[cols])
-            peak_to_cluster, n_noise = dpc(rows=rows,
-                                           cols=cols,
-                                           sims=similarities,
-                                           n=n_spans,
-                                           min_sim=min_dom_sim,
-                                           weights=weights,
-                                           backend="numpy",
-                                           filter_transparency=halo_stringency,
-                                           halo_method=halo_method,
-                                           min_dens=min_dom_dens)
+                                         row_lengths=row_domain_lengths,
+                                         column_lengths=col_domain_lengths)
 
-            assigned_peak_map = np.full(n_spans, -1, dtype=np.int32)
+        logger.info(f"Clustering {n_domains} domains into families using DPC "
+                    f"with min_fam_sim={min_fam_sim}, halo_stringency={halo_stringency}, "
+                    f"min_fam_dens={min_fam_dens}, halo_method={halo_method}")
+
+        peak_to_cluster, n_halo = dpc(rows=rows,
+                                      cols=cols,
+                                      sims=similarities,
+                                      n=n_domains,
+                                      min_sim=min_fam_sim,
+                                      backend="scipy",
+                                      filter_transparency=halo_stringency,
+                                      halo_method=halo_method,
+                                      min_dens=min_fam_dens)
+        self.n_halo_domains = n_halo
+        n_clusters = len(peak_to_cluster)
+
+        with tqdm(total=n_clusters, desc="Evaluating clusters") as pbar:
             for peak_id, member_ids in peak_to_cluster.items():
-                assigned_peak_map[member_ids] = peak_id
-            cluster_map = assigned_peak_map[cluster_map]
+                cluster_domains_per_seq = defaultdict(list)
+                for d_id in member_ids:
+                    d = self.domain_index[int(d_id)]
+                    cluster_domains_per_seq[d.seq_id].append(d)
 
-            if len(peak_to_cluster) > 1:
-                unique_domain_indices = np.array(list(peak_to_cluster.keys()), dtype=np.int32)
-                peak_mask = np.isin(rows, unique_domain_indices) & np.isin(cols, unique_domain_indices)
-                if np.any(peak_mask):
-                    cluster_map = filter_spurious_domains(cluster_map=cluster_map,
-                                                          suspect_rows=rows[peak_mask],
-                                                          suspect_cols=cols[peak_mask],
-                                                          suspect_intersections=intersections[peak_mask],
-                                                          suspect_lengths=span_lengths,
-                                                          min_containment=min_containment,
-                                                          reassign_targets=reassign_targets)
-
-            active_peaks = np.unique(cluster_map)
-            active_peaks = active_peaks[active_peaks >= 0]
-            peak_indices = active_peaks
-
-    if len(peak_indices) == 0:
-        return [], np.empty((0, 4), dtype=np.int32)
-
-    # Re-index local domains contiguously: 0, 1, ..., K-1
-    domain_id_map = {peak_id: local_idx for local_idx, peak_id in enumerate(peak_indices)}
-    local_domain_ptrs = np.array([domain_id_map.get(c, -1) for c in cluster_map], dtype=np.int32)
-    valid_mask = local_domain_ptrs >= 0
-
-    t_seqs = target_spans[:, 0][valid_mask]
-    t_starts = target_spans[:, 1][valid_mask]
-    t_ends = target_spans[:, 2][valid_mask]
-    t_strands = target_spans[:, 3][valid_mask]
-    t_doms = local_domain_ptrs[valid_mask]
-
-    local_domains: List[Tuple[int, int, int, str]] = []
-    for local_id, peak_id in enumerate(peak_indices):
-        peak_span = unique_query_spans[peak_id]
-        assigned_strands = t_strands[t_doms == local_id]
-        dom_strand = determine_strand(assigned_strands)
-        local_domains.append((query_id, int(peak_span[0]), int(peak_span[1]), dom_strand))
-
-    # Supplement targets with self-hits: (query_id, peak_start, peak_end, local_domain_id)
-    n_self = len(peak_indices)
-    self_targets = np.empty((n_self, 4), dtype=np.int32)
-    for local_id, peak_id in enumerate(peak_indices):
-        peak_span = unique_query_spans[peak_id]
-        self_targets[local_id] = [query_id, peak_span[0], peak_span[1], local_id]
-
-    if valid_mask.any():
-        partner_targets = np.column_stack((t_seqs, t_starts, t_ends, t_doms))
-        all_targets = np.vstack((partner_targets, self_targets))
-    else:
-        all_targets = self_targets
-
-    return local_domains, all_targets
-
-
-def batch_query_processor(batch: List[Tuple[int, np.ndarray, np.ndarray]],
-                          min_dom_sim: float,
-                          min_containment: float,
-                          reassign_targets: bool,
-                          halo_stringency: float,
-                          min_dom_dens: float,
-                          halo_method: Optional[str]) \
-        -> List[Tuple[List[Tuple[int, int, int, str]], np.ndarray]]:
-    """
-    Process a batch of queries and identify domain instances and associated targets.
-
-    :param batch: List of tuples containing (query_id, sorted_query_spans, target_spans).
-    :param min_dom_sim: Minimum similarity for domain identification.
-    :param min_containment: Minimum containment for domain filtering.
-    :param reassign_targets: Whether to reassign targets of spurious domains.
-    :param halo_stringency: Stringency for halo filtering.
-    :param min_dom_dens: Minimum density for domain identification.
-    :param halo_method: Halo filtering algorithm.
-    :return: List of tuples (local_domains, all_targets) for each query in the batch.
-    """
-    batch_results = []
-    for query_id, sorted_query_spans, target_spans in batch:
-        res = domain_instances_on_query(query_id=query_id,
-                                        sorted_query_spans=sorted_query_spans,
-                                        target_spans=target_spans,
-                                        min_dom_sim=min_dom_sim,
-                                        min_containment=min_containment,
-                                        reassign_targets=reassign_targets,
-                                        halo_stringency=halo_stringency,
-                                        min_dom_dens=min_dom_dens,
-                                        halo_method=halo_method)
-        batch_results.append(res)
-    return batch_results
-
-
-# =============================================================================
-# Stage 4: Target Overlap Calculation
-# =============================================================================
-
-def merge_overlapping_spans(targets_on_sequence: np.ndarray) -> np.ndarray:
-    """
-    Merge overlapping target spans into non-overlapping intervals.
-
-    :param targets_on_sequence: 2D NumPy array of target spans (start, end).
-    :return: 2D NumPy array of merged non-overlapping target spans.
-    """
-    if len(targets_on_sequence) == 0:
-        return targets_on_sequence.copy()
-    s = np.ascontiguousarray(targets_on_sequence[:, 0])
-    e = np.ascontiguousarray(targets_on_sequence[:, 1])
-    order = np.lexsort((e, s))
-    s = s[order]
-    e = e[order]
-    e_cum = np.maximum.accumulate(e)
-    brk = np.flatnonzero(s[1:] > e_cum[:-1])
-    out = np.empty((len(brk) + 1, 2), dtype=targets_on_sequence.dtype)
-    out[0, 0] = s[0]
-    out[1:, 0] = s[brk + 1]
-    out[:-1, 1] = e_cum[brk]
-    out[-1, 1] = e_cum[-1]
-    return out
-
-
-def overlaps_on_target(sorted_target_spans: np.ndarray,
-                       aligned_domain_pointers: np.ndarray) \
-        -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Calculate overlaps between target spans and aligned domain pointers on a sequence.
-
-    :param sorted_target_spans: Start-sorted 2D NumPy array of target spans.
-    :param aligned_domain_pointers: 1D NumPy array of domain pointers for each span.
-    :return: Tuple of (global_rows, global_cols, intersections).
-    """
-    n_targets = sorted_target_spans.shape[0]
-    if n_targets > 1:
-        local_rows, local_cols, intersections = compare_sorted_spans(sorted_target_spans)
-        if local_rows.size > 0:
-            mask = aligned_domain_pointers[local_rows] != aligned_domain_pointers[local_cols]
-            if np.any(mask):
-                global_rows = aligned_domain_pointers[local_rows][mask]
-                global_cols = aligned_domain_pointers[local_cols][mask]
-                return global_rows, global_cols, intersections[mask]
-    return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
-
-
-def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray]]) \
-        -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[int, int]]:
-    """
-    Process a batch of target sequences to merge same-domain intervals, compute
-    per-domain target lengths, and calculate pairwise target overlaps.
-
-    :param batch_targets: List of (target_id, target_spans, domain_pointers).
-    :return: Tuple of (rows, cols, intersections, domain_lengths_dict).
-    """
-    batch_rows, batch_cols, batch_data = [], [], []
-    batch_dom_lengths: Dict[int, int] = defaultdict(int)
-
-    for target_id, target_spans, domain_pointers in batch_targets:
-        uniq_domains = np.unique(domain_pointers)
-        merged_spans_list = []
-        aligned_domains_list = []
-
-        for d_id in uniq_domains:
-            dom_mask = domain_pointers == d_id
-            d_spans = target_spans[dom_mask]
-            m_spans = merge_overlapping_spans(d_spans)
-            for sp in m_spans:
-                merged_spans_list.append(sp)
-                aligned_domains_list.append(d_id)
-                batch_dom_lengths[int(d_id)] += int(sp[1] - sp[0])
-
-        if len(merged_spans_list) <= 1:
-            continue
-
-        merged_spans = np.array(merged_spans_list, dtype=np.int32)
-        aligned_domains = np.array(aligned_domains_list, dtype=np.int32)
-
-        sort_order = np.argsort(merged_spans[:, 0])
-        sorted_spans = merged_spans[sort_order]
-        aligned_sorted_domains = aligned_domains[sort_order]
-
-        rows, cols, intersections = overlaps_on_target(sorted_spans, aligned_sorted_domains)
-        if rows.size > 0:
-            batch_rows.append(rows)
-            batch_cols.append(cols)
-            batch_data.append(intersections)
-
-    if batch_rows:
-        return (np.concatenate(batch_rows),
-                np.concatenate(batch_cols),
-                np.concatenate(batch_data),
-                dict(batch_dom_lengths))
-
-    return (np.empty(0, dtype=np.int32),
-            np.empty(0, dtype=np.int32),
-            np.empty(0, dtype=np.int32),
-            dict(batch_dom_lengths))
-
-
-# =============================================================================
-# Stage 5: Family Finding
-# =============================================================================
-
-def family_finder(rows: np.ndarray,
-                  cols: np.ndarray,
-                  intersections: np.ndarray,
-                  domain_lengths: np.ndarray,
-                  n_domains: int,
-                  min_fam_sim: float,
-                  min_fam_dens: float,
-                  halo_stringency: float,
-                  halo_method: Optional[str]) \
-        -> Tuple[Dict[int, np.ndarray], int]:
-    """
-    Cluster domain instances into domain families using DPC based on Jaccard similarity
-    of accumulated target overlaps and total domain target lengths.
-
-    :param rows: 1D NumPy array of domain index pairs (row).
-    :param cols: 1D NumPy array of domain index pairs (col).
-    :param intersections: 1D NumPy array of accumulated target overlap lengths.
-    :param domain_lengths: 1D NumPy array of total target lengths per domain.
-    :param n_domains: Total number of domain instances.
-    :param min_fam_sim: Minimum family similarity for DPC clustering.
-    :param min_fam_dens: Minimum family density for DPC clustering.
-    :param halo_stringency: Halo stringency threshold.
-    :param halo_method: Halo filtering algorithm.
-    :return: Tuple of (peak_to_cluster dictionary, n_noise count).
-    """
-    if rows.size == 0 or n_domains <= 1:
-        return {int(i): np.array([i], dtype=np.int64) for i in range(n_domains)}, 0
-
-    # Ensure canonical undirected edges (rows < cols)
-    u_r = np.minimum(rows, cols).astype(np.int64)
-    u_c = np.maximum(rows, cols).astype(np.int64)
-    diff = u_r != u_c
-    u_r, u_c, inters = u_r[diff], u_c[diff], intersections[diff].astype(np.int64)
-
-    if u_r.size == 0:
-        return {int(i): np.array([i], dtype=np.int64) for i in range(n_domains)}, 0
-
-    keys = (u_r << 32) | u_c
-    order = np.argsort(keys)
-    keys_sorted = keys[order]
-    inters_sorted = inters[order]
-
-    starts = np.flatnonzero(np.concatenate(([True], keys_sorted[1:] != keys_sorted[:-1])))
-    summed_inters = np.add.reduceat(inters_sorted, starts)
-    uniq_keys = keys_sorted[starts]
-
-    final_r = (uniq_keys >> 32).astype(np.int32)
-    final_c = (uniq_keys & 0xFFFFFFFF).astype(np.int32)
-
-    unions = domain_lengths[final_r] + domain_lengths[final_c] - summed_inters
-    valid = (unions > 0) & (summed_inters > 0)
-    final_r = final_r[valid]
-    final_c = final_c[valid]
-    similarities = summed_inters[valid] / unions[valid]
-
-    logger.info(
-        f"Clustering {n_domains} domains into families using DPC with min_fam_sim={min_fam_sim}, "
-        f"halo_stringency={halo_stringency}, min_fam_dens={min_fam_dens}, halo_method={halo_method}"
-    )
-
-    peak_to_cluster, n_halo = dpc(rows=final_r,
-                                  cols=final_c,
-                                  sims=similarities,
-                                  n=n_domains,
-                                  min_sim=min_fam_sim,
-                                  backend="scipy",
-                                  filter_transparency=halo_stringency,
-                                  halo_method=halo_method,
-                                  min_dens=min_fam_dens)
-    return peak_to_cluster, n_halo
-
-
-# =============================================================================
-# Stage 6: Evaluation & GFF3 Export
-# =============================================================================
-
-def evaluate_clusters(peak_to_cluster: Dict[int, np.ndarray],
-                      domain_registry: List[Tuple[int, int, int, str]]) \
-        -> Generator[Tuple[str, List[Tuple[int, int, int, str]]], None, None]:
-    """
-    Evaluate DPC clusters, group member domains by query sequence, and merge
-    overlapping same-cluster domains on the same query sequence.
-
-    :param peak_to_cluster: Dictionary mapping peak ID to member domain index array.
-    :param domain_registry: Global list of domain instances: (query_id, start, end, strand).
-    :return: Generator yielding (cluster_id_str, list_of_final_domains).
-    """
-    n_clusters = len(peak_to_cluster)
-    with tqdm(total=n_clusters, desc="Evaluating clusters") as pbar:
-        for peak_id, member_ids in peak_to_cluster.items():
-            cluster_domains_per_seq: Dict[int, List[Tuple[int, int, int, str]]] = defaultdict(list)
-            for d_id in member_ids:
-                d = domain_registry[int(d_id)]
-                cluster_domains_per_seq[d[0]].append(d)
-
-            component_domains: List[Tuple[int, int, int, str]] = []
-            for seq_id, domains in cluster_domains_per_seq.items():
-                if len(domains) == 1:
-                    component_domains.extend(domains)
-                    continue
-
-                sorted_domains = sorted(domains, key=lambda d: d[1])
-                spans_arr = np.array([[d[1], d[2]] for d in sorted_domains], dtype=np.int32)
-                rows, cols, intersections = compare_sorted_spans(spans_arr)
-                if rows.size == 0:
-                    component_domains.extend(sorted_domains)
-                else:
-                    similarity_matrix = coo_matrix(
-                        (intersections, (rows, cols)),
-                        shape=(len(sorted_domains), len(sorted_domains))
-                    ).tocsr()
-                    components, labels = csgraph.connected_components(
-                        similarity_matrix, directed=False, return_labels=True
-                    )
-                    for component_id in range(components):
-                        comp = [sorted_domains[i] for i in range(len(sorted_domains))
-                                if labels[i] == component_id]
-                        if len(comp) == 1:
-                            component_domains.append(comp[0])
-                        else:
-                            merged_start = min(s[1] for s in comp)
-                            merged_end = max(s[2] for s in comp)
-                            strands = [s[3] for s in comp]
-                            merged_strand = "-" if strands.count("-") > strands.count("+") else "+"
-                            component_domains.append((seq_id, merged_start, merged_end, merged_strand))
-
-            pbar.update(1)
-            yield str(peak_id), component_domains
+                component_domains = []
+                for seq_id, domains in cluster_domains_per_seq.items():
+                    sorted_domains = sorted(domains, key=lambda d: d.start)
+                    c_rows, c_cols, c_intersections = compare_sorted_spans(sorted_domains)
+                    if c_rows.size == 0:
+                        component_domains.extend(sorted_domains)
+                    else:
+                        similarity_matrix = coo_matrix(
+                            (c_intersections, (c_rows, c_cols)),
+                            shape=(len(sorted_domains), len(sorted_domains))
+                        ).tocsr()
+                        components, labels = csgraph.connected_components(
+                            similarity_matrix,
+                            directed=False,
+                            return_labels=True
+                        )
+                        for component_id in range(components):
+                            component_index = {
+                                i: s for i, s in enumerate(sorted_domains)
+                                if labels[i] == component_id
+                            }
+                            if len(component_index) == 1:
+                                distinct_domain, = component_index.values()
+                                component_domains.append(distinct_domain)
+                            else:
+                                merged_start = min(s.start for s in component_index.values())
+                                merged_end = max(s.end for s in component_index.values())
+                                merged_domain = DomainInstance(
+                                    seq_id=seq_id,
+                                    start=merged_start,
+                                    summary_strand=0,
+                                    end=merged_end,
+                                    targets=[self.domain_index[int(i)]
+                                             for i in component_index],
+                                    source=self.source
+                                )
+                                component_domains.append(merged_domain)
+                pbar.update(1)
+                yield f"{peak_id}", component_domains
 
 
 def find_domains(fasta_path: Path,
                  attributes: Dict[str, Any],
                  output_gff: Path,
                  tmp_dir: Optional[Path] = None,
-                 result_dir: Optional[Path] = None,
-                 cpu: int = default_threads) -> Path:
+                 result_dir: Optional[Path] = None) -> Path:
     """
-    Main orchestration function for domain instance extraction and family clustering.
-    Operates on a pre-computed alignment TSV file specified in attributes['tsv'].
+    Find domain families from a FASTA sequence file given parameter attributes.
+
+    Runs MMseqs2 or RiboSeek (or reads pre-computed TSV), filters spurious domain
+    instances, merges target spans, constructs domain overlap graphs, and clusters
+    domain instances into domain families written out to GFF format.
 
     :param fasta_path: Path to input FASTA file containing query sequences.
-    :param attributes: Dictionary with clustering parameters and pre-computed TSV path.
-    :param output_gff: Output GFF3 file path.
-    :param tmp_dir: Optional temporary directory path.
-    :param result_dir: Optional result directory path.
-    :param cpu: Number of parallel CPU worker threads.
-    :return: Path to the generated GFF3 file.
+    :param attributes: Dictionary of aligner and DPC parameter settings.
+    :param output_gff: Path where the resulting GFF3 file will be written.
+    :param tmp_dir: Optional directory path for temporary alignment scratch files.
+    :param result_dir: Optional directory path for alignment TSV output files.
+    :return: Path to the written output GFF3 file.
     """
     fasta_path = Path(fasta_path)
     output_gff = Path(output_gff)
-    output_gff.parent.mkdir(parents=True, exist_ok=True)
 
-    tsv_path_val = attributes.get("tsv")
-    if not tsv_path_val:
-        raise ValueError("🛑 'tsv' path must be specified in attributes. Aligners must be run externally.")
+    tmp_dir = Path(tmp_dir) if tmp_dir else fasta_path.parent / "tmp"
+    result_dir = Path(result_dir) if result_dir else fasta_path.parent / "results_tsvs"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    result_dir.mkdir(parents=True, exist_ok=True)
 
-    tsv_file = Path(tsv_path_val)
-    if not tsv_file.exists():
-        raise FileNotFoundError(f"🛑 Pre-computed TSV file not found: {tsv_file}")
+    norm_attrs = _normalize_attributes(attributes)
 
-    aligner_name = str(attributes.get("aligner", "mmseqs2")).lower()
-    min_dom_sim = float(attributes.get("min_dom_sim", 0.35))
-    dom_halo = float(attributes.get("dom_halo", 0.5))
-    min_dom_dens = float(attributes.get("min_dom_dens", 1.0))
-    min_fam_sim = float(attributes.get("min_fam_sim", 0.25))
-    fam_halo = float(attributes.get("fam_halo", 0.5))
-    min_fam_dens = float(attributes.get("min_fam_dens", 1.0))
-    halo_method = attributes.get("halo_method", "knn")
-    if halo_method is not None and str(halo_method).lower() == "none":
+    # Sequence registry for efficient string management
+    registry = SequenceRegistry()
+
+    # Determine aligner and search strategy
+    tsv_val = norm_attrs.get("tsv") or norm_attrs.get("tsv_path") or norm_attrs.get("read")
+    aligner_setting = str(norm_attrs.get("aligner", "")).lower()
+
+    if tsv_val and Path(tsv_val).exists():
+        aligner_name = aligner_setting if aligner_setting and aligner_setting != "read" else "mmseqs2"
+        logger.info(f"Reading pre-computed alignments from {tsv_val}")
+        search_stream = parse_mmseqs_tsv_stream(Path(tsv_val), registry=registry)
+    elif aligner_setting == "riboseek":
+        aligner_name = "riboseek"
+        logger.info("Executing RiboSeek search")
+        search_hits = riboseek_easy_search(
+            fasta_file=fasta_path,
+            tmp_dir=tmp_dir,
+            result_dir=result_dir,
+            num_iterations=int(norm_attrs.get("num_iterations", 1)),
+            s=float(norm_attrs.get("s", 5.7)),
+            gap_open=float(norm_attrs.get("gap_open", 23.0)),
+            min_seq_id=float(norm_attrs.get("min_seq_id", 0.0)),
+            timeout=norm_attrs.get("timeout"),
+            cpu=int(norm_attrs.get("cpu", max(default_threads - 1, 1))),
+            registry=registry
+        )
+        search_stream = search_hits
+    else:
+        aligner_name = "mmseqs2"
+        logger.info("Executing MMseqs2 search")
+        search_hits = mmseq_easy_search(
+            fasta_file=fasta_path,
+            tmp_dir=tmp_dir,
+            result_dir=result_dir,
+            k=int(norm_attrs.get("k", 7)),
+            s=float(norm_attrs.get("s", 5.7)),
+            gap_extend=float(norm_attrs.get("gap_extend", 1.0)),
+            gap_open=float(norm_attrs.get("gap_open", 11.0)),
+            min_seq_id=float(norm_attrs.get("min_seq_id", 0.0)),
+            timeout=int(norm_attrs.get("timeout", 1800)),
+            cpu=int(norm_attrs.get("cpu", default_threads)),
+            registry=registry
+        )
+        search_stream = search_hits
+
+    # Extract DPC parameters
+    min_dom_sim = float(norm_attrs.get("min_dom_sim", 0.35))
+    dom_halo = float(norm_attrs.get("dom_halo", 0.5))
+    min_dom_dens = float(norm_attrs.get("min_dom_dens", 1.0))
+    min_fam_sim = float(norm_attrs.get("min_fam_sim", 0.25))
+    fam_halo = float(norm_attrs.get("fam_halo", 0.5))
+    min_fam_dens = float(norm_attrs.get("min_fam_dens", 1.0))
+    halo_method = norm_attrs.get("halo_method", "knn")
+    if halo_method and str(halo_method).lower() == "none":
         halo_method = None
-    reassign_targets = bool(attributes.get("reassign_targets", True))
-    min_containment = float(attributes.get("min_containment", 0.6))
+    reassign_targets = bool(norm_attrs.get("reassign_targets", True))
+    min_containment = float(norm_attrs.get("min_containment", 0.6))
 
-    sequence_registry = populate_registry_from_fasta(fasta_path)
+    # Perform domain finding and clustering
+    finder = DomainFinder(search=search_stream, source=aligner_name, registry=registry)
+    finder.find_domain_instances(min_dom_sim=min_dom_sim,
+                                 halo_stringency=dom_halo,
+                                 min_dom_dens=min_dom_dens,
+                                 halo_method=halo_method)
+    finder.filter_spurious_domains(min_containment=min_containment,
+                                   reassign_targets=reassign_targets)
+    finder.merge_targets()
+    finder.calculate_target_overlaps()
 
-    # 1. Obtain generator of alignment query batches from pre-computed TSV
-    batch_gen = batch_parse_mmseqs_tsv(tsv_file=tsv_file,
-                                       n=1000,
-                                       registry=sequence_registry)
+    output_gff.parent.mkdir(parents=True, exist_ok=True)
+    with output_gff.open("w") as gff_writer:
+        for fam_id, fam_domains in finder.families(min_fam_sim=min_fam_sim,
+                                                   halo_stringency=fam_halo,
+                                                   min_fam_dens=min_fam_dens,
+                                                   halo_method=halo_method):
+            for domain in fam_domains:
+                gff_writer.write(domain.to_gff(cluster_id=fam_id, registry=registry) + "\n")
 
-    # 2. Stage 2 & 3: Parallel query processing and domain identification
-    logger.info("Executing Stage 2: Finding domain instances across queries")
-    query_kwargs = {
-        "min_dom_sim": min_dom_sim,
-        "min_containment": min_containment,
-        "reassign_targets": reassign_targets,
-        "halo_stringency": dom_halo,
-        "min_dom_dens": min_dom_dens,
-        "halo_method": halo_method,
+    logger.info(f"Successfully exported domain families to {output_gff}")
+    return output_gff
+
+
+if __name__ == "__main__":
+    FASTA_PATH = Path("original_datasets/sequences.fna")
+    OUTPUT_GFF = Path("output/domain_families.gff")
+    TMP_DIR = Path("output/tmp")
+    RESULT_DIR = Path("output/results_tsvs")
+
+    attributes = {
+        "aligner": "mmseqs2",
+        "k": 7,
+        "s": 5.7,
+        "gap_open": 11.0,
+        "gap_extend": 1.0,
+        "min_seq_id": 0.0,
+        "num_iterations": 1,
+        "min_dom_sim": 0.35,
+        "dom_halo": 0.5,
+        "min_dom_dens": 1.0,
+        "min_fam_sim": 0.25,
+        "fam_halo": 0.5,
+        "min_fam_dens": 1.0,
+        "halo_method": "knn",
+        "reassign_targets": True,
+        "min_containment": 0.6,
     }
 
-    query_workers = Parallel(function=batch_query_processor,
-                             input_collection=batch_gen,
-                             kwargs=query_kwargs,
-                             n_jobs=cpu,
-                             bar=True,
-                             description="Finding domain instances",
-                             chunk_size=1)
-
-    global_domains: List[Tuple[int, int, int, str]] = []
-    targets_by_seq: Dict[int, List[np.ndarray]] = defaultdict(list)
-    global_offset = 0
-
-    for batch_res in query_workers.results:
-        for local_domains, all_targets in batch_res:
-            n_doms = len(local_domains)
-            if n_doms == 0:
-                continue
-            global_domains.extend(local_domains)
-            if all_targets.size > 0:
-                offset_targets = all_targets.copy()
-                offset_targets[:, 3] += global_offset
-                order = np.argsort(offset_targets[:, 0])
-                sorted_t = offset_targets[order]
-                seq_breaks = np.flatnonzero(np.diff(sorted_t[:, 0])) + 1
-                seq_groups = np.split(sorted_t, seq_breaks)
-                for grp in seq_groups:
-                    t_seq = int(grp[0, 0])
-                    targets_by_seq[t_seq].append(grp[:, 1:4])
-            global_offset += n_doms
-
-    n_total_domains = len(global_domains)
-    logger.info(f"Found {n_total_domains} domain instances across {len(targets_by_seq)} target sequences")
-
-    # 3. Stage 4: Parallel target sequence overlap calculation
-    def target_batch_generator() -> Generator[List[Tuple[int, np.ndarray, np.ndarray]], None, None]:
-        batch_pkg: List[Tuple[int, np.ndarray, np.ndarray]] = []
-        for t_seq, chunks in targets_by_seq.items():
-            combined = np.vstack(chunks)
-            spans = combined[:, 0:2]
-            dom_ptrs = combined[:, 2]
-            batch_pkg.append((t_seq, spans, dom_ptrs))
-            if len(batch_pkg) >= 1000:
-                yield batch_pkg
-                batch_pkg = []
-        if batch_pkg:
-            yield batch_pkg
-
-    logger.info("Executing Stage 4: Calculating target overlaps across sequences")
-    target_workers = Parallel(function=target_batch_processor,
-                              input_collection=target_batch_generator(),
-                              n_jobs=cpu,
-                              bar=True,
-                              description="Calculating target overlaps",
-                              chunk_size=1)
-
-    accumulated_rows: List[np.ndarray] = []
-    accumulated_cols: List[np.ndarray] = []
-    accumulated_inters: List[np.ndarray] = []
-    global_dom_lengths = np.zeros(n_total_domains, dtype=np.int64)
-
-    for rows, cols, inters, dom_lens_dict in target_workers.results:
-        if rows.size > 0:
-            accumulated_rows.append(rows)
-            accumulated_cols.append(cols)
-            accumulated_inters.append(inters)
-        for d_id, d_len in dom_lens_dict.items():
-            if d_id < n_total_domains:
-                global_dom_lengths[d_id] += d_len
-
-    all_rows = np.concatenate(accumulated_rows) if accumulated_rows else np.empty(0, dtype=np.int32)
-    all_cols = np.concatenate(accumulated_cols) if accumulated_cols else np.empty(0, dtype=np.int32)
-    all_inters = np.concatenate(accumulated_inters) if accumulated_inters else np.empty(0, dtype=np.int32)
-
-    # 4. Stage 5: Family finding with DPC
-    logger.info("Executing Stage 5: Finding domain families")
-    peak_to_cluster, n_halo = family_finder(rows=all_rows,
-                                            cols=all_cols,
-                                            intersections=all_inters,
-                                            domain_lengths=global_dom_lengths,
-                                            n_domains=n_total_domains,
-                                            min_fam_sim=min_fam_sim,
-                                            min_fam_dens=min_fam_dens,
-                                            halo_stringency=fam_halo,
-                                            halo_method=halo_method)
-
-    # 5. Stage 6: Evaluate clusters and export to GFF3
-    logger.info(f"Writing predicted domain families to {output_gff}")
-    with output_gff.open("w", encoding="utf-8") as gff_writer:
-        gff_writer.write("##gff-version 3\n")
-        for fam_id, fam_domains in evaluate_clusters(peak_to_cluster=peak_to_cluster,
-                                                     domain_registry=global_domains):
-            for seq_int, start, end, strand in fam_domains:
-                seq_name = sequence_registry.get_str(seq_int)
-                gff_line = f"{seq_name}\t{aligner_name}\tDomain\t{start}\t{end}\t.\t{strand}\t.\tID={fam_id}\n"
-                gff_writer.write(gff_line)
-
-    logger.info(f"Successfully finished domain finding. Output written to {output_gff}")
-    return output_gff
+    if FASTA_PATH.exists():
+        find_domains(fasta_path=FASTA_PATH,
+                     attributes=attributes,
+                     output_gff=OUTPUT_GFF,
+                     tmp_dir=TMP_DIR,
+                     result_dir=RESULT_DIR)
 # fmt: on
