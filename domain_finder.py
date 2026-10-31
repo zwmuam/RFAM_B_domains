@@ -55,8 +55,7 @@ def domain_instances_on_query(query_id: int,
     :param min_dom_dens: The minimum density for domain identification.
     :param halo_method: The method for halo filtering.
 
-    Returns:
-        A list of tuples containing the peak ID and the corresponding component domains.
+    Returns: ???
     """
 
     unique_query_spans, cluster_map, weights = np.unique(sorted_query_spans,
@@ -103,7 +102,9 @@ def domain_instances_on_query(query_id: int,
                                                           suspect_lengths=span_lengths[peak_mask],
                                                           min_containment=min_containment,
                                                           reassign_targets=reassign_targets)
-    unique_domain_indices = np.unique(cluster_map)
+    # where is the bsest moment to determine domain instance strand?
+
+
 
     # add domain pointers to the target spans
     targets_with_domains = np.column_stack((target_spans, cluster_map))
@@ -113,8 +114,17 @@ def domain_instances_on_query(query_id: int,
 
     raise NotImplementedError("This function is not yet implemented.")
 
-    # return
+    # return preliminary indexed domain instances (peak query spans) and the corresponding target spans prepared for per-target overlap calculation
+    # the numbering in cluster_map must be consistent with the domain pointers in the target spans (the last column of targets_with_domains)
+    # they both should later be offset to create a global domain pointer index across all queries and targets
 
+def determine_strand(XXX):
+    """
+    Determine the strand of a domain instance based its target hits
+    (strands of all alignemnts that were assigned to it in 'cluster_map' in domain_instances_on_query).
+    :param XXX: ???
+    """
+    raise NotImplementedError("This function is not yet implemented.")
 
 def filter_spurious_domains(cluster_map: np.ndarray,
                             suspect_rows: np.ndarray,
@@ -207,19 +217,19 @@ def batch_query_processor(batch: List[Tuple[int, np.ndarray, np.ndarray]],
                           reassign_targets: bool,
                           halo_stringency: float,
                           min_dom_dens: float,
-                          halo_method: Optional[str]) -> List[Tuple[str, List[Any]]]:
+                          halo_method: Optional[str]):
     """
     Process a batch of queries and prepare it for efficient accumulation for subsequent per-target processing.
     (this function is designed to be run in parallel across multiple processes to generate domain instances and
     per-target
-    :param q_batch_generator: A generator yielding batches of query IDs and their corresponding sorted query spans and target spans.
+    :param batch: A list of tuples containing query_id, sorted_query_spans, and target_spans.
     :param min_dom_sim: The minimum similarity for domain identification.
     :param min_containment: The minimum containment for domain identification.
     :param reassign_targets: Whether to reassign targets.
     :param halo_stringency: The stringency for halo filtering.
     :param min_dom_dens: The minimum density for domain identification.
     :param halo_method: The method for halo filtering.
-    :return: A list of tuples containing the peak ID and the corresponding component domains.
+    :return: ???
     """
     for query_id, sorted_query_spans, target_spans in batch:
         XXX = domain_instances_on_query(query_id=query_id,
@@ -254,8 +264,7 @@ def overlaps_on_target(sorted_target_spans: np.ndarray,
     return None, None, None
 
 
-def target_batch_processor(batch_targets: Any,
-                           n_domains: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def target_batch_processor(batch_targets: Any) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Process a batch of target sequences and return deduplicated sparse COO triplets.
     """
@@ -269,55 +278,70 @@ def target_batch_processor(batch_targets: Any,
             batch_cols.append(cols)
             batch_data.append(intersections)
 
-
-def agregate_sparse_batches(q_batch_generator: Generator[List[int, np.ndarray, np.ndarray], None, None]):
-    """
-    Aggregate sparse COO triplets from multiple batches into a single deduplicated sparse COO matrix.
-    """
-    # the fastest most memory-efficient way to aggregate sparse canonical COO
-    raise NotImplementedError("This function is not yet implemented.")
+    return np.concatenate(batch_rows), np.concatenate(batch_cols), np.concatenate(batch_data)
 
 
 # =============================================================================
-# Stage 5: Family Finding & Cluster Evaluation
+# Stage 5: Family Finding
 # =============================================================================
 
-def evaluate_cluster(batch_items: Any,
-                     source: str) -> List[Tuple[str, List[Any]]]:
+def family_finder(XXX__ACCUMULATED_INTRSECTION__XXX,
+                  domain_registry):
     """
-    Worker function to evaluate domain family clusters in parallel.
+    Identify domain families from accumulated intersections between domain instances.
+    Retrieve the domain instances based on the global domain pointer index and yield the final domain families.
+    :pseudo-param XXX__ACCUMULATED_INTRSECTION__XXX: Accumulated intersections between domain instances across all queries and targets.
+    :param domain_registry: The registry containing domain instances.
     """
+    similarities = jaccard_index(intersections=intersections,
+                                 row_lengths=row_domain_lengths,
+                                 column_lengths=col_domain_lengths)
+    logger.info(f'Clustering {n_domains} domains into families using DPC with min_fam_sim={min_fam_sim}, '
+                f'halo_stringency={halo_stringency}, min_fam_dens={min_fam_dens}, halo_method={halo_method}')
+    peak_to_cluster, n_halo = dpc(rows=rows,
+                                  cols=cols,
+                                  sims=similarities,
+                                  n=n_domains,
+                                  min_sim=min_fam_sim,
+                                  backend='scipy',
+                                  filter_transparency=halo_stringency,
+                                  halo_method=halo_method,
+                                  min_dens=min_fam_dens)
+    n_clusters = len(peak_to_cluster)
 
-    batch_results = []
-    for peak_id, cluster_domains in batch_items:
-        cluster_domains_per_seq = defaultdict(list)
-        for d in cluster_domains:
-            cluster_domains_per_seq[d.seq_id].append(d)
+    with tqdm(total=n_clusters, desc="Evaluating clusters") as pbar:
+        for peak_id, member_ids in peak_to_cluster.items():
+            # sort the domains back to original sequences
+            cluster_domains_per_seq = defaultdict(list)
+            for d_id in member_ids:
+                d = self.domain_index[int(d_id)]
+                cluster_domains_per_seq[d.seq_id].append(d)
 
-        component_domains = []
-        for seq_id, domains in cluster_domains_per_seq.items():
-            sorted_domains = sorted(domains, key=lambda d: d.start)
-            c_rows, c_cols, c_intersections = compare_sorted_spans(sorted_domains)
-            if c_rows.size == 0:
-                component_domains.extend(sorted_domains)
-            else:
-                similarity_matrix = coo_matrix((c_intersections,
-                                                (c_rows, c_cols)),
-                                               shape=(len(sorted_domains),
-                                                      len(sorted_domains))).tocsr()
-                components, labels = csgraph.connected_components(similarity_matrix,
-                                                                  directed=False,
-                                                                  return_labels=True)
-                for component_id in range(components):
-                    component_index = {i: s for i, s in enumerate(sorted_domains)
-                                       if labels[i] == component_id}
-                    if len(component_index) == 1:
-                        distinct_domain, = component_index.values()
-                        component_domains.append(distinct_domain)
-                    else:
-                        merged_start = min(s.start for s in component_index.values())
-                        merged_end = max(s.end for s in component_index.values())
-    return batch_results
+            component_domains = []
+            # merge any overlapping same-cluster domains (alternate versions of the same domain) to clean up the output
+            for seq_id, domains in cluster_domains_per_seq.items():
+                sorted_domains = sorted(domains, key=lambda d: d.start)
+                rows, cols, intersections = compare_sorted_spans(sorted_domains)
+                if rows.size == 0:
+                    component_domains.extend(sorted_domains)
+                else:
+                    similarity_matrix = coo_matrix((intersections, (rows, cols)),
+                                                   shape=(len(sorted_domains), len(sorted_domains))).tocsr()
+                    components, labels = csgraph.connected_components(similarity_matrix, directed=False,
+                                                                      return_labels=True)
+                    for component_id in range(components):
+                        component_index = {i: s for i, s in enumerate(sorted_domains) if
+                                           labels[i] == component_id}
+                        if len(component_index) == 1:
+                            distinct_domain, = component_index.values()
+                            component_domains.append(distinct_domain)
+                        else:
+                            merged_start = min([s.start for s in component_index.values()])
+                            merged_end = max([s.end for s in component_index.values()])
+                            # strand becomes irrelevant after merging, so we set it to 0 (unknown)
+                            component_domains.append(merged_domain)
+            pbar.update(1)
+            yield f'{peak_id}', component_domains
 
 
 def find_conserved_domains(mmseqs_tsv: Path,
@@ -344,10 +368,24 @@ def find_conserved_domains(mmseqs_tsv: Path,
     sequence_registry = SequenceRegistry()
 
     # run the batch_query_processor in parallel to get domain instances, per-target span batches, and aligned domain pointers
-    workers = Parallel(XXX, cpu=cpu)
-
-    # aggregate the results from the workers and prepare for target overlap calculation
+    query_workers = Parallel(XXX, cpu=cpu)
+    for result in query_workers.results:
+        # aggregate the results to get full global index of domain instances and the corresponding target spans prepared for per-target overlap calculation
+        raise NotImplementedError("This function is not yet implemented.")
 
     # run the target_batch_processor in parallel to get target opverlaps between domain instances
+    target_workers = Parallel(XXX, cpu=cpu)
+    for result in target_workers.results:
+        # aggregate the results to get full global index of domain instances and the corresponding target spans prepared for per-target overlap calculation
+        raise NotImplementedError("This function is not yet implemented.")
 
-
+    # after full accumulation of the overlaps between domain instances, run the family_finder to get the final domain families
+    family_map, n_noise = family_finder(rows=XXX,
+                                        cols=XXX,
+                                        intersections=XXX,
+                                        min_dom_sim=min_dom_sim,
+                                        min_containment=min_containment,
+                                        reassign_targets=reassign_targets,
+                                        halo_stringency=halo_transparency,
+                                        min_dom_dens=min_dom_dens,
+                                        halo_method=halo_method)
