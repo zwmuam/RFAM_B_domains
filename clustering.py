@@ -3,34 +3,26 @@
 """
 Density Peak Clustering (DPC) methods
 """
-from typing import Dict, List, Literal, Tuple, Optional, Union
+from typing import Dict, Tuple, Optional, Union
 
 import numpy as np
 from scipy.sparse import csr_matrix
 
-from aligners import Span
 
-
-def compare_sorted_spans(spans: Union[List[Span], np.ndarray]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def compare_sorted_spans(spans: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Extract positional intersections from local pairwise alignments on a single sequence.
     Expects input to be start-position sorted. Maintains O(N) range-bound early exit.
 
-    :param spans: START-SORTED list of Spans or 2D NumPy array shape (N, 2) [[start, end], ...]
+    :param spans: START-SORTED 2D NumPy array shape (N, 2) [[start, end], ...]
     :return: row_indices, col_indices, intersection_lengths
     """
-    if isinstance(spans, np.ndarray):
-        n = spans.shape[0]
-        if n < 2:
-            return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
-        starts = spans[:, 0]
-        ends = spans[:, 1]
-    else:
-        n = len(spans)
-        if n < 2:
-            return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
-        starts = [s.start for s in spans]
-        ends = [s.end for s in spans]
+    n = spans.shape[0]
+    if n < 2:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+    starts = spans[:, 0]
+    ends = spans[:, 1]
+
 
     if not isinstance(starts, np.ndarray):
         starts = np.array(starts, dtype=np.int64)
@@ -870,7 +862,7 @@ def dpc(rows: np.ndarray,
         rows, cols, sims, n, weights, backend
     )
 
-    # --- Peak selection on the decision graph ---
+    # Peak selection on the decision graph
     gamma = densities * (1.0 - s_max_higher)
     sorted_by_gamma = np.lexsort((np.arange(n), -gamma))
     is_candidate_peak = (densities > min_dens) & ((s_max_higher < min_sim) | (nearest_higher == -1))
@@ -878,7 +870,7 @@ def dpc(rows: np.ndarray,
     if peak_indices.size == 0:
         peak_indices = sorted_by_gamma[:1]
 
-    # --- Cascading assignment via vectorised pointer doubling ---
+    # Cascading assignment via vectorised pointer doubling
     parent = np.where((nearest_higher >= 0) & (s_max_higher > 0.0), nearest_higher, np.arange(n))
     parent[peak_indices] = peak_indices
     while True:
@@ -887,12 +879,11 @@ def dpc(rows: np.ndarray,
             break
         parent = grandparent
 
-    labels = np.full(n, -1, dtype=np.int64)
     peak_rank = np.full(n, -1, dtype=np.int64)
     peak_rank[peak_indices] = np.arange(peak_indices.size)
     labels = peak_rank[parent]
 
-    # --- Halo refinement ---
+    # Halo refinement
     if halo_method is not None and str(halo_method).lower() != 'none' and filter_transparency < 1.0:
         labels = halo_filter(labels,
                              similarity_mat=mat,
@@ -903,7 +894,7 @@ def dpc(rows: np.ndarray,
                              rho=densities,
                              halo_k=halo_k)
 
-    # --- Output formatting ---
+    # Output formatting
     peak_to_cluster: Dict[int, np.ndarray] = {int(p): np.empty(0, dtype=np.int64) for p in peak_indices}
     assigned = np.flatnonzero(labels >= 0)
     if assigned.size:
