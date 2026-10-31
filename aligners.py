@@ -1,3 +1,4 @@
+# fmt: off
 from pathlib import Path
 import sys
 from typing import Dict, Generator, List, Optional, Tuple, Union
@@ -11,18 +12,28 @@ class SequenceRegistry:
     """
     Bidirectional string-to-int32 sequence ID registry using sys.intern.
     Reduces memory overhead by eliminating redundant string allocations across billions of hits.
+    Can be frozen to enforce a closed sequence ID set derived from input FASTA sequences.
     """
-    __slots__ = ('str_to_id', 'id_to_str')
+    __slots__ = ("str_to_id", "id_to_str", "frozen")
 
-    def __init__(self) -> None:
+    def __init__(self, frozen: bool = False) -> None:
         self.str_to_id: Dict[str, int] = {}
         self.id_to_str: List[str] = []
+        self.frozen: bool = frozen
+
+    def freeze(self) -> None:
+        """Freeze the registry to prohibit adding new sequence IDs."""
+        self.frozen = True
 
     def get_id(self, seq_id: Union[str, int]) -> int:
         if isinstance(seq_id, int):
             return seq_id
         val = self.str_to_id.get(seq_id)
         if val is None:
+            if self.frozen:
+                raise KeyError(
+                    f"🛑 Sequence ID '{seq_id}' not found in pre-populated SequenceRegistry."
+                )
             s = sys.intern(seq_id)
             val = len(self.id_to_str)
             self.str_to_id[s] = val
@@ -39,12 +50,17 @@ class SequenceRegistry:
     def __len__(self) -> int:
         return len(self.id_to_str)
 
+    def __contains__(self, seq_id: str) -> bool:
+        return seq_id in self.str_to_id
 
-def count_fasta(fasta_path: Path) -> int:
+
+def count_fasta(fasta_path: Path,
+                registry: Optional[SequenceRegistry] = None) -> int:
     """
-    Count the number of sequence header lines starting with '>' in a FASTA sequence file.
+    Count sequence headers (starting with '>') and optionally populate registry.
 
     :param fasta_path: Path to the FASTA sequence file.
+    :param registry: Optional SequenceRegistry to populate with FASTA query IDs.
     :return: Integer count of query sequence headers.
     """
     fasta_path = Path(fasta_path)
@@ -55,7 +71,27 @@ def count_fasta(fasta_path: Path) -> int:
         for line in fasta_file:
             if line.startswith(">"):
                 header_count += 1
+                if registry is not None:
+                    seq_id = line[1:].strip().split()[0]
+                    registry.get_id(seq_id)
+    if registry is not None:
+        registry.freeze()
     return header_count
+
+
+def populate_registry_from_fasta(fasta_path: Path,
+                                 registry: Optional[SequenceRegistry] = None) -> SequenceRegistry:
+    """
+    Populate and freeze a SequenceRegistry in a single pass over a FASTA file.
+
+    :param fasta_path: Path to the FASTA sequence file.
+    :param registry: Optional SequenceRegistry instance to populate (created if None).
+    :return: Frozen SequenceRegistry containing all sequence IDs from the FASTA file.
+    """
+    if registry is None:
+        registry = SequenceRegistry()
+    count_fasta(fasta_path=fasta_path, registry=registry)
+    return registry
 
 
 def parse_mmseqs_tsv(tsv_file: Path,
@@ -63,48 +99,53 @@ def parse_mmseqs_tsv(tsv_file: Path,
         -> Generator[Tuple[int, np.ndarray, np.ndarray], None, None]:
     """
     Single-pass streaming parser for MMseqs2 BLAST-TAB TSV output files.
-    Yields (q_seq_id, sorted_query_spans) query block by query block to keep memory usage minimal.
+    Yields (q_seq_id, sorted_query_spans, target_spans) query block by query block.
+
     :param tsv_file: Path to the MMseqs2 BLAST-TAB TSV output file.
     :param registry: SequenceRegistry instance to use for sequence ID lookups.
-    :return: Generator yielding tuples of (query_seq_ID, (query_spans, target_spans)).
+    :return: Generator yielding tuples of (query_seq_int, query_spans, target_spans).
     """
     tsv_file = Path(tsv_file)
     if not tsv_file.exists():
-        raise FileNotFoundError(f"TSV file not found: {tsv_file}")
+        raise FileNotFoundError(f"🛑 TSV file not found: {tsv_file}")
 
-    with tsv_file.open('r') as handle:
+    with tsv_file.open("r") as handle:
         first_line = handle.readline().strip()
         if first_line == "_TimeoutError_":
-            raise TimeoutError(f'MMseqs2 search timed out. Result file: {tsv_file}')
+            raise TimeoutError(f"🛑 MMseqs2 search timed out. Result file: {tsv_file}")
 
     def format_block(query_int: int,
                      query_hits: List[Tuple[int, int]],
-                     target_hits: List[Tuple[int, int, int, int]]) -> Tuple[int, np.ndarray, np.ndarray]:
+                     target_hits: List[Tuple[int, int, int, int]]) \
+            -> Tuple[int, np.ndarray, np.ndarray]:
         """
-        Format a block of query and target hits into a tuple of (query_seq_ID, (query_spans, target_spans)).
-        :param query_int: Integer ID of the query sequence.
-        :param query_hits: List of tuples representing query hit spans (start, end).
-        :param target_hits: List of tuples representing target hit spans (target_seq_ID, start, end, strand).
-        :return: Tuple of (query_seq_ID, (query_spans, target_spans)).
+        Format hits into sorted NumPy arrays (primary: start, tiebreaker: end).
         """
         query_spans = np.array(query_hits, dtype=np.int32)
         target_spans = np.array(target_hits, dtype=np.int32)
 
-        # Sort query spans by start position, then by end position
-        sort_order = XXX
+        # Deterministic sorting: primary on start (col 0), tie-breaker on end (col 1)
+        sort_order = np.lexsort((query_spans[:, 1], query_spans[:, 0]))
         return query_int, query_spans[sort_order], target_spans[sort_order]
 
     seen_queries = set()
     current_q_int = None
-    current_query_hits = []
-    current_target_hits = []
+    current_query_hits: List[Tuple[int, int]] = []
+    current_target_hits: List[Tuple[int, int, int, int]] = []
+    total_valid_hits = 0
 
-    logger.info(f'streaming alignment results from {tsv_file}')
+    logger.info(f"streaming alignment results from {tsv_file}")
 
-    with tsv_file.open('r') as handle:
+    with tsv_file.open("r") as handle:
         for line in handle:
-            line = line.rstrip('\n')
-            fields = line.split('\t')
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 10:
+                raise ValueError(
+                    f"🛑 Malformed BLAST-TAB line with fewer than 10 fields: {line}"
+                )
 
             q_seq_str = fields[0]
             t_seq_str = fields[1]
@@ -121,41 +162,56 @@ def parse_mmseqs_tsv(tsv_file: Path,
             t_start, t_end = min(t_start, t_end), max(t_start, t_end)
 
             q_seq_int = registry.get_id(q_seq_str)
+            t_seq_int = registry.get_id(t_seq_str)
 
             if current_q_int is None:
                 current_q_int = q_seq_int
                 seen_queries.add(q_seq_int)
             elif current_q_int != q_seq_int:
                 if q_seq_int in seen_queries:
-                    raise ValueError(f"Input TSV {tsv_file} is not grouped contiguously by query sequence ID.")
-                yield format_block(current_q_int, current_query_hits, current_target_hits)
-                current_query_hits.clear(), current_target_hits.clear()
+                    raise ValueError(
+                        f"🛑 Input TSV {tsv_file} is not grouped contiguously by query ID."
+                    )
+                if current_query_hits:
+                    yield format_block(current_q_int, current_query_hits, current_target_hits)
+                    current_query_hits.clear()
+                    current_target_hits.clear()
                 current_q_int = q_seq_int
                 seen_queries.add(q_seq_int)
 
-            t_seq_int = registry.get_id(t_seq_str)
             current_query_hits.append((q_start, q_end))
             current_target_hits.append((t_seq_int, t_start, t_end, t_strand))
-    yield format_block(current_q_int, current_query_hits, current_target_hits)
+            total_valid_hits += 1
+
+    if current_q_int is not None and current_query_hits:
+        yield format_block(current_q_int, current_query_hits, current_target_hits)
+
+    if total_valid_hits == 0:
+        raise ValueError(
+            f"🛑 Input TSV {tsv_file} is empty or contains only excluded self-hits."
+        )
 
 
 def batch_parse_mmseqs_tsv(tsv_file: Path,
-                           n: int,
-                           registry: SequenceRegistry) -> Generator[
-    List[Tuple[int, np.ndarray, np.ndarray]], None, None]:
+                           n: int = 1000,
+                           registry: Optional[SequenceRegistry] = None) \
+        -> Generator[List[Tuple[int, np.ndarray, np.ndarray]], None, None]:
     """
-    Collect n query blocks from a TSV file and yield them as a list of query sequence IDs.
+    Collect n query blocks from a TSV file and yield them as a batch.
+
     :param tsv_file: Path to the MMseqs2 BLAST-TAB TSV output file.
     :param n: Number of query blocks to collect before yielding.
     :param registry: SequenceRegistry instance to use for sequence ID lookups.
-    :return: Generator yielding lists of query sequence IDs.
+    :return: Generator yielding lists of query blocks.
     """
+    if registry is None:
+        registry = SequenceRegistry()
     batch = []
-    for query_block in parse_mmseqs_tsv(tsv_file, registry):
+    for query_block in parse_mmseqs_tsv(tsv_file=tsv_file, registry=registry):
         batch.append(query_block)
         if len(batch) >= n:
             yield batch
-            batch.clear()
+            batch = []
     if batch:
         yield batch
 
@@ -168,12 +224,12 @@ def riboseek_easy_search(fasta_file: Path,
                          gap_open: float,
                          min_seq_id: float,
                          timeout: Optional[int] = None,
-                         cpu: int = default_threads - 1) -> Generator[
-    List[Tuple[int, np.ndarray, np.ndarray]], None, None]:
+                         cpu: int = default_threads - 1,
+                         registry: Optional[SequenceRegistry] = None,
+                         batch_size: int = 1000) \
+        -> Generator[List[Tuple[int, np.ndarray, np.ndarray]], None, None]:
     """
     Runs a Riboseek easy-search with the given parameters and parses the results.
-    This wrapper function is structured for downstream Bayesian optimization 
-    of nucleotide/RFAM homology search parameters.
 
     =============================================================================
     THE 10 CRITICAL OPTIMIZATION PARAMETERS (Selected for Bayesian Optimization):
@@ -226,7 +282,7 @@ def riboseek_easy_search(fasta_file: Path,
     ITERATIVE RNA PROFILE OPTIONS & MMSEQS2 DIFFERENCES:
     =============================================================================
     Riboseek introduces crucial departures from MMseqs2 to handle structural RNA:
-    
+
     1. Di-mer vs Mononucleotide/AA Alphabet:
        Riboseek operates on a 24-state overlapping di-mer alphabet (16 canonical,
        8 wildcards) with a stride of 1 nucleotide. This preserves base-pairing signals.
@@ -246,57 +302,47 @@ def riboseek_easy_search(fasta_file: Path,
        Riboseek MSAs via `cmbuild` and realign hits with the CYK algorithm using `cmsearch`
        for structure-aware alignments, which standard MMseqs2 cannot do.
     """
+    fasta_file = Path(fasta_file)
+    result_dir = Path(result_dir)
+    tmp_dir = Path(tmp_dir)
 
-    # generate a result file path based on the input fasta file name riboseek flags
-    name_string = f'{fasta_file.stem}_s{s}_Iter{num_iterations}_go{gap_open}_msi{min_seq_id}'
+    if registry is None:
+        registry = populate_registry_from_fasta(fasta_file)
+
+    name_string = f"{fasta_file.stem}_s{s}_Iter{num_iterations}_go{gap_open}_msi{min_seq_id}"
     result_file = result_dir.joinpath(name_string)
-    # if file already exists (from a previous run), skip the search and parse the existing results
-    try:
-        return batch_parse_mmseqs_tsv(result_file)
-    # if file does not exist, run Riboseek easy-search and parse the results
-    except FileNotFoundError:
-        # Establish directory structure
-        fasta_file = Path(fasta_file)
-        run_tmp_dir = Path(tmp_dir).joinpath(f"{fasta_file.stem}.riboseek.tmp")
-        run_tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    if not result_file.exists():
+        run_tmp_dir = tmp_dir.joinpath(f"{fasta_file.stem}.riboseek.tmp")
+        run_tmp_dir.mkdir(parents=True, exist_ok=True)
         tmp_subdir = run_tmp_dir.joinpath("riboseek_tmp")
         tmp_subdir.mkdir(parents=True, exist_ok=True)
 
-        # Construct command list
-        command = ["riboseek", "easy-search",
-                   str(fasta_file.as_posix()),  # Query Fasta (Self-search for RFAM identification)
-                   str(fasta_file.as_posix()),  # Target Fasta
-                   str(result_file.as_posix()),  # Output BLAST-TAB TSV
-                   str(tmp_subdir.as_posix()),  # Temporary scratch subdirectory
-
-                   # Performance/System Parameters
-                   "--threads", str(cpu),
-
-                   # 1. Sensitivity
-                   "-s", f"{s}",
-                   "--mask", "1",  # Enable TANTAN low-complexity masking for RNA to avoid repeat-driven hit explosion
-
-                   # 7. Ungapped Prefilter Threshold
-                   "--max-seqs", '9999',  # Set to 2000 to capture more potential hits for RNA
-
-                   # 9. Iterations
-                   "--num-iterations", str(num_iterations),
-                   "--gap-open", str(gap_open),
-                   "--min-seq-id", str(min_seq_id),  # Minimum sequence identity threshold
-                   "--search-type", "3",  # Explicitly force nucleotide search
-                   "--max-rejected", "100",  # Limit rejected candidates
-                   "--qsc", "0.0",  # perform rudimentary candidate filtering to avoid profile pollution
-                   "-c", "0.0",  # Set coverage threshold to 0 to capture short domains
-                   ]
+        command = [
+            "riboseek", "easy-search",
+            str(fasta_file.as_posix()),
+            str(fasta_file.as_posix()),
+            str(result_file.as_posix()),
+            str(tmp_subdir.as_posix()),
+            "--threads", str(cpu),
+            "-s", f"{s}",
+            "--mask", "1",
+            "--max-seqs", "9999",
+            "--num-iterations", str(num_iterations),
+            "--gap-open", str(gap_open),
+            "--min-seq-id", str(min_seq_id),
+            "--search-type", "3",
+            "--max-rejected", "100",
+            "--qsc", "0.0",
+            "-c", "0.0"
+        ]
         try:
             shell(command=command, timeout=timeout)
         except TimeoutError:
-            # make a fake output file that contains only "_TimeoutError_" to indicate that the search timed out
-            with open(result_file, 'w') as f:
-                f.write("_TimeoutError_")
+            with open(result_file, "w") as f:
+                f.write("_TimeoutError_\n")
 
-        return batch_parse_mmseqs_tsv(result_file)
+    return batch_parse_mmseqs_tsv(tsv_file=result_file, n=batch_size, registry=registry)
 
 
 def mmseq_easy_search(fasta_file: Path,
@@ -308,55 +354,68 @@ def mmseq_easy_search(fasta_file: Path,
                       gap_open: float,
                       min_seq_id: float,
                       timeout: int,
-                      cpu: int = default_threads) -> Generator[List[Tuple[int, np.ndarray, np.ndarray]], None, None]:
+                      cpu: int = default_threads,
+                      registry: Optional[SequenceRegistry] = None,
+                      batch_size: int = 1000) \
+        -> Generator[List[Tuple[int, np.ndarray, np.ndarray]], None, None]:
     """
-    1. Run MMseqs2 search on the input fasta file against itself
-    2. Parse the results into a dictionary of query sequences and their corresponding hits
-    3. Return the dictionary of query sequences and their hits
-    :param fasta_file: path to the input fasta file
-    :param tmp_dir: path to the temporary directory for MMseqs2 output
-    :param k: k-mer size
-    :param s: sensitivity
-    :param gap_extend: gap extension penalty
-    :param gap_open: gap opening penalty
-    :param min_seq_id: minimum sequence identity
-    :param timeout: timeout for the search (in seconds)
-    :param cpu: number of CPU threads to use (default: all but one)
-    :return: Generator yielding lists of query sequence IDs and their corresponding hits
+    1. Run MMseqs2 search on input FASTA file against itself
+    2. Stream-parse results into batches of query sequence blocks
+    3. Yield batches of (query_int, query_spans, target_spans)
+
+    :param fasta_file: Path to the input FASTA file.
+    :param tmp_dir: Path to the temporary directory for MMseqs2 output.
+    :param result_dir: Path to the directory for alignment TSV output.
+    :param k: k-mer size.
+    :param s: Sensitivity.
+    :param gap_extend: Gap extension penalty.
+    :param gap_open: Gap opening penalty.
+    :param min_seq_id: Minimum sequence identity.
+    :param timeout: Timeout for search (in seconds).
+    :param cpu: Number of CPU threads to use.
+    :param registry: Pre-populated SequenceRegistry (created from FASTA if None).
+    :param batch_size: Number of query blocks to yield per batch.
+    :return: Generator yielding lists of query blocks.
     """
+    fasta_file = Path(fasta_file)
+    result_dir = Path(result_dir)
+    tmp_dir = Path(tmp_dir)
+
+    if registry is None:
+        registry = populate_registry_from_fasta(fasta_file)
+
     name_string = f"{fasta_file.stem}_k{k}_s{s}_gap{gap_open}_{gap_extend}_minid_{min_seq_id}.tsv"
     result_file = result_dir.joinpath(name_string)
-    try:
-        return batch_parse_mmseqs_tsv(result_file)
-    except FileNotFoundError:
-        fasta_file = Path(fasta_file)
-        run_tmp_dir = Path(tmp_dir).joinpath(f"{fasta_file.stem}.riboseek.tmp")
-        run_tmp_dir.mkdir(parents=True, exist_ok=True)
-        tmp_subdir = tmp_dir.joinpath('mmseqs_tmp')
-        tmp_subdir.mkdir(parents=True, exist_ok=True)
-        command = ['mmseqs',
-                   'easy-search',
-                   str(fasta_file.as_posix()),
-                   str(fasta_file.as_posix()),
-                   str(result_file.as_posix()),
-                   str(tmp_subdir.as_posix()),
-                   '--threads', str(cpu),
-                   '-k', f'{k}',
-                   '--spaced-kmer-mode', '1',
-                   '--diag-score', '1',
-                   '--gap-extend', f'{gap_extend}',
-                   '--gap-open', f'{gap_open}',
-                   '-s', f'{s}',
-                   '--min-seq-id', f'{min_seq_id}',
-                   '-c', '0',
-                   '--max-seqs', '9999',
-                   '--search-type', '3']
 
+    if not result_file.exists():
+        run_tmp_dir = tmp_dir.joinpath(f"{fasta_file.stem}.riboseek.tmp")
+        run_tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_subdir = tmp_dir.joinpath("mmseqs_tmp")
+        tmp_subdir.mkdir(parents=True, exist_ok=True)
+
+        command = [
+            "mmseqs", "easy-search",
+            str(fasta_file.as_posix()),
+            str(fasta_file.as_posix()),
+            str(result_file.as_posix()),
+            str(tmp_subdir.as_posix()),
+            "--threads", str(cpu),
+            "-k", f"{k}",
+            "--spaced-kmer-mode", "1",
+            "--diag-score", "1",
+            "--gap-extend", f"{gap_extend}",
+            "--gap-open", f"{gap_open}",
+            "-s", f"{s}",
+            "--min-seq-id", f"{min_seq_id}",
+            "-c", "0",
+            "--max-seqs", "9999",
+            "--search-type", "3"
+        ]
         try:
             shell(command=command, timeout=timeout)
         except TimeoutError:
-            # make a fake output file that contains only "_TimeoutError_" to indicate that the search timed out
-            with open(result_file, 'w') as f:
-                f.write("_TimeoutError_")
+            with open(result_file, "w") as f:
+                f.write("_TimeoutError_\n")
 
-        return batch_parse_mmseqs_tsv(result_file)
+    return batch_parse_mmseqs_tsv(tsv_file=result_file, n=batch_size, registry=registry)
+# fmt: on
