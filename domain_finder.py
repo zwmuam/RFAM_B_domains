@@ -171,8 +171,10 @@ def domain_instances_on_query(query_id: int,
                                            halo_method=halo_method,
                                            min_dens=min_dom_dens)
 
+            assigned_peak_map = np.full(n_spans, -1, dtype=np.int32)
             for peak_id, member_ids in peak_to_cluster.items():
-                cluster_map[np.isin(cluster_map, member_ids)] = peak_id
+                assigned_peak_map[member_ids] = peak_id
+            cluster_map = assigned_peak_map[cluster_map]
 
             if len(peak_to_cluster) > 1:
                 unique_domain_indices = np.array(list(peak_to_cluster.keys()), dtype=np.int32)
@@ -186,9 +188,9 @@ def domain_instances_on_query(query_id: int,
                                                           min_containment=min_containment,
                                                           reassign_targets=reassign_targets)
 
-        active_peaks = np.unique(cluster_map)
-        active_peaks = active_peaks[active_peaks >= 0]
-        peak_indices = active_peaks
+            active_peaks = np.unique(cluster_map)
+            active_peaks = active_peaks[active_peaks >= 0]
+            peak_indices = active_peaks
 
     if len(peak_indices) == 0:
         return [], np.empty((0, 4), dtype=np.int32)
