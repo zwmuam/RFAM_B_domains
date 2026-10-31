@@ -20,10 +20,8 @@ __email__ = "jakub.barylski@gmail.com"
 # built-ins
 from collections import defaultdict
 from itertools import count
-import math
 from pathlib import Path
-import re
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 # standard libraries
 import numpy as np
@@ -33,8 +31,7 @@ from tqdm import tqdm
 # internal repository/package imports
 from aligners import (SequenceRegistry, count_fasta,
                       populate_registry_from_fasta,
-                      batch_parse_mmseqs_tsv,
-                      mmseq_easy_search, riboseek_easy_search)
+                      batch_parse_mmseqs_tsv)
 from clustering import (compare_sorted_spans,
                         jaccard_index, max_containment,
                         dpc)
@@ -49,24 +46,6 @@ def count_fasta_queries(fasta_path: Path) -> int:
     :return: Integer count of query sequence headers.
     """
     return count_fasta(fasta_path=fasta_path)
-
-
-def normalize_attributes(attributes: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize key names in the attributes dictionary.
-
-    Strips leading non-alphanumeric characters (such as dashes) and replaces
-    non-alphanumeric characters with underscores.
-
-    :param attributes: Input dictionary with search and clustering parameters.
-    :return: Normalized attributes dictionary with cleaned keys.
-    """
-    normalized: Dict[str, Any] = {}
-    for key, val in attributes.items():
-        clean_key = key.lstrip("-")
-        clean_key = re.sub(r"[^a-zA-Z0-9_]", "_", clean_key)
-        normalized[clean_key] = val
-    return normalized
 
 
 def determine_strand(strands: np.ndarray) -> str:
@@ -281,7 +260,7 @@ def batch_query_processor(batch: List[Tuple[int, np.ndarray, np.ndarray]],
                                         halo_method=halo_method)
         batch_results.append(res)
     return batch_results
-# fmt: on
+
 
 # =============================================================================
 # Stage 4: Target Overlap Calculation
@@ -386,6 +365,7 @@ def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray
             np.empty(0, dtype=np.int32),
             dict(batch_dom_lengths))
 
+
 # =============================================================================
 # Stage 5: Family Finding
 # =============================================================================
@@ -461,6 +441,7 @@ def family_finder(rows: np.ndarray,
                                   min_dens=min_fam_dens)
     return peak_to_cluster, n_halo
 
+
 # =============================================================================
 # Stage 6: Evaluation & GFF3 Export
 # =============================================================================
@@ -527,70 +508,47 @@ def find_domains(fasta_path: Path,
                  cpu: int = default_threads) -> Path:
     """
     Main orchestration function for domain instance extraction and family clustering.
+    Operates on a pre-computed alignment TSV file specified in attributes['tsv'].
 
     :param fasta_path: Path to input FASTA file containing query sequences.
-    :param attributes: Dictionary with search and clustering parameters.
+    :param attributes: Dictionary with clustering parameters and pre-computed TSV path.
     :param output_gff: Output GFF3 file path.
-    :param tmp_dir: Optional temporary directory for search output.
-    :param result_dir: Optional result directory for alignment TSVs.
+    :param tmp_dir: Optional temporary directory path.
+    :param result_dir: Optional result directory path.
     :param cpu: Number of parallel CPU worker threads.
     :return: Path to the generated GFF3 file.
     """
     fasta_path = Path(fasta_path)
     output_gff = Path(output_gff)
     output_gff.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dir = Path(tmp_dir) if tmp_dir else output_gff.parent / "tmp"
-    result_dir = Path(result_dir) if result_dir else output_gff.parent / "results"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    result_dir.mkdir(parents=True, exist_ok=True)
 
-    norm_attrs = normalize_attributes(attributes)
-    aligner_name = str(norm_attrs.get("aligner", "mmseqs2")).lower()
+    tsv_path_val = attributes.get("tsv")
+    if not tsv_path_val:
+        raise ValueError("🛑 'tsv' path must be specified in attributes. Aligners must be run externally.")
 
-    min_dom_sim = float(norm_attrs.get("min_dom_sim", 0.35))
-    dom_halo = float(norm_attrs.get("dom_halo", 0.5))
-    min_dom_dens = float(norm_attrs.get("min_dom_dens", 1.0))
-    min_fam_sim = float(norm_attrs.get("min_fam_sim", 0.25))
-    fam_halo = float(norm_attrs.get("fam_halo", 0.5))
-    min_fam_dens = float(norm_attrs.get("min_fam_dens", 1.0))
-    halo_method = norm_attrs.get("halo_method", "knn")
+    tsv_file = Path(tsv_path_val)
+    if not tsv_file.exists():
+        raise FileNotFoundError(f"🛑 Pre-computed TSV file not found: {tsv_file}")
+
+    aligner_name = str(attributes.get("aligner", "mmseqs2")).lower()
+    min_dom_sim = float(attributes.get("min_dom_sim", 0.35))
+    dom_halo = float(attributes.get("dom_halo", 0.5))
+    min_dom_dens = float(attributes.get("min_dom_dens", 1.0))
+    min_fam_sim = float(attributes.get("min_fam_sim", 0.25))
+    fam_halo = float(attributes.get("fam_halo", 0.5))
+    min_fam_dens = float(attributes.get("min_fam_dens", 1.0))
+    halo_method = attributes.get("halo_method", "knn")
     if halo_method is not None and str(halo_method).lower() == "none":
         halo_method = None
-    reassign_targets = bool(norm_attrs.get("reassign_targets", True))
-    min_containment = float(norm_attrs.get("min_containment", 0.6))
+    reassign_targets = bool(attributes.get("reassign_targets", True))
+    min_containment = float(attributes.get("min_containment", 0.6))
 
     sequence_registry = populate_registry_from_fasta(fasta_path)
 
-    # 1. Obtain generator of alignment query batches
-    tsv_path_str = norm_attrs.get("tsv")
-    if tsv_path_str and Path(tsv_path_str).exists():
-        batch_gen = batch_parse_mmseqs_tsv(tsv_file=Path(tsv_path_str),
-                                           n=1000,
-                                           registry=sequence_registry)
-    elif "riboseek" in aligner_name:
-        batch_gen = riboseek_easy_search(fasta_file=fasta_path,
-                                         tmp_dir=tmp_dir,
-                                         result_dir=result_dir,
-                                         num_iterations=int(norm_attrs.get("num_iterations", 1)),
-                                         s=float(norm_attrs.get("s", 5.7)),
-                                         gap_open=float(norm_attrs.get("gap_open", 23.0)),
-                                         min_seq_id=float(norm_attrs.get("min_seq_id", 0.0)),
-                                         cpu=cpu,
-                                         registry=sequence_registry,
-                                         batch_size=1000)
-    else:
-        batch_gen = mmseq_easy_search(fasta_file=fasta_path,
-                                      tmp_dir=tmp_dir,
-                                      result_dir=result_dir,
-                                      k=int(norm_attrs.get("k", 0)),
-                                      s=float(norm_attrs.get("s", 5.7)),
-                                      gap_extend=float(norm_attrs.get("gap_extend", 1.0)),
-                                      gap_open=float(norm_attrs.get("gap_open", 23.0)),
-                                      min_seq_id=float(norm_attrs.get("min_seq_id", 0.0)),
-                                      timeout=int(norm_attrs.get("timeout", 1800)),
-                                      cpu=cpu,
-                                      registry=sequence_registry,
-                                      batch_size=1000)
+    # 1. Obtain generator of alignment query batches from pre-computed TSV
+    batch_gen = batch_parse_mmseqs_tsv(tsv_file=tsv_file,
+                                       n=1000,
+                                       registry=sequence_registry)
 
     # 2. Stage 2 & 3: Parallel query processing and domain identification
     logger.info("Executing Stage 2: Finding domain instances across queries")
@@ -701,17 +659,4 @@ def find_domains(fasta_path: Path,
 
     logger.info(f"Successfully finished domain finding. Output written to {output_gff}")
     return output_gff
-
-
-def find_conserved_domains(mmseqs_tsv: Path,
-                           min_dom_sim: float,
-                           min_containment: float,
-                           reassign_targets: bool,
-                           halo_transparency: float,
-                           min_dom_dens: float,
-                           halo_method: Optional[str],
-                           cpu: int = default_threads) -> List[Tuple[str, List[Any]]]:
-    """
-    Legacy wrapper function for backward compatibility.
-    """
-    pass
+# fmt: on
