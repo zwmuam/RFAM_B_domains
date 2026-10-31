@@ -1,152 +1,182 @@
 # fmt: off
 from pathlib import Path
 import pytest
-import numpy as np
-
-import domain_finder
-from aligners import SequenceRegistry
-from clustering import compare_sorted_spans, jaccard_index, max_containment
+from aligners import Span
+from domain_finder import (DomainFinder, DomainInstance, _normalize_attributes,
+                           find_domains)
 
 
-def test_coordinate_system_consistency():
-    """
-    Validate coordinate system consistency:
-    - Identical intervals yield Jaccard = 1.0.
-    - Abutting intervals [10, 50] and [50, 90] have 0 intersection in compare_sorted_spans.
-    - Overlapping intervals have exact intersection min(e1, e2) - max(s1, s2).
-    - Interval merging correctly merges abutting and overlapping intervals while preserving gaps.
-    """
-    # Identical spans
-    spans = np.array([[10, 50], [10, 50]], dtype=np.int32)
-    rows, cols, inters = compare_sorted_spans(spans)
-    lens = spans[:, 1] - spans[:, 0]
-    sim = inters[0] / (lens[rows[0]] + lens[cols[0]] - inters[0])
-    assert inters[0] == 40
-    assert sim == 1.0
-
-    # Abutting spans [10, 50] and [50, 90]
-    abutting = np.array([[10, 50], [50, 90]], dtype=np.int32)
-    rows_ab, cols_ab, inters_ab = compare_sorted_spans(abutting)
-    assert len(rows_ab) == 0  # No interior overlap
-
-    # Adjacent spans with gap [10, 50] and [51, 90]
-    adjacent = np.array([[10, 50], [51, 90]], dtype=np.int32)
-    merged_adj = domain_finder.merge_overlapping_spans(adjacent)
-    assert np.array_equal(merged_adj, adjacent)  # Gap is preserved
-
-    # Merging abutting spans [10, 50] and [50, 90]
-    merged_abutting = domain_finder.merge_overlapping_spans(abutting)
-    assert np.array_equal(merged_abutting, [[10, 90]])
+def test_normalize_attributes():
+    raw_attrs = {
+        "--aligner": "riboseek",
+        "gap-open": 11.0,
+        "-min-seq-id": 0.5,
+        "min.dom.sim": 0.25,
+    }
+    normalized = _normalize_attributes(raw_attrs)
+    assert normalized["aligner"] == "riboseek"
+    assert normalized["gap_open"] == 11.0
+    assert normalized["min_seq_id"] == 0.5
+    assert normalized["min_dom_sim"] == 0.25
 
 
-def test_determine_strand():
-    assert domain_finder.determine_strand(np.array([-1, -1, 1])) == "-"
-    assert domain_finder.determine_strand(np.array([1, 1, -1])) == "+"
-    assert domain_finder.determine_strand(np.array([1, -1])) == "+"
-    assert domain_finder.determine_strand(np.array([], dtype=np.int32)) == "+"
+def test_domain_instance():
+    target1 = Span(seq_id="seqB", start=10, end=50, strand=1)
+    target2 = Span(seq_id="seqC", start=20, end=70, strand=-1)
+    domain = DomainInstance(seq_id="seqA",
+                            start=5,
+                            summary_strand=1,
+                            end=100,
+                            targets=[target1, target2],
+                            source="riboseek")
+
+    assert domain.seq_id == "seqA"
+    assert domain.start == 5
+    assert domain.end == 100
+    assert domain.length == 96
+    assert domain.strand == 1
+    assert domain.coverage() == 2
+    assert domain.total_target_length() == (41 + 51)
+    gff_line = domain.to_gff(cluster_id="0")
+    assert "seqA\triboseek\tDomain\t5\t100\t.\t+\t.\tID=0" in gff_line
 
 
-def test_merge_overlapping_spans():
-    empty_spans = np.empty((0, 2), dtype=np.int32)
-    assert np.array_equal(domain_finder.merge_overlapping_spans(empty_spans), empty_spans)
+def test_domain_finder_workflow(tmp_path):
+    # Setup mock search hits
+    span1 = Span(seq_id="seq1", start=10, end=100, strand=1)
+    target1 = Span(seq_id="seq2", start=15, end=95, strand=1)
+    span1.partners = [target1]
 
-    # Disjoint spans
-    disjoint = np.array([[10, 50], [60, 100]], dtype=np.int32)
-    merged = domain_finder.merge_overlapping_spans(disjoint)
-    assert np.array_equal(merged, disjoint)
+    span2 = Span(seq_id="seq1", start=12, end=98, strand=1)
+    target2 = Span(seq_id="seq3", start=20, end=90, strand=1)
+    span2.partners = [target2]
 
-    # Overlapping spans
-    overlapping = np.array([[10, 50], [30, 80], [100, 150]], dtype=np.int32)
-    expected = np.array([[10, 80], [100, 150]], dtype=np.int32)
-    assert np.array_equal(domain_finder.merge_overlapping_spans(overlapping), expected)
+    search_hits = {"seq1": [span1, span2]}
 
-    # Embedded spans
-    embedded = np.array([[10, 100], [20, 50], [120, 150]], dtype=np.int32)
-    expected_emb = np.array([[10, 100], [120, 150]], dtype=np.int32)
-    assert np.array_equal(domain_finder.merge_overlapping_spans(embedded), expected_emb)
+    finder = DomainFinder(search=search_hits, source="mmseqs2")
+    finder.find_domain_instances(min_dom_sim=0.1,
+                                 halo_stringency=0.5,
+                                 min_dom_dens=0.0,
+                                 halo_method="knn")
+    assert finder.n_domains > 0
 
+    discarded, kept = finder.filter_spurious_domains(min_containment=0.5,
+                                                      reassign_targets=True)
+    assert kept > 0
 
-def test_domain_instances_on_query_basic():
-    # 2 query spans clustered together, 2 target hits
-    sorted_q_spans = np.array([[10, 50], [12, 52]], dtype=np.int32)
-    target_spans = np.array([[2, 100, 140, -1], [3, 200, 240, -1]], dtype=np.int32)
-    local_doms, all_targets = domain_finder.domain_instances_on_query(
-        query_id=1,
-        sorted_query_spans=sorted_q_spans,
-        target_spans=target_spans,
-        min_dom_sim=0.3,
-        min_containment=0.5,
-        reassign_targets=True,
-        halo_stringency=1.0,
-        min_dom_dens=0.0,
-        halo_method=None
-    )
+    finder.merge_targets()
+    finder.calculate_target_overlaps()
 
-    assert len(local_doms) == 1
-    q_id, start, end, strand = local_doms[0]
-    assert q_id == 1
-    assert strand == "-"  # majority -1
-    # Check that self-target is appended
-    assert all_targets.shape[0] == 3  # 2 original targets + 1 self target
-    assert (all_targets[:, 0] == 1).any()  # self target exists
+    families = list(finder.families(min_fam_sim=0.1,
+                                    min_fam_dens=0.0,
+                                    halo_stringency=0.5,
+                                    halo_method="knn"))
+    assert len(families) > 0
 
 
-def test_target_batch_processor():
-    # Test batch processing of target sequences
-    # Target sequence 1 has hits from dom 0 and dom 1 that overlap
-    seq1 = (1, np.array([[10, 50], [30, 70], [20, 60]], dtype=np.int32), np.array([0, 0, 1], dtype=np.int32))
-    rows, cols, inters, dom_lens = domain_finder.target_batch_processor([seq1])
-    assert len(rows) == 1
-    assert rows[0] == 0
-    assert cols[0] == 1
-    assert inters[0] == 40  # dom 0 merged to [10, 70], dom 1 is [20, 60], overlap is 40
-    assert dom_lens[0] == 60
-    assert dom_lens[1] == 40
-
-
-def test_family_finder_and_evaluate_clusters(tmp_path):
-    # End-to-end test with synthetic mini dataset
-    fasta_file = tmp_path / "test.fna"
-    fasta_file.write_text(">seq1\nACGT\n>seq2\nACGT\n>seq3\nACGT\n")
-
-    tsv_file = tmp_path / "test.tsv"
+def test_find_domains_with_tsv(tmp_path):
     tsv_content = (
-        "seq1\tseq2\t95.0\t50\t0\t0\t10\t60\t20\t70\t1e-10\t200.0\n"
-        "seq1\tseq3\t95.0\t50\t0\t0\t15\t65\t30\t80\t1e-10\t200.0\n"
-        "seq2\tseq3\t95.0\t50\t0\t0\t25\t75\t35\t85\t1e-10\t200.0\n"
+        "seq2\tseq1\t100.0\t100\t0\t0\t10\t100\t10\t100\t1e-10\t200\n"
+        "seq3\tseq1\t100.0\t100\t0\t0\t20\t90\t12\t98\t1e-10\t200\n"
     )
+    tsv_file = tmp_path / "mock_search.tsv"
     tsv_file.write_text(tsv_content)
 
-    out_gff = tmp_path / "out.gff"
-    attrs = {
+    fasta_file = tmp_path / "sequences.fna"
+    fasta_file.write_text(">seq1\nACGT\n>seq2\nACGT\n>seq3\nACGT\n")
+
+    output_gff = tmp_path / "output.gff"
+
+    attributes = {
         "aligner": "mmseqs2",
         "tsv": str(tsv_file),
-        "min_dom_sim": 0.2,
-        "dom_halo": 1.0,
+        "min_dom_sim": 0.1,
+        "dom_halo": 0.5,
         "min_dom_dens": 0.0,
         "min_fam_sim": 0.1,
-        "fam_halo": 1.0,
+        "fam_halo": 0.5,
         "min_fam_dens": 0.0,
-        "halo_method": None,
+        "halo_method": "knn",
         "reassign_targets": True,
         "min_containment": 0.5,
     }
 
-    res_path = domain_finder.find_domains(
-        fasta_path=fasta_file,
-        attributes=attrs,
-        output_gff=out_gff,
-        cpu=1
-    )
+    find_domains(fasta_path=fasta_file,
+                 attributes=attributes,
+                 output_gff=output_gff,
+                 tmp_dir=tmp_path / "tmp",
+                 result_dir=tmp_path / "results_tsvs")
 
-    assert res_path.exists()
-    lines = [line.strip() for line in out_gff.open() if not line.startswith("#") and line.strip()]
-    assert len(lines) > 0
-    # Verify GFF format
-    parts = lines[0].split("\t")
-    assert len(parts) == 9
-    assert parts[1] == "mmseqs2"
-    assert parts[2] == "Domain"
-    assert parts[6] in ("+", "-")
-    assert parts[8].startswith("ID=")
+    assert output_gff.exists()
+    assert output_gff.stat().st_size > 0
+    content = output_gff.read_text()
+    assert "seq1\tmmseqs2\tDomain\t" in content
+
+
+def test_non_contiguous_tsv_raises_error(tmp_path):
+    # Non-contiguous query block (seq1 appears, then seq2, then seq1 again)
+    tsv_content = (
+        "targetA\tseq1\t100.0\t100\t0\t0\t10\t100\t10\t100\t1e-10\t200\n"
+        "targetA\tseq2\t100.0\t100\t0\t0\t10\t100\t10\t100\t1e-10\t200\n"
+        "targetB\tseq1\t100.0\t100\t0\t0\t10\t100\t10\t100\t1e-10\t200\n"
+    )
+    tsv_file = tmp_path / "non_contiguous.tsv"
+    tsv_file.write_text(tsv_content)
+
+    fasta_file = tmp_path / "sequences.fna"
+    fasta_file.write_text(">seq1\nACGT\n>seq2\nACGT\n")
+
+    output_gff = tmp_path / "output.gff"
+
+    attributes = {
+        "aligner": "mmseqs2",
+        "tsv": str(tsv_file),
+    }
+
+    with pytest.raises(ValueError) as exc_info:
+        find_domains(fasta_path=fasta_file,
+                     attributes=attributes,
+                     output_gff=output_gff,
+                     tmp_dir=tmp_path / "tmp",
+                     result_dir=tmp_path / "results_tsvs")
+
+    assert "🛑" in str(exc_info.value)
+    assert "not grouped contiguously" in str(exc_info.value)
+
+
+def test_inverted_target_coordinates(tmp_path):
+    # Inverted target coordinates (t_start > t_end: 100 to 10)
+    tsv_content = (
+        "seq2\tseq1\t100.0\t91\t0\t0\t100\t10\t10\t100\t1e-10\t200\n"
+    )
+    tsv_file = tmp_path / "inverted_target.tsv"
+    tsv_file.write_text(tsv_content)
+
+    fasta_file = tmp_path / "sequences.fna"
+    fasta_file.write_text(">seq1\nACGT\n>seq2\nACGT\n")
+
+    output_gff = tmp_path / "output.gff"
+
+    attributes = {
+        "aligner": "mmseqs2",
+        "tsv": str(tsv_file),
+        "min_dom_sim": 0.1,
+        "dom_halo": 0.5,
+        "min_dom_dens": 0.0,
+        "min_fam_sim": 0.1,
+        "fam_halo": 0.5,
+        "min_fam_dens": 0.0,
+        "halo_method": "knn",
+        "reassign_targets": True,
+        "min_containment": 0.5,
+    }
+
+    find_domains(fasta_path=fasta_file,
+                 attributes=attributes,
+                 output_gff=output_gff,
+                 tmp_dir=tmp_path / "tmp",
+                 result_dir=tmp_path / "results_tsvs")
+
+    assert output_gff.exists()
+    assert output_gff.stat().st_size > 0
 # fmt: on
