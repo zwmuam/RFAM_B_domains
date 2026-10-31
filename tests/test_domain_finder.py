@@ -5,6 +5,38 @@ import numpy as np
 
 import domain_finder
 from aligners import SequenceRegistry
+from clustering import compare_sorted_spans, jaccard_index, max_containment
+
+
+def test_coordinate_system_consistency():
+    """
+    Validate coordinate system consistency:
+    - Identical intervals yield Jaccard = 1.0.
+    - Abutting intervals [10, 50] and [50, 90] have 0 intersection in compare_sorted_spans.
+    - Overlapping intervals have exact intersection min(e1, e2) - max(s1, s2).
+    - Interval merging correctly merges abutting and overlapping intervals while preserving gaps.
+    """
+    # Identical spans
+    spans = np.array([[10, 50], [10, 50]], dtype=np.int32)
+    rows, cols, inters = compare_sorted_spans(spans)
+    lens = spans[:, 1] - spans[:, 0]
+    sim = inters[0] / (lens[rows[0]] + lens[cols[0]] - inters[0])
+    assert inters[0] == 40
+    assert sim == 1.0
+
+    # Abutting spans [10, 50] and [50, 90]
+    abutting = np.array([[10, 50], [50, 90]], dtype=np.int32)
+    rows_ab, cols_ab, inters_ab = compare_sorted_spans(abutting)
+    assert len(rows_ab) == 0  # No interior overlap
+
+    # Adjacent spans with gap [10, 50] and [51, 90]
+    adjacent = np.array([[10, 50], [51, 90]], dtype=np.int32)
+    merged_adj = domain_finder.merge_overlapping_spans(adjacent)
+    assert np.array_equal(merged_adj, adjacent)  # Gap is preserved
+
+    # Merging abutting spans [10, 50] and [50, 90]
+    merged_abutting = domain_finder.merge_overlapping_spans(abutting)
+    assert np.array_equal(merged_abutting, [[10, 90]])
 
 
 def test_determine_strand():
