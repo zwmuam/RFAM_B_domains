@@ -156,37 +156,6 @@ An exhaustive audit of coordinate and span handling across `aligners.py`, `domai
 
 ### 4.3 Missing Safeguards & Potential Data Corruption Risks
 
-#### 1. Zero-Length Interval Risk & Division by Zero in Single-Nucleotide Hits
-- **Failure Mechanism:** In BLAST-TAB TSV files, an exact 1-nucleotide match is represented with identical start and end (e.g., `q_start=45, q_end=45`). When parsed without coordinate conversion, $L = \text{end} - \text{start} = 0$.
-- **Data Risk:** In `clustering.py`, calculating Jaccard similarity `intersections / (row_lengths + column_lengths - intersections)` or `max_containment` will cause a division by zero (`0.0 / 0.0 -> NaN`) if both spans are length 0, corrupting similarity matrices and causing DPC clustering crashes.
-- **Safeguard Required:**
-  1. Add an explicit validation check in `aligners.py` ensuring $q_{\text{start}} \le q_{\text{end}}$ and $t_{\text{start}} \le t_{\text{end}}$.
-  2. With $[s - 1, e)$ conversion, a 1-nt hit $[45, 45]$ becomes $[44, 45)$, which has valid length $45 - 44 = 1$, eliminating zero-length divisions.
-  3. Reject or filter hits where length $< 1$ with an explicit error (🛑).
-
-#### 2. Sequence Boundary Overflow Beyond FASTA Lengths
-- **Failure Mechanism:** If an alignment tool produces erroneous coordinates exceeding the actual sequence length defined in the input FASTA file (e.g. alignment coordinates $e > L_{\text{seq}}$), or negative coordinates ($s < 1$), downstream sequence slicing in `gff_sequence_extractor.py` or array allocation in `evaluation.py` will experience out-of-bounds indexing or silent truncation.
-- **Safeguard Required:**
-  - In `populate_registry_from_fasta`, record sequence lengths alongside sequence IDs.
-  - In `aligners.py`, assert that $0 \le s_0 < e_0 \le L_{\text{seq}}$ for every alignment record.
-
-#### 3. Integer Overflow and Bit-Shift Truncation in `family_finder`
-- **Failure Mechanism:** In `family_finder` (`domain_finder.py`), domain pair keys are encoded using 64-bit integer bit-shifting:
-  ```python
-  keys = (u_r << 32) | u_c
-  ```
-  And unpacked via:
-  ```python
-  final_r = (uniq_keys >> 32).astype(np.int32)
-  final_c = (uniq_keys & 0xFFFFFFFF).astype(np.int32)
-  ```
-- **Data Risk:**
-  - If the number of domain instances $N \ge 2^{31}$ (~2.14 billion), casting to `int32` overflows into negative indices.
-  - If an unsigned shift is performed on negative integers, keys collide.
-- **Safeguard Required:**
-  - Assert that $N < 2^{31} - 1$ at the beginning of `family_finder`.
-  - Alternatively, use structured array sorting with fields `('r', np.int64), ('c', np.int64)` when $N > 2^{31}$.
-
 #### 4. Silent Inversion and Strand Discrepancies
 - **Failure Mechanism:** BLAST-TAB reports strand by inverting coordinates ($s > e$ implies reverse complement). Current code in `aligners.py` uses:
   ```python
@@ -195,23 +164,7 @@ An exhaustive audit of coordinate and span handling across `aligners.py`, `domai
   t_start, t_end = min(t_start, t_end), max(t_start, t_end)
   ```
 - **Safeguard Assessment:**
-  - The XOR condition `(q_start > q_end) ^ (t_start > t_end)` correctly computes relative strand when one of the spans is reversed.
-  - However, if coordinates are converted upfront to 0-based half-open, normalization must occur **before** conversion:
-    ```python
-    t_strand = -1 if (raw_qs > raw_qe) ^ (raw_ts > raw_te) else 1
-    qs, qe = min(raw_qs, raw_qe) - 1, max(raw_qs, raw_qe)
-    ts, te = min(raw_ts, raw_te) - 1, max(raw_ts, raw_te)
-    ```
-    Doing `min - 1` and `max` preserves the exact half-open interval $[s - 1, e)$ corresponding to 1-based $[s, e]$.
-
-#### 5. Abutting Interval Inconsistency between Merging and Overlap Detection
-- **Failure Mechanism:**
-  - In `merge_overlapping_spans`, the break condition is `s[1:] > e_cum[:-1]`. If $s_2 = e_1$ (touching boundaries), $s_2 > e_1$ is `False`, so touching intervals are merged into a single interval.
-  - In `compare_sorted_spans`, overlap is computed as $\min(e_1, e_2) - s_2$. If $s_2 = e_1$, overlap is 0, and `valid = overlap > 0` evaluates to `False`, so touching intervals do not form an overlap edge.
-- **Safeguard Assessment:**
-  - In 0-based half-open intervals $[0, 10)$ and $[10, 20)$, position 10 belongs strictly to the second interval. They are adjacent without sharing any nucleotide.
-  - For target interval consolidation (where same-domain hits on a sequence are merged to determine total domain coverage), merging touching intervals is biologically desired because they represent contiguous covered sequence.
-  - For domain similarity graph construction (`compare_sorted_spans`), strictly positive intersection ($> 0$) is mathematically required because 0 shared nucleotides implies 0 Jaccard similarity.
+  - If coordinates are converted upfront to 0-based half-open, normalization must occur **before** conversion:
 
 ---
 
@@ -228,14 +181,10 @@ An exhaustive audit of coordinate and span handling across `aligners.py`, `domai
    - When formatting GFF3 rows:
      $$\text{gff\_start} = s_0 + 1, \quad \text{gff\_end} = e_0$$
    - Emits canonical 1-based closed intervals directly compliant with GFF3 specifications and `evaluation.py`.
-4. **`evaluation.py` (Downstream Ingestion):**
-   - Existing parser does: `start, end = int(start) - 1, int(end)`. This aligns with the GFF3 1-based closed standard, seamlessly mapping GFF3 coordinates back to internal 0-based array indexing.
 
 ---
 
-## 5. Unified Update Implementation Plan: Step-by-Step Instructions for Future Jules Runs
-
-This implementation instruction unifies all audit findings, coordinate transformations, memory safeguards, and performance optimizations into an executable, zero-regression roadmap designed specifically for execution by an automated Jules agent.
+## 5. Unified Update Implementation Plan
 
 ---
 
@@ -390,7 +339,7 @@ Replace heavy graph connected components (`coo_matrix` + `csgraph.connected_comp
 ### Phase 5: GFF3 Export Coordinate Conversion & Formatting (`domain_finder.py`)
 
 #### Objective
-Ensure emitted GFF3 files strictly follow the canonical 1-based fully-closed genomic coordinate convention $[s_1, e_1] = [s_0 + 1, e_0]$, ensuring seamless compatibility with standard bioinformatics tooling and `evaluation.py`.
+Ensure emitted GFF3 files strictly follow the canonical 1-based fully-closed genomic coordinate convention $[s_1, e_1] = [s_0 + 1, e_0]$, ensuring seamless compatibility with standard bioinformatics tooling and `evaluation.py`. Other than that final results should be unchanged or explicitly corrected.  
 
 #### Detailed Implementation Instructions
 1. **1-Based Closed GFF3 Emission:**
@@ -400,12 +349,6 @@ Ensure emitted GFF3 files strictly follow the canonical 1-based fully-closed gen
      gff_end = end
      gff_line = f"{seq_name}\t{aligner_name}\tDomain\t{gff_start}\t{gff_end}\t.\t{strand}\t.\tID={fam_id}\n"
      gff_writer.write(gff_line)
-     ```
-2. **Safeguards Against 64-Bit Bit-Shift Collisions (`family_finder` in `domain_finder.py`):**
-   - Ensure the domain instance count $N_{\text{domains}} < 2^{31} - 1$ before constructing composite bit-keys:
-     ```python
-     if n_domains >= 2**31 - 1:
-         raise ValueError(f"🛑 Domain count ({n_domains}) exceeds 32-bit key packing capacity.")
      ```
 
 ---
@@ -432,5 +375,4 @@ Ensure emitted GFF3 files strictly follow the canonical 1-based fully-closed gen
 - Confirm master process RAM remains $< 200$ GB on multi-gigabyte TSV alignment runs.
 
 #### 4. Pre-Commit Verification
-- Always execute `pre_commit_instructions` and follow all steps before submitting any future change.
-- Verify that Unix LF line endings are preserved and PEP 8 formatting template rules (`# fmt: off` / `# fmt: on`, max line length $\le 99$) are strictly respected.
+- Re-evaluate scientific and mathematical validity of all steps after update and add any problems, inconsistencies or doubts at the end of PROBLEMS.md together with full update report.
