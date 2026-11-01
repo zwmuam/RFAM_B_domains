@@ -77,11 +77,14 @@ def test_parse_mmseqs_tsv_sorting_and_shapes(tmp_path):
     assert t1_spans.shape == (3, 4)
 
     # Deterministic sorting check: primary start, tiebreaker end
-    # For seq1, hits had spans: (50, 100), (10, 80), (10, 50)
-    # Sorted order should be: (10, 50) -> (10, 80) -> (50, 100)
-    assert np.array_equal(q1_spans[0], [10, 50])
-    assert np.array_equal(q1_spans[1], [10, 80])
-    assert np.array_equal(q1_spans[2], [50, 100])
+    # Converted from 1-based [s, e] to 0-based half-open [s-1, e):
+    # (50, 100) -> [49, 100)
+    # (10, 80)  -> [9, 80)
+    # (10, 50)  -> [9, 50)
+    # Sorted order should be: [9, 50) -> [9, 80) -> [49, 100)
+    assert np.array_equal(q1_spans[0], [9, 50])
+    assert np.array_equal(q1_spans[1], [9, 80])
+    assert np.array_equal(q1_spans[2], [49, 100])
 
     # Check that target_spans maintained identical row alignment
     assert t1_spans[0, 0] == reg.get_id("seq4")
