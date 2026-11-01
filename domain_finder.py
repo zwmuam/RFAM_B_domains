@@ -26,7 +26,7 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 
 # standard libraries
 import numpy as np
-from scipy.sparse import coo_matrix, csgraph
+from scipy.sparse import coo_matrix
 from tqdm import tqdm
 
 # internal repository/package imports
@@ -95,35 +95,60 @@ def _process_query_batch(batch_items: Any,
     return batch_results, batch_halo_alns
 
 
-def _process_overlap_batch(batch_targets: Any,
+def _process_overlap_batch(batch_chunks: Any,
                            n_domains: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Worker function to process target sequence batches and return deduplicated sparse COO triplets.
+    Worker function to process target sequence batches (structured NumPy arrays or legacy tuples)
+    and return deduplicated sparse COO triplets.
     """
-    if isinstance(batch_targets, tuple) and len(batch_targets) == 2 and not isinstance(batch_targets[0], (tuple, list)):
-        batch_targets = [batch_targets]
+    if isinstance(batch_chunks, np.ndarray):
+        batch_chunks = [batch_chunks]
+    elif isinstance(batch_chunks, tuple) and len(batch_chunks) == 2 and not isinstance(batch_chunks[0], (tuple, list, np.ndarray)):
+        batch_chunks = [batch_chunks]
 
     batch_rows, batch_cols, batch_data = [], [], []
-    for seq_id, targets in batch_targets:
-        n_targets = len(targets)
-        if n_targets > 1:
-            sorted_targets = sorted(targets, key=lambda s: s.start)
-            local_rows, local_cols, intersections = compare_sorted_spans(sorted_targets)
-            if local_rows.size > 0:
-                domain_ids = np.array([t.domain for t in sorted_targets], dtype=np.int32)
-                global_rows = domain_ids[local_rows]
-                global_cols = domain_ids[local_cols]
-                mask = global_rows != global_cols
-                if np.any(mask):
-                    g_r = np.minimum(global_rows[mask], global_cols[mask])
-                    g_c = np.maximum(global_rows[mask], global_cols[mask])
-                    coo = coo_matrix((intersections[mask], (g_r, g_c)), shape=(n_domains, n_domains))
-                    csr = coo.tocsr()
-                    csr.sum_duplicates()
-                    coo_dedup = csr.tocoo()
-                    batch_rows.append(coo_dedup.row)
-                    batch_cols.append(coo_dedup.col)
-                    batch_data.append(coo_dedup.data)
+    for item in batch_chunks:
+        if isinstance(item, np.ndarray):
+            n_targets = len(item)
+            if n_targets > 1:
+                coords = np.column_stack((item["start"], item["end"]))
+                local_rows, local_cols, intersections = compare_sorted_spans(coords)
+                if local_rows.size > 0:
+                    domain_ids = item["dom_id"]
+                    global_rows = domain_ids[local_rows]
+                    global_cols = domain_ids[local_cols]
+                    mask = global_rows != global_cols
+                    if np.any(mask):
+                        g_r = np.minimum(global_rows[mask], global_cols[mask])
+                        g_c = np.maximum(global_rows[mask], global_cols[mask])
+                        coo = coo_matrix((intersections[mask], (g_r, g_c)), shape=(n_domains, n_domains))
+                        csr = coo.tocsr()
+                        csr.sum_duplicates()
+                        coo_dedup = csr.tocoo()
+                        batch_rows.append(coo_dedup.row)
+                        batch_cols.append(coo_dedup.col)
+                        batch_data.append(coo_dedup.data)
+        else:
+            seq_id, targets = item
+            n_targets = len(targets)
+            if n_targets > 1:
+                sorted_targets = sorted(targets, key=lambda s: s.start)
+                local_rows, local_cols, intersections = compare_sorted_spans(sorted_targets)
+                if local_rows.size > 0:
+                    domain_ids = np.array([t.domain for t in sorted_targets], dtype=np.int32)
+                    global_rows = domain_ids[local_rows]
+                    global_cols = domain_ids[local_cols]
+                    mask = global_rows != global_cols
+                    if np.any(mask):
+                        g_r = np.minimum(global_rows[mask], global_cols[mask])
+                        g_c = np.maximum(global_rows[mask], global_cols[mask])
+                        coo = coo_matrix((intersections[mask], (g_r, g_c)), shape=(n_domains, n_domains))
+                        csr = coo.tocsr()
+                        csr.sum_duplicates()
+                        coo_dedup = csr.tocoo()
+                        batch_rows.append(coo_dedup.row)
+                        batch_cols.append(coo_dedup.col)
+                        batch_data.append(coo_dedup.data)
 
     if not batch_rows:
         return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
@@ -251,6 +276,7 @@ class DomainFinder:
         self.domain_index: Dict[int, DomainInstance] = {}
         self.domain_total_lengths: Dict[int, int] = {}
         self.targets_per_seq: Dict[Any, List[Span]] = {}
+        self._target_chunks: List[np.ndarray] = []
         self._overlap_rows: List[np.ndarray] = []
         self._overlap_cols: List[np.ndarray] = []
         self._overlap_data: List[np.ndarray] = []
@@ -409,6 +435,7 @@ class DomainFinder:
     def merge_targets(self) -> None:
         """
         Merge overlapping target spans for each domain to prepare for overlap matrix generation.
+        Employs 1D interval merging and contiguous structured array partitioning.
 
         :return: None
         """
@@ -416,59 +443,85 @@ class DomainFinder:
         n_merged = 0
         n_distinct = 0
         n_singletons = 0
+
+        target_dtype = np.dtype([
+            ("t_seq", np.int64),
+            ("start", np.int64),
+            ("end", np.int64),
+            ("dom_id", np.int32)
+        ])
+
+        if self.registry is None:
+            self.registry = SequenceRegistry()
+
+        target_records: List[Tuple[int, int, int, int]] = []
         with tqdm(total=len(self.domain_index),
                   desc="Merging overlapping targets") as pbar:
             for d_id, domain in self.domain_index.items():
                 self.domain_total_lengths[d_id] = 0
-                domain_targets_by_seq = defaultdict(list)
+                domain_targets_by_seq: Dict[int, List[Tuple[int, int]]] = {}
                 for target in domain.partners:
-                    domain_targets_by_seq[target.seq_id].append(target)
+                    s_id = self.registry.get_id(target.seq_id)
+                    if s_id not in domain_targets_by_seq:
+                        domain_targets_by_seq[s_id] = []
+                    domain_targets_by_seq[s_id].append((target.start, target.end))
 
                 for t_seq_id, targets in domain_targets_by_seq.items():
+                    # For compatibility, maintain targets_per_seq container
                     if t_seq_id not in self.targets_per_seq:
                         self.targets_per_seq[t_seq_id] = []
+
                     n_targets = len(targets)
-                    if n_targets > 1:
-                        sorted_group = sorted(targets, key=lambda s: s.start)
-                        rows, cols, intersections = compare_sorted_spans(sorted_group)
-                        similarity_matrix = coo_matrix(
-                            (intersections, (rows, cols)),
-                            shape=(n_targets, n_targets)
-                        ).tocsr()
-                        components, labels = csgraph.connected_components(
-                            similarity_matrix,
-                            directed=False,
-                            return_labels=True
-                        )
-                        for component_id in range(components):
-                            component_index = {
-                                i: s for i, s in enumerate(sorted_group)
-                                if labels[i] == component_id
-                            }
-                            if len(component_index) == 1:
-                                distinct_target, = component_index.values()
-                                distinct_target.domain = d_id
-                                self.targets_per_seq[t_seq_id].append(distinct_target)
-                                self.domain_total_lengths[d_id] += distinct_target.length
-                                n_distinct += 1
-                            else:
-                                merged_start = min(s.start for s in component_index.values())
-                                merged_end = max(s.end for s in component_index.values())
-                                merged_target = Span(seq_id=t_seq_id,
-                                                     start=merged_start,
-                                                     end=merged_end,
-                                                     strand=0)
-                                merged_target.domain = d_id
-                                self.targets_per_seq[t_seq_id].append(merged_target)
-                                self.domain_total_lengths[d_id] += merged_target.length
-                                n_merged += len(component_index) - 1
-                    else:
-                        singleton_target, = targets
-                        singleton_target.domain = d_id
-                        self.targets_per_seq[t_seq_id].append(singleton_target)
-                        self.domain_total_lengths[d_id] += singleton_target.length
+                    if n_targets == 1:
+                        s, e = targets[0]
+                        target_records.append((t_seq_id, s, e, d_id))
+                        self.domain_total_lengths[d_id] += e - s + 1
                         n_singletons += 1
+                        span_item = Span(seq_id=t_seq_id, start=s, end=e, strand=0)
+                        span_item.domain = d_id
+                        self.targets_per_seq[t_seq_id].append(span_item)
+                    else:
+                        sorted_group = sorted(targets, key=lambda x: (x[0], x[1]))
+                        cur_start, cur_end = sorted_group[0]
+                        group_count = 1
+                        for s, e in sorted_group[1:]:
+                            if s < cur_end:
+                                if e > cur_end:
+                                    cur_end = e
+                                group_count += 1
+                            else:
+                                target_records.append((t_seq_id, cur_start, cur_end, d_id))
+                                self.domain_total_lengths[d_id] += cur_end - cur_start + 1
+                                span_item = Span(seq_id=t_seq_id, start=cur_start, end=cur_end, strand=0)
+                                span_item.domain = d_id
+                                self.targets_per_seq[t_seq_id].append(span_item)
+                                if group_count == 1:
+                                    n_distinct += 1
+                                else:
+                                    n_merged += group_count - 1
+                                cur_start, cur_end = s, e
+                                group_count = 1
+
+                        target_records.append((t_seq_id, cur_start, cur_end, d_id))
+                        self.domain_total_lengths[d_id] += cur_end - cur_start + 1
+                        span_item = Span(seq_id=t_seq_id, start=cur_start, end=cur_end, strand=0)
+                        span_item.domain = d_id
+                        self.targets_per_seq[t_seq_id].append(span_item)
+                        if group_count == 1:
+                            n_distinct += 1
+                        else:
+                            n_merged += group_count - 1
+
                 pbar.update(1)
+
+        if target_records:
+            target_array = np.array(target_records, dtype=target_dtype)
+            order = np.lexsort((target_array["end"], target_array["start"], target_array["t_seq"]))
+            sorted_targets = target_array[order]
+            boundaries = np.flatnonzero(np.diff(sorted_targets["t_seq"])) + 1
+            self._target_chunks = np.split(sorted_targets, boundaries)
+        else:
+            self._target_chunks = []
 
         logger.info(f"Merged: {n_merged}; Distinct: {n_distinct}; "
                     f"Singletons: {n_singletons}")
@@ -480,15 +533,21 @@ class DomainFinder:
         :return: None
         """
         n_domains = len(self.domain_index)
-        if n_domains == 0 or not self.targets_per_seq:
+        if n_domains == 0:
             return
 
-        target_items = list(self.targets_per_seq.items())
-        total_targets = len(target_items)
-        batch_size = max(100, min(2000, total_targets // (default_threads * 4) if default_threads > 0 else 100))
+        chunks_to_process = self._target_chunks
+        if not chunks_to_process and self.targets_per_seq:
+            chunks_to_process = list(self.targets_per_seq.items())
+
+        total_chunks = len(chunks_to_process)
+        if total_chunks == 0:
+            return
+
+        batch_size = max(100, min(2000, total_chunks // (default_threads * 4) if default_threads > 0 else 100))
         target_batches = [
-            target_items[i:i + batch_size]
-            for i in range(0, total_targets, batch_size)
+            chunks_to_process[i:i + batch_size]
+            for i in range(0, total_chunks, batch_size)
         ]
 
         kwargs = {"n_domains": n_domains}
@@ -579,41 +638,60 @@ class DomainFinder:
 
                 component_domains = []
                 for seq_id, domains in cluster_domains_per_seq.items():
-                    sorted_domains = sorted(domains, key=lambda d: d.start)
-                    c_rows, c_cols, c_intersections = compare_sorted_spans(sorted_domains)
-                    if c_rows.size == 0:
-                        component_domains.extend(sorted_domains)
-                    else:
-                        similarity_matrix = coo_matrix(
-                            (c_intersections, (c_rows, c_cols)),
-                            shape=(len(sorted_domains), len(sorted_domains))
-                        ).tocsr()
-                        components, labels = csgraph.connected_components(
-                            similarity_matrix,
-                            directed=False,
-                            return_labels=True
-                        )
-                        for component_id in range(components):
-                            component_index = {
-                                i: s for i, s in enumerate(sorted_domains)
-                                if labels[i] == component_id
-                            }
-                            if len(component_index) == 1:
-                                distinct_domain, = component_index.values()
-                                component_domains.append(distinct_domain)
+                    if len(domains) == 1:
+                        component_domains.append(domains[0])
+                        continue
+
+                    sorted_domains = sorted(domains, key=lambda d: (d.start, d.end))
+                    current_group = [sorted_domains[0]]
+                    current_max_end = sorted_domains[0].end
+
+                    for d in sorted_domains[1:]:
+                        # Continuous coordinate overlap condition: start < current_max_end
+                        if d.start < current_max_end:
+                            current_group.append(d)
+                            if d.end > current_max_end:
+                                current_max_end = d.end
+                        else:
+                            if len(current_group) == 1:
+                                component_domains.append(current_group[0])
                             else:
-                                merged_start = min(s.start for s in component_index.values())
-                                merged_end = max(s.end for s in component_index.values())
+                                merged_start = min(dom.start for dom in current_group)
+                                merged_end = max(dom.end for dom in current_group)
+                                merged_strand_sum = sum(dom.strand for dom in current_group)
+                                merged_targets = []
+                                for dom in current_group:
+                                    merged_targets.extend(dom.partners)
                                 merged_domain = DomainInstance(
                                     seq_id=seq_id,
                                     start=merged_start,
-                                    summary_strand=0,
+                                    summary_strand=merged_strand_sum,
                                     end=merged_end,
-                                    targets=[self.domain_index[int(i)]
-                                             for i in component_index],
+                                    targets=merged_targets,
                                     source=self.source
                                 )
                                 component_domains.append(merged_domain)
+                            current_group = [d]
+                            current_max_end = d.end
+
+                    if len(current_group) == 1:
+                        component_domains.append(current_group[0])
+                    else:
+                        merged_start = min(dom.start for dom in current_group)
+                        merged_end = max(dom.end for dom in current_group)
+                        merged_strand_sum = sum(dom.strand for dom in current_group)
+                        merged_targets = []
+                        for dom in current_group:
+                            merged_targets.extend(dom.partners)
+                        merged_domain = DomainInstance(
+                            seq_id=seq_id,
+                            start=merged_start,
+                            summary_strand=merged_strand_sum,
+                            end=merged_end,
+                            targets=merged_targets,
+                            source=self.source
+                        )
+                        component_domains.append(merged_domain)
                 pbar.update(1)
                 yield f"{peak_id}", component_domains
 
