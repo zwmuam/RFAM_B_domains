@@ -79,7 +79,7 @@ class Parallel:
     """
 
     def __init__(self,
-                 parallelized_function: Callable,
+                 parallelized_function: Optional[Callable] = None,
                  input_collection: Optional[Collection] = None,
                  random_replicates: Optional[int] = None,
                  kwargs: Optional[Dict[str, Any]] = None,
@@ -90,6 +90,7 @@ class Parallel:
                  chunk_size: Any = 'auto',
                  shared_objects: Any = None,
                  keep_order: bool = True,
+                 function: Optional[Callable] = None,
                  **extra_kwargs: Any) -> None:
         """
         Initialise Parallel instance and execute worker pool mapping.
@@ -107,12 +108,16 @@ class Parallel:
         :param keep_order: Boolean flag specifying whether to preserve input item ordering.
         :return: None
         """
+        target_fn = parallelized_function if parallelized_function is not None else function
+        if target_fn is None:
+            raise ValueError("Parallel requires a target function (parallelized_function or function).")
+
         assert bool(random_replicates) ^ bool(input_collection is not None), \
             'You need to specify EITHER an input collection OR number of random replicates'
 
         n_jobs = get_default_cpu_threads(n_jobs)
         kwargs = {} if not kwargs else kwargs
-        description = description if description else parallelized_function.__name__
+        description = description if description else getattr(target_fn, "__name__", "Parallel")
 
         if random_replicates:
             ss = np.random.SeedSequence()
@@ -126,7 +131,7 @@ class Parallel:
             total_items = len(input_list)
             if chunk_size == 'auto':
                 if total_items > 0 and n_jobs > 0:
-                    chunk_size = max(1, total_items // (n_jobs * 4))
+                    chunk_size = max(1, min(200, total_items // (n_jobs * 4)))
                 else:
                     chunk_size = 1
         else:
@@ -137,7 +142,7 @@ class Parallel:
 
         def _worker_wrapper(*args: Any) -> Any:
             item = args[0] if len(args) == 1 else args
-            return parallelized_function(item, **kwargs)
+            return target_fn(item, **kwargs)
 
         extra_kwargs.pop('total', None)
         extra_kwargs.pop('iterable_len', None)
@@ -157,6 +162,7 @@ class Parallel:
             self.result: List[Any] = map_func(_worker_wrapper,
                                               input_list,
                                               **map_kwargs)
+        self.results = self.result
 
 
 def run_external(command: Union[Sequence[Any], Sequence[Sequence[Any]]],

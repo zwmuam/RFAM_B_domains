@@ -25,7 +25,6 @@ from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 # standard libraries
 import numpy as np
-from scipy.sparse import coo_matrix, csgraph
 from tqdm import tqdm
 
 # internal repository/package imports
@@ -35,7 +34,8 @@ from aligners import (SequenceRegistry, count_fasta,
 from clustering import (compare_sorted_spans,
                         jaccard_index, max_containment,
                         dpc)
-from tweaks import Parallel, default_threads, logger
+from executor import Parallel
+from tweaks import default_threads, logger
 
 
 def count_fasta_queries(fasta_path: Path) -> int:
@@ -470,33 +470,25 @@ def evaluate_clusters(peak_to_cluster: Dict[int, np.ndarray],
             component_domains: List[Tuple[int, int, int, str]] = []
             for seq_id, domains in cluster_domains_per_seq.items():
                 if len(domains) == 1:
-                    component_domains.extend(domains)
+                    component_domains.append(domains[0])
                     continue
 
                 sorted_domains = sorted(domains, key=lambda d: d[1])
-                spans_arr = np.array([[d[1], d[2]] for d in sorted_domains], dtype=np.int32)
-                rows, cols, intersections = compare_sorted_spans(spans_arr)
-                if rows.size == 0:
-                    component_domains.extend(sorted_domains)
-                else:
-                    similarity_matrix = coo_matrix(
-                        (intersections, (rows, cols)),
-                        shape=(len(sorted_domains), len(sorted_domains))
-                    ).tocsr()
-                    components, labels = csgraph.connected_components(
-                        similarity_matrix, directed=False, return_labels=True
-                    )
-                    for component_id in range(components):
-                        comp = [sorted_domains[i] for i in range(len(sorted_domains))
-                                if labels[i] == component_id]
-                        if len(comp) == 1:
-                            component_domains.append(comp[0])
-                        else:
-                            merged_start = min(s[1] for s in comp)
-                            merged_end = max(s[2] for s in comp)
-                            strands = [s[3] for s in comp]
-                            merged_strand = "-" if strands.count("-") > strands.count("+") else "+"
-                            component_domains.append((seq_id, merged_start, merged_end, merged_strand))
+                spans_arr = np.array([[d[1], d[2]] for d in sorted_domains], dtype=np.int64)
+                merged_spans = merge_overlapping_spans(spans_arr)
+
+                for m_start, m_end in merged_spans:
+                    overlapping_strands = [
+                        d[3] for d in sorted_domains
+                        if max(d[1], m_start) < min(d[2], m_end)
+                    ]
+                    if not overlapping_strands:
+                        consensus_strand = "+"
+                    else:
+                        neg = overlapping_strands.count("-")
+                        pos = overlapping_strands.count("+")
+                        consensus_strand = "-" if neg > pos else "+"
+                    component_domains.append((seq_id, int(m_start), int(m_end), consensus_strand))
 
             pbar.update(1)
             yield str(peak_id), component_domains
@@ -571,8 +563,15 @@ def find_domains(fasta_path: Path,
                              description="Finding domain instances",
                              chunk_size=1)
 
+    target_dtype = np.dtype([
+        ('t_seq', np.int64),
+        ('start', np.int64),
+        ('end', np.int64),
+        ('dom_id', np.int32)
+    ])
+
     global_domains: List[Tuple[int, int, int, str]] = []
-    targets_by_seq: Dict[int, List[np.ndarray]] = defaultdict(list)
+    target_chunks: List[np.ndarray] = []
     global_offset = 0
 
     for batch_res in query_workers.results:
@@ -582,27 +581,36 @@ def find_domains(fasta_path: Path,
                 continue
             global_domains.extend(local_domains)
             if all_targets.size > 0:
-                offset_targets = all_targets.copy()
-                offset_targets[:, 3] += global_offset
-                order = np.argsort(offset_targets[:, 0])
-                sorted_t = offset_targets[order]
-                seq_breaks = np.flatnonzero(np.diff(sorted_t[:, 0])) + 1
-                seq_groups = np.split(sorted_t, seq_breaks)
-                for grp in seq_groups:
-                    t_seq = int(grp[0, 0])
-                    targets_by_seq[t_seq].append(grp[:, 1:4])
+                chunk = np.empty(all_targets.shape[0], dtype=target_dtype)
+                chunk['t_seq'] = all_targets[:, 0]
+                chunk['start'] = all_targets[:, 1]
+                chunk['end'] = all_targets[:, 2]
+                chunk['dom_id'] = all_targets[:, 3] + global_offset
+                target_chunks.append(chunk)
             global_offset += n_doms
 
     n_total_domains = len(global_domains)
-    logger.info(f"Found {n_total_domains} domain instances across {len(targets_by_seq)} target sequences")
+
+    if target_chunks:
+        all_targets_arr = np.concatenate(target_chunks)
+        del target_chunks
+        all_targets_arr.sort(order=['t_seq', 'start'])
+        seq_breaks = np.flatnonzero(np.diff(all_targets_arr['t_seq'])) + 1
+        target_seq_groups = np.split(all_targets_arr, seq_breaks)
+        n_target_seqs = len(target_seq_groups)
+    else:
+        target_seq_groups = []
+        n_target_seqs = 0
+
+    logger.info(f"Found {n_total_domains} domain instances across {n_target_seqs} target sequences")
 
     # 3. Stage 4: Parallel target sequence overlap calculation
     def target_batch_generator() -> Generator[List[Tuple[int, np.ndarray, np.ndarray]], None, None]:
         batch_pkg: List[Tuple[int, np.ndarray, np.ndarray]] = []
-        for t_seq, chunks in targets_by_seq.items():
-            combined = np.vstack(chunks)
-            spans = combined[:, 0:2]
-            dom_ptrs = combined[:, 2]
+        for grp in target_seq_groups:
+            t_seq = int(grp['t_seq'][0])
+            spans = np.column_stack((grp['start'], grp['end']))
+            dom_ptrs = grp['dom_id']
             batch_pkg.append((t_seq, spans, dom_ptrs))
             if len(batch_pkg) >= 1000:
                 yield batch_pkg
@@ -656,7 +664,9 @@ def find_domains(fasta_path: Path,
                                                      domain_registry=global_domains):
             for seq_int, start, end, strand in fam_domains:
                 seq_name = sequence_registry.get_str(seq_int)
-                gff_line = f"{seq_name}\t{aligner_name}\tDomain\t{start}\t{end}\t.\t{strand}\t.\tID={fam_id}\n"
+                gff_start = start + 1
+                gff_end = end
+                gff_line = f"{seq_name}\t{aligner_name}\tDomain\t{gff_start}\t{gff_end}\t.\t{strand}\t.\tID={fam_id}\n"
                 gff_writer.write(gff_line)
 
     logger.info(f"Successfully finished domain finding. Output written to {output_gff}")

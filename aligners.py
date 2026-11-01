@@ -153,13 +153,21 @@ def parse_mmseqs_tsv(tsv_file: Path,
             if q_seq_str == t_seq_str:
                 continue
 
-            q_start, q_end = int(fields[6]), int(fields[7])
-            t_start, t_end = int(fields[8]), int(fields[9])
+            raw_qs, raw_qe = int(fields[6]), int(fields[7])
+            raw_ts, raw_te = int(fields[8]), int(fields[9])
 
-            # Determine relative alignment strand and normalize range endpoints
-            t_strand = -1 if (q_start > q_end) ^ (t_start > t_end) else 1
-            q_start, q_end = min(q_start, q_end), max(q_start, q_end)
-            t_start, t_end = min(t_start, t_end), max(t_start, t_end)
+            # Determine relative alignment strand and convert 1-based closed to 0-based half-open
+            t_strand = -1 if (raw_qs > raw_qe) ^ (raw_ts > raw_te) else 1
+            q_start = min(raw_qs, raw_qe) - 1
+            q_end = max(raw_qs, raw_qe)
+            t_start = min(raw_ts, raw_te) - 1
+            t_end = max(raw_ts, raw_te)
+
+            if q_start < 0 or q_end <= q_start or t_start < 0 or t_end <= t_start:
+                raise ValueError(
+                    f"🛑 Invalid alignment hit coordinates: q=[{q_start}, {q_end}), "
+                    f"t=[{t_start}, {t_end}) in line: {line}"
+                )
 
             q_seq_int = registry.get_id(q_seq_str)
             t_seq_int = registry.get_id(t_seq_str)
