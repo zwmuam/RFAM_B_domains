@@ -4,44 +4,13 @@ Pipeline Re-Evaluation: Critical Inconsistencies, Mathematical & Biological Risk
 
 A comprehensive, end-to-end re-evaluation of the current codebase (`aligners.py`, `domain_finder.py`, `clustering.py`, `executor.py`, and `evaluation.py`) was conducted against real biological use cases, mathematical foundations of Density Peak Clustering, and high-throughput memory/concurrency models.
 
-While the upfront 0-based half-open conversion $[s - 1, e)$ and linear interval scanning have resolved basic off-by-one errors and graph connected component bloat, critical scientific inconsistencies, biological assumption misalignments, data corruption vulnerabilities, and concurrency bottlenecks remain in the active codebase.
 
----
 
-### 7.1 Coordinate Systems & Mathematical Span Handling: End-to-End Audit
-
-#### A. Consistency Across Pipeline Stages
-The coordinate convention flows across pipeline stages as follows:
-1. **Raw MMseqs2 / RiboSeek BLAST-TAB:** Ingests 1-based fully-closed intervals $[s_1, e_1]$.
-2. **Upfront Ingestion (`aligners.py`):** Converted to 0-based half-open $[s_0, e_0) = [\min(s, e) - 1, \max(s, e))$.
-3. **Internal Processing (`domain_finder.py`, `clustering.py`):**
-   - Interval length: $L = e_0 - s_0$.
-   - Overlap: $I = \min(e_{0, 1}, e_{0, 2}) - \max(s_{0, 1}, s_{0, 2})$.
-   - Boundary condition for abutting intervals: $[0, 10)$ and $[10, 20)$ yield $I = 0$. Because `compare_sorted_spans` filters with `overlap > 0`, abutting spans correctly produce zero pairwise intersection.
-   - Interval merging in `merge_overlapping_spans`: `brk = np.flatnonzero(s[1:] > e_cum[:-1])`. When $s[1] == e_{\text{cum}}[0]$ (e.g. $[0, 10)$ and $[10, 20)$), $10 > 10$ is False, correctly merging abutting contiguous blocks into $[0, 20)$.
-4. **GFF3 Export (`find_domains` in `domain_finder.py`):** Emits $\text{gff\_start} = s_0 + 1$ and $\text{gff\_end} = e_0$, restoring standard 1-based closed intervals $[s_1, e_1]$.
-5. **Ground Truth & Prediction Ingestion (`read_gff` in `evaluation.py`):** Reads $\text{start} = \text{int}(s_1) - 1$ and $\text{end} = \text{int}(e_1)$, correctly operating on 0-based half-open coordinates.
-
-#### B. Coordinate Vulnerabilities & Risks
-1. **Single-Nucleotide Hits vs Zero-Length Coordinate Rejection in `aligners.py`:**
-   - In `aligners.py`:
-     ```python
-     q_start = min(raw_qs, raw_qe) - 1
-     q_end = max(raw_qs, raw_qe)
-     t_start = min(raw_ts, raw_te) - 1
-     t_end = max(raw_ts, raw_te)
-     if q_start < 0 or q_end <= q_start or t_start < 0 or t_end <= t_start:
-         raise ValueError(f"🛑 Invalid alignment hit coordinates: q=[{q_start}, {q_end}), t=[{t_start}, {t_end}) in line: {line}")
-     ```
-   - *Risk Analysis:* If a valid 1-based alignment reported $s_1 = 5, e_1 = 5$ (a 1-nt hit), then $s_0 = 4, e_0 = 5$, and $e_0 - s_0 = 1 > 0$, which passes. However, if an upstream aligner emitted zero-based or inverted boundary coordinates (e.g., $s_1 = 0, e_1 = 0$), $q\_start = -1$, triggering the error. While this safeguard prevents zero-length and negative-length spans, it does not verify against actual sequence bounds from the FASTA file, risking out-of-bounds slicing downstream.
+### Coordinate Vulnerabilities & Risks
 2. **Integer Truncation & Type Inconsistency Across Modules:**
    - In `domain_finder.py`, structured arrays use `np.int64` for `t_seq`, `start`, and `end`, but `np.int32` for `dom_id`.
    - In `target_batch_processor`: `merged_spans = np.array(merged_spans_list, dtype=np.int32)`. For chromosome-scale sequences (>2.14 billion bases), casting coordinates down to `np.int32` will trigger silent signed integer overflow and negative genomic coordinates.
    - *Recommendation:* Unify coordinate dtypes to `np.int64` throughout `domain_finder.py` and `clustering.py`.
-
----
-
-### 7.2 Biological & Mathematical Validity of Algorithmic Steps
 
 #### A. Spurious Domain Filtering: Flawed Weighting by Length (`filter_spurious_domains`)
 - **Current Implementation:**
@@ -68,11 +37,10 @@ The coordinate convention flows across pipeline stages as follows:
   $$\text{Support}(d) = N_{\text{targets}}(d) = \sum_{t \in \text{Cluster}(d)} w_t$$
   - **Multi-Tiered Biological Tie-Breakers:**
     1. Primary key: Cluster alignment support $N_{\text{targets}}$ (highest support wins).
-    2. Secondary key (if support is equal): Mean alignment identity / local DPC peak density ($\rho$).
-    3. Tertiary key (if density is equal): Domain length compactness or proximity to expected motif size.
-    4. Deterministic final tie-breaker: Canonical coordinate order $(s, e)$.
+    2. Secondary key (if density is equal): Domain length compactness or proximity to expected motif size.
+    3. Deterministic final tie-breaker: index
 
-#### B. Target Overlap Accumulation & Global Multi-Sequence Jaccard
+### Target Overlap Accumulation & Global Multi-Sequence Jaccard
 - **Current Mathematical Model in `family_finder`:**
   For domain instances $d_r$ and $d_c$:
   $$\text{Overlap}(d_r, d_c) = \sum_{t \in \mathcal{S}} \text{Intersection}_t(\text{merged\_hits}(d_r), \text{merged\_hits}(d_c))$$
