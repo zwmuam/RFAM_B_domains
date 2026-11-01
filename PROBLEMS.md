@@ -1,6 +1,4 @@
-# Codebase Quality Audit: Bad Practices, Suboptimal Solutions & Proposed Optimizations
-
-## 1. Audit of Bad Practices and Suboptimal Solutions
+## 1. Audit
 
 A comprehensive technical audit of `domain_finder.py`, `aligners.py`, and `clustering.py` identified several architectural bottlenecks, memory anti-patterns, and suboptimal computational routines:
 
