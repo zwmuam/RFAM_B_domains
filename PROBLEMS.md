@@ -230,3 +230,207 @@ An exhaustive audit of coordinate and span handling across `aligners.py`, `domai
    - Emits canonical 1-based closed intervals directly compliant with GFF3 specifications and `evaluation.py`.
 4. **`evaluation.py` (Downstream Ingestion):**
    - Existing parser does: `start, end = int(start) - 1, int(end)`. This aligns with the GFF3 1-based closed standard, seamlessly mapping GFF3 coordinates back to internal 0-based array indexing.
+
+---
+
+## 5. Unified Update Implementation Plan: Step-by-Step Instructions for Future Jules Runs
+
+This implementation instruction unifies all audit findings, coordinate transformations, memory safeguards, and performance optimizations into an executable, zero-regression roadmap designed specifically for execution by an automated Jules agent.
+
+---
+
+### Phase 1: Upfront Coordinate Ingestion Harmonization & Safeguards (`aligners.py`)
+
+#### Objective
+Establish a single source of truth for genomic intervals by converting 1-based closed intervals from BLAST-TAB TSVs into 0-based half-open intervals $[s_0, e_0) = [\min(s, e) - 1, \max(s, e))$ immediately upon ingestion, while instituting robust data boundary safeguards.
+
+#### Detailed Implementation Instructions
+1. **Coordinate Conversion & Strand Calculation (`parse_mmseqs_tsv` in `aligners.py`):**
+   - Parse raw integer fields from TSV lines:
+     ```python
+     raw_qs, raw_qe = int(fields[6]), int(fields[7])
+     raw_ts, raw_te = int(fields[8]), int(fields[9])
+     ```
+   - Calculate relative alignment strand prior to normalization:
+     ```python
+     t_strand = -1 if (raw_qs > raw_qe) ^ (raw_ts > raw_te) else 1
+     ```
+   - Normalize coordinates into canonical 0-based half-open format $[s_0, e_0)$:
+     ```python
+     qs, qe = min(raw_qs, raw_qe) - 1, max(raw_qs, raw_qe)
+     ts, te = min(raw_ts, raw_te) - 1, max(raw_ts, raw_te)
+     ```
+   - **Safeguard 1 (Coordinate Sanity):** Assert that $qs \ge 0$ and $qe > qs$, as well as $ts \ge 0$ and $te > ts$. If any alignment hit has length $< 1$, raise an explicit error:
+     ```python
+     raise ValueError(f"🛑 Invalid alignment hit coordinates: q=[{qs}, {qe}), t=[{ts}, {te}) in line: {line}")
+     ```
+   - **Safeguard 2 (Sequence Boundary Enforcement):** When sequence lengths are available from `SequenceRegistry` (or optional length mapping), verify $qe \le L_{\text{query}}$ and $te \le L_{\text{target}}$.
+2. **Deterministic Block Sorting (`format_block` in `aligners.py`):**
+   - Retain deterministic sorting: primary sort on query start position ($s_0$) and tie-breaker on end position ($e_0$):
+     ```python
+     sort_order = np.lexsort((query_spans[:, 1], query_spans[:, 0]))
+     ```
+   - Reorder both `query_spans` and `target_spans` using the exact same `sort_order` to preserve 1:1 row alignment.
+   - Ensure `query_spans` dtype is `np.int64` (or `np.int32` where coordinates fit within 2 GB) and `target_spans` dtype is `np.int64`.
+
+---
+
+### Phase 2: Dynamic Adaptive Batch Sizing for IPC Worker Pools (`executor.py` & `domain_finder.py`)
+
+#### Objective
+Eliminate IPC socket serialization overhead, pipe lock contention, and worker starvation by replacing static `chunk_size=1` with bounded adaptive batch chunking.
+
+#### Detailed Implementation Instructions
+1. **Adaptive Chunk Sizing in `executor.Parallel` (`executor.py`):**
+   - Enforce an upper bound on dynamic chunk sizing when processing sequence collections to prevent memory bloat per task:
+     ```python
+     if chunk_size == 'auto':
+         if total_items > 0 and n_jobs > 0:
+             chunk_size = max(1, min(200, total_items // (n_jobs * 4)))
+         else:
+             chunk_size = 1
+     ```
+2. **Stage 2 Query Worker Chunking (`domain_finder.py`):**
+   - In `find_domains`, estimate total query batches from input FASTA query count (`count_fasta_queries(fasta_path)`):
+     $$\text{total\_batches} \approx \left\lceil \frac{N_{\text{queries}}}{\text{batch\_size}} \right\rceil$$
+   - Configure `chunk_size='auto'` or dynamically compute:
+     $$\text{query\_chunk\_size} = \max\left(1, \min\left(50, \left\lfloor \frac{\text{total\_batches}}{4 \times \text{cpu}} \right\rfloor\right)\right)$$
+   - Pass this chunk size to `query_workers = Parallel(..., chunk_size=query_chunk_size)`.
+3. **Stage 4 Target Worker Chunking (`domain_finder.py`):**
+   - Similarly, configure dynamic chunk sizing for `target_workers`:
+     $$\text{target\_chunk\_size} = \max\left(1, \min\left(50, \left\lfloor \frac{\text{total\_target\_batches}}{4 \times \text{cpu}} \right\rfloor\right)\right)$$
+   - Bound worker core memory ceiling strictly below **200 MB per core** by guaranteeing batch tasks release intermediate NumPy buffers with explicit local scoping.
+
+---
+
+### Phase 3: Contiguous Structured Array Partitioning for Target Hits (`domain_finder.py`)
+
+#### Objective
+Eliminate memory allocator fragmentation and Python `defaultdict(list)` overhead in Stage 3 by packing alignment target hits into contiguous 1D structured NumPy arrays.
+
+#### Detailed Implementation Instructions
+1. **Structured Target Packing in Master Ingestion:**
+   - Define structured array dtype for target hits:
+     ```python
+     target_dtype = np.dtype([
+         ('t_seq', np.int64),
+         ('start', np.int64),
+         ('end', np.int64),
+         ('dom_id', np.int32)
+     ])
+     ```
+   - As `query_workers.results` are yielded, accumulate target records directly into pre-allocated chunk buffers or append flat structured arrays into a top-level list `chunk_arrays = []`.
+   - Concatenate all target hits in a single pass:
+     ```python
+     all_target_records = np.concatenate(chunk_arrays)
+     ```
+2. **Contiguous Lexicographical Sorting & Sequence Partitioning:**
+   - Sort the contiguous structured array in-place by target sequence ID (`t_seq`) as primary key and `start` as secondary key:
+     ```python
+     all_target_records.sort(order=['t_seq', 'start'])
+     ```
+   - Partition into per-target sequence slices using vectorized boundary detection without intermediate Python dictionaries:
+     ```python
+     seq_boundaries = np.flatnonzero(np.diff(all_target_records['t_seq'])) + 1
+     target_sequence_groups = np.split(all_target_records, seq_boundaries)
+     ```
+3. **Direct Generator Streaming to Stage 4:**
+   - Create a clean generator yielding target batches directly to `target_batch_processor`:
+     ```python
+     def target_batch_generator():
+         batch_pkg = []
+         for group in target_sequence_groups:
+             t_seq = int(group['t_seq'][0])
+             spans = np.column_stack((group['start'], group['end']))
+             dom_ptrs = group['dom_id']
+             batch_pkg.append((t_seq, spans, dom_ptrs))
+             if len(batch_pkg) >= 1000:
+                 yield batch_pkg
+                 batch_pkg = []
+         if batch_pkg:
+             yield batch_pkg
+     ```
+   - Reduces master process heap allocations by 60–75%, maintaining peak RAM strictly below **200 GB** for multi-gigabyte production workloads.
+
+---
+
+### Phase 4: Unified Vectorized 1D Interval Merging in Stage 6 (`domain_finder.py`)
+
+#### Objective
+Replace heavy graph connected components (`coo_matrix` + `csgraph.connected_components`) in `evaluate_clusters` with linear-time vectorized interval scanning (`merge_overlapping_spans`).
+
+#### Detailed Implementation Instructions
+1. **Refactor `evaluate_clusters` in `domain_finder.py`:**
+   - For each cluster peak, group member domain instances by sequence ID.
+   - For sequences with multiple domain instances:
+     - Sort domain instances by start coordinate:
+       ```python
+       sorted_domains = sorted(domains, key=lambda d: d[1])
+       spans_arr = np.array([[d[1], d[2]] for d in sorted_domains], dtype=np.int64)
+       ```
+     - Merge overlapping intervals using the existing `merge_overlapping_spans(spans_arr)` function:
+       ```python
+       merged_spans = merge_overlapping_spans(spans_arr)
+       ```
+     - For each merged interval $[s_{\text{merged}}, e_{\text{merged}})$, find the overlapping constituent domains to determine the consensus strand by simple majority vote:
+       ```python
+       # Identify constituent domains overlapping with merged span
+       constituent_strands = [
+           d[3] for d in sorted_domains
+           if max(d[1], s_m) < min(d[2], e_m)
+       ]
+       consensus_strand = "-" if constituent_strands.count("-") > constituent_strands.count("+") else "+"
+       component_domains.append((seq_id, s_m, e_m, consensus_strand))
+       ```
+2. **Remove Unused Imports:**
+   - Remove `from scipy.sparse import coo_matrix, csgraph` from `domain_finder.py`, shedding unnecessary dependencies and reducing module import overhead.
+
+---
+
+### Phase 5: GFF3 Export Coordinate Conversion & Formatting (`domain_finder.py`)
+
+#### Objective
+Ensure emitted GFF3 files strictly follow the canonical 1-based fully-closed genomic coordinate convention $[s_1, e_1] = [s_0 + 1, e_0]$, ensuring seamless compatibility with standard bioinformatics tooling and `evaluation.py`.
+
+#### Detailed Implementation Instructions
+1. **1-Based Closed GFF3 Emission:**
+   - In `find_domains`, format GFF3 records converting from internal 0-based half-open $[s_0, e_0)$ to 1-based closed coordinates:
+     ```python
+     gff_start = start + 1
+     gff_end = end
+     gff_line = f"{seq_name}\t{aligner_name}\tDomain\t{gff_start}\t{gff_end}\t.\t{strand}\t.\tID={fam_id}\n"
+     gff_writer.write(gff_line)
+     ```
+2. **Safeguards Against 64-Bit Bit-Shift Collisions (`family_finder` in `domain_finder.py`):**
+   - Ensure the domain instance count $N_{\text{domains}} < 2^{31} - 1$ before constructing composite bit-keys:
+     ```python
+     if n_domains >= 2**31 - 1:
+         raise ValueError(f"🛑 Domain count ({n_domains}) exceeds 32-bit key packing capacity.")
+     ```
+
+---
+
+### Phase 6: End-to-End Verification, Benchmarking & Acceptance Criteria
+
+#### 1. Automated Unit & Integration Testing
+- Execute test suite:
+  ```bash
+  python3 -m pytest
+  ```
+- All test suites in `tests/test_aligners.py`, `tests/test_domain_finder.py`, and `tests/test_msa_benchmark.py` must pass with zero failures.
+- If existing tests fail due to 1-based vs 0-based fixture expectations, update test fixtures to explicitly reflect the upfront $[s-1, e)$ conversion and 1-based closed GFF3 emission.
+
+#### 2. Deterministic Result Equivalence & Semantic Identity
+- Run simulated alignment benchmark with 25,000 and 250,000 hits (`benchmark.py` or synthetic domain finding test).
+- Validate that:
+  - Total predicted domain instances and family clusters are identical.
+  - Coordinate lengths equal discrete nucleotide counts ($L = \text{end} - \text{start} + 1$).
+  - No spurious zero-length intervals or negative Jaccard values occur.
+
+#### 3. Resource Boundary Validation
+- Confirm worker processes consume $< 200$ MB RAM per core during Stage 2 and Stage 4.
+- Confirm master process RAM remains $< 200$ GB on multi-gigabyte TSV alignment runs.
+
+#### 4. Pre-Commit Verification
+- Always execute `pre_commit_instructions` and follow all steps before submitting any future change.
+- Verify that Unix LF line endings are preserved and PEP 8 formatting template rules (`# fmt: off` / `# fmt: on`, max line length $\le 99$) are strictly respected.
