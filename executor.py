@@ -126,7 +126,7 @@ class Parallel:
 
         if chunk_size == 'auto':
             if total_items > 0 and n_jobs > 0:
-                chunk_size = max(1, total_items // (n_jobs * 4))
+                chunk_size = max(1, min(200, total_items // (n_jobs * 4)))
             else:
                 chunk_size = 1
 
