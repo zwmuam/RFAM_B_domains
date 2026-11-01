@@ -1,3 +1,16 @@
+
+ensure that documentation (docstrings, coments) is informative, intuitive for biologists and variable names are clear, informative and easy to understand (even if some have to be longer).
+
+Re-evaluate current logic of domain finding and its dependencies. Is every stage scientifically and mathematically valid? Is coordinate/span handling consistent. Does coordinate system remain fully compatible trough the whole pipeline starting from mmseqs parser in aligners, trough entire domain finding including important clustering function and intersection calculation. Validate expected results at each numerical step checking specifically for off-by-one and passing of one format to the function that expects one with no explicit conversion. Is there any data risk of data corruption? Re-assess the speed optimisation and memory efficiency. Are there any avoidable/amendable bottlenecks or bloats. Can you spot any bad programming practices or mathematical errors. Are biological assumptions valid and does the code. Add remaining problems, inconsistencies, risks and uncertain practices at the end of the PROBLEMS.md with detailed result of this evaluation. Use existing content in PROBLEMS.md only for comparision (it is mostly outdated and should be re-evaluated with current codebase).
+
+Propose 
+
+Add unified update implementation plan to the end of PROBLEMS.md that covers best harmonised optimisation implementation strategy to guide future Jules run. Base your plan on analysis of potential conflicts, data flow corruption possibilities and meticulous scientific evaluation of both existing code and proposed changes. The result should be well-thought-out general plan that considers, refines and unifies all changes and solutions to problems. Add plan at the end of existing file as step-by-step implementation instruction for next Jules agent run.
+
+Re-evaluate and implement speed, paralellisation and and memory-optimisation suggestions in PROBLEMS.md to perform unified code revision of the whole domain_finding workflow (including in-repository dependencies). Ensure each step makes sense and is scientifically valid and programmatically optimal. Check for overlapping/conflicting changes, ensure scientific rigor and best programming practices, code readability, streamlined structure. Rewrite all necessary files implementing optimal arrangement of the changes with minimal code revision, optimised simplicity, minimised risk. Finally, test all changes ensuring proper execution, reduced memory load, propper thread usage, no result corruption and seamless connection with downstream and upstream tasks. Evaluate the results, memory consumption and speed of changed script compared to results of current version in small-to-medium case studies. Validate result equivalence, speed improvement, thread-efficiency and memory footprint of old (pre-revision) and new version on datasets of 25000 simulated mmseqs2 hits and add results at the end of the PROBLEMS.md. CONSIDERATIONS: Backward Compatibility is irrelevant optimise for speed. Errors should enforce format compliance. Revision should holistically implement optimal refinement strategy aiming at code readability but without sacrificing performance.
+
+
+
 ## 1. Audit
 
 Pipeline Re-Evaluation: Critical Inconsistencies, Mathematical & Biological Risks, and Architectural Bottlenecks
