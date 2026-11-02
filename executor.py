@@ -1,20 +1,25 @@
 # fmt: off
 """
-Multi-threading, system CPU thread detection, command execution, and logging utilities.
+System thread detection, parallel process pools, external CLI command execution,
+serialization checkpoints, and logging utilities.
 
-This module provides system thread count determination, an MPIRE wrapper for parallel process pool
-execution, external process invocation, and loguru warning redirection.
+Consolidates all multiprocessing and process-execution abstractions into a unified,
+fork-safe, and thread-safe implementation.
 """
 
 # built-ins
+import inspect
 import multiprocessing as mp
 import os
+import pickle
+import signal
 import subprocess
 import sys
 import threading
 import warnings
+from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Collection, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Collection, Dict, Generator, Hashable, List, Optional, Sequence, Tuple, Union
 
 # standard libraries
 import numpy as np
@@ -23,7 +28,13 @@ import numpy as np
 from loguru import logger
 from mpire import WorkerPool
 
+# Limit BLAS/MKL/OpenBLAS threads before any numerical operations
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 
+
+# LOGGING format and configuration
 def loguru_showwarning(message: Any,
                        category: Any,
                        filename: str,
@@ -69,6 +80,120 @@ def get_default_cpu_threads(requested_cpus: Optional[int] = None) -> int:
     if not available_cores or available_cores <= 1:
         return 1
     return available_cores - 1
+
+
+# Default threads alias
+default_threads: int = get_default_cpu_threads()
+seed_max: int = 2 ** 32 - 1
+
+
+def frantic_search(dictionary: Dict[Hashable, Any],
+                   *possible_keys: Hashable) -> Any:
+    """
+    Find first of the several keys that are in a dictionary and return the value.
+
+    :param dictionary: dictionary to search.
+    :param possible_keys: any number of possible keys (preferred first).
+    :return: dictionary[first_found_key].
+    """
+    for key in possible_keys:
+        if key in dictionary:
+            return dictionary[key]
+    missed_keys = ', '.join([str(k) for k in possible_keys])
+    raise KeyError(f'Found none of the: {missed_keys}')
+
+
+def total_time(func: Callable) -> Callable:
+    """
+    Timing decorator logging function execution duration.
+
+    :param func: Function to wrap.
+    :return: Wrapped function.
+    """
+    @wraps(func)
+    def timed(*args: Any, **kwargs: Any) -> Any:
+        from time import time
+        start_time = time()
+        result = func(*args, **kwargs)
+        end_time = time()
+        duration = end_time - start_time
+        human_readable = (f'{int(duration // 3600):02d}:'
+                          f'{int((duration % 3600) // 60):02d}:'
+                          f'{int(duration % 60):02d}')
+        logger.info(f'Function "{func.__name__}" executed in {human_readable} (hh:mm:ss)')
+        return result
+
+    return timed
+
+
+def checkpoint(funct: Callable) -> Callable:
+    """
+    Serialization checkpoint decorator that caches function results on disk.
+
+    :param funct: Function to wrap.
+    :return: Wrapped function with checkpoint disk caching.
+    """
+    signature = inspect.signature(funct)
+
+    @wraps(funct)
+    def save_checkpoint(*args: Any, **kwargs: Any) -> Any:
+        bound_args = signature.bind(*args, **kwargs)
+        pickle_path = Path(bound_args.arguments.get('pickle_path',
+                                                    signature.parameters['pickle_path'].default))
+        if pickle_path:
+            try:
+                with pickle_path.open('rb') as file_object:
+                    result = pickle.load(file_object)
+                logger.info(f'\ntemporary file read from: {pickle_path.as_posix()}\n', flush=True)
+                return result
+            except (FileNotFoundError, IOError, EOFError):
+                sys.setrecursionlimit(5000)
+                result = funct(*args, **kwargs)
+                with pickle_path.open('wb') as out:
+                    pickle.dump(result, out)
+                logger.info(f'\ntemporary file stored at: {pickle_path.as_posix()}\n', flush=True)
+                return result
+
+    return save_checkpoint
+
+
+def timeout_signal(seconds: int = 1800) -> Callable:
+    """
+    Signal-based timeout decorator for POSIX systems.
+
+    :param seconds: Maximum allowed runtime in seconds before raising TimeoutError.
+    :return: Wrapped decorator function.
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            def _handle_timeout(signum: int, frame: Any) -> None:
+                raise TimeoutError(f"Function '{func.__name__}' timed out after {seconds} seconds.")
+
+            old_handler = signal.signal(signal.SIGALRM, _handle_timeout)
+            signal.alarm(seconds)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+        return wrapper
+    return decorator
+
+
+def _parallel_worker_dispatch(shared_objects: Tuple[Callable, Dict[str, Any], Any],
+                              item: Any) -> Any:
+    """
+    Top-level picklable target dispatcher compatible with forkserver and spawn.
+
+    :param shared_objects: Tuple of (target_function, user_kwargs, user_shared_objects).
+    :param item: Single input argument yielded for the task.
+    :return: Target function evaluation result.
+    """
+    target_fn, kwargs, user_shared = shared_objects
+    if user_shared is not None:
+        return target_fn(user_shared, item, **kwargs)
+    return target_fn(item, **kwargs)
 
 
 class Parallel:
@@ -128,6 +253,7 @@ class Parallel:
         else:
             input_list = input_collection
 
+        total_items: Optional[int] = None
         if isinstance(input_list, (list, tuple)):
             total_items = len(input_list)
             if chunk_size == 'auto':
@@ -139,18 +265,24 @@ class Parallel:
             if chunk_size == 'auto':
                 chunk_size = 32
 
-        worker_kwargs = {'shared_objects': shared_objects} if shared_objects else {}
+        worker_kwargs = {}
+        # Default start method for WorkerPool: use forkserver if available, else spawn
+        if 'start_method' not in extra_kwargs:
+            avail = mp.get_all_start_methods()
+            worker_kwargs['start_method'] = 'forkserver' if 'forkserver' in avail else 'spawn'
+        else:
+            worker_kwargs['start_method'] = extra_kwargs.pop('start_method')
 
-        # Default start method for WorkerPool on Linux
-        if 'start_method' not in worker_kwargs and 'start_method' not in extra_kwargs:
-            worker_kwargs['start_method'] = 'fork'
-
-        def _worker_wrapper(*args: Any) -> Any:
-            item = args[0] if len(args) == 1 else args
-            return target_fn(item, **kwargs)
+        worker_kwargs['shared_objects'] = (target_fn, kwargs, shared_objects)
 
         extra_kwargs.pop('total', None)
-        extra_kwargs.pop('iterable_len', None)
+        iterable_len = extra_kwargs.pop('iterable_len', None)
+        if iterable_len is None and total_items is not None:
+            iterable_len = total_items
+
+        def _arg_feeder(source_iter: Any) -> Generator[Tuple[Any], None, None]:
+            for item in source_iter:
+                yield (item,)
 
         with WorkerPool(n_jobs=n_jobs, **worker_kwargs) as pool:
             pbar_opts = {'desc': description, 'colour': bar_color} if bar else {}
@@ -160,14 +292,66 @@ class Parallel:
             map_kwargs: Dict[str, Any] = {
                 'progress_bar': bar,
                 'progress_bar_options': pbar_opts if bar else None,
-                'chunk_size': chunk_size
+                'chunk_size': chunk_size,
+                'iterable_len': iterable_len,
             }
 
             map_func = pool.map if keep_order else pool.map_unordered
-            self.result: List[Any] = map_func(_worker_wrapper,
-                                              input_list,
+            self.result: List[Any] = map_func(_parallel_worker_dispatch,
+                                              _arg_feeder(input_list),
                                               **map_kwargs)
         self.results = self.result
+
+
+def shell(command: List[str],
+          stdout: str = 'suppress',
+          stdin: Optional[bytes] = None,
+          timeout: Optional[float] = None) -> Optional[bytes]:
+    """
+    Run external CLI commands, ensuring all sub-processes in the process
+    group are fully terminated on timeout or failure.
+
+    :param command: List of command arguments.
+    :param stdout: Output handling ('suppress', 'capture', or None).
+    :param stdin: Optional input bytes.
+    :param timeout: Execution timeout threshold in seconds.
+    :return: Captured bytes output if stdout == 'capture', else None.
+    """
+    sanitized_command = [str(c) for c in command]
+    logger.info(" ".join(sanitized_command))
+
+    if stdout == 'suppress':
+        out_stream, err_stream = subprocess.DEVNULL, subprocess.DEVNULL
+    elif stdout == 'capture':
+        out_stream, err_stream = subprocess.PIPE, subprocess.PIPE
+    else:
+        out_stream, err_stream = None, None
+
+    process = subprocess.Popen(
+        sanitized_command,
+        stdout=out_stream,
+        stderr=err_stream,
+        stdin=subprocess.PIPE if stdin is not None else None,
+        start_new_session=True
+    )
+
+    try:
+        out, err = process.communicate(input=stdin, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+        process.wait()
+        raise TimeoutError(f'Command "{" ".join(sanitized_command)}" timed out after {timeout} seconds.')
+
+    if process.returncode != 0:
+        err_msg = err.decode('utf-8', errors='replace') if err else "Process failed silently"
+        raise ChildProcessError(
+            f'Command "{" ".join(sanitized_command)}" exited with code {process.returncode}:\n{err_msg}')
+
+    return out if stdout == 'capture' else None
 
 
 def run_external(command: Union[Sequence[Any], Sequence[Sequence[Any]]],

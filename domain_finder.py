@@ -34,8 +34,7 @@ from aligners import (SequenceRegistry, count_fasta,
 from clustering import (compare_sorted_spans,
                         jaccard_index, max_containment,
                         dpc)
-from executor import Parallel
-from tweaks import default_threads, logger
+from executor import Parallel, default_threads, logger
 
 
 def count_fasta_queries(fasta_path: Path) -> int:
@@ -404,7 +403,8 @@ def family_finder(rows: np.ndarray,
                   min_fam_sim: float,
                   min_fam_dens: float,
                   halo_stringency: float,
-                  halo_method: Optional[str]) \
+                  halo_method: Optional[str] = "similarity_weighted",
+                  point_specific: bool = False) \
         -> Tuple[Dict[int, np.ndarray], int]:
     """
     Cluster domain instances into domain families using DPC based on Jaccard similarity
@@ -464,7 +464,8 @@ def family_finder(rows: np.ndarray,
                                   backend="scipy",
                                   filter_transparency=halo_stringency,
                                   halo_method=halo_method,
-                                  min_dens=min_fam_dens)
+                                  min_dens=min_fam_dens,
+                                  point_specific=point_specific)
     return peak_to_cluster, n_halo
 
 
@@ -555,7 +556,7 @@ def find_domains(fasta_path: Path,
     min_fam_sim = float(attributes.get("min_fam_sim", 0.25))
     fam_halo = float(attributes.get("fam_halo", 0.5))
     min_fam_dens = float(attributes.get("min_fam_dens", 1.0))
-    halo_method = attributes.get("halo_method", "knn")
+    halo_method = attributes.get("halo_method", "similarity_weighted")
     if halo_method is not None and str(halo_method).lower() == "none":
         halo_method = None
     reassign_targets = bool(attributes.get("reassign_targets", True))
@@ -588,17 +589,17 @@ def find_domains(fasta_path: Path,
                              chunk_size='auto')
 
     target_dtype = np.dtype([
-        ('t_seq', np.int64),
-        ('start', np.int64),
-        ('end', np.int64),
+        ('t_seq', np.int32),
+        ('start', np.int32),
+        ('end', np.int32),
         ('dom_id', np.int32)
     ])
 
     global_domains: List[Tuple[int, int, int, str]] = []
     global_offset = 0
 
-    # In-place pre-allocated dynamic buffer eliminates 2x peak RAM allocation spike
-    est_capacity = max(100_000, count_fasta_queries(fasta_path) * 100)
+    # Estimate capacity from TSV byte size (~75 bytes per BLAST line) to prevent reallocations
+    est_capacity = max(100_000, int(tsv_file.stat().st_size // 75))
     target_buffer = np.empty(est_capacity, dtype=target_dtype)
     write_offset = 0
 
@@ -676,7 +677,9 @@ def find_domains(fasta_path: Path,
 
     all_rows = np.concatenate(accumulated_rows) if accumulated_rows else np.empty(0, dtype=np.int32)
     all_cols = np.concatenate(accumulated_cols) if accumulated_cols else np.empty(0, dtype=np.int32)
-    all_inters = np.concatenate(accumulated_inters) if accumulated_inters else np.empty(0, dtype=np.int64)
+    all_inters = np.concatenate(accumulated_inters) if accumulated_inters else np.empty(0, dtype=np.int32)
+
+    point_specific_val = bool(attributes.get("point_specific", False))
 
     # 4. Stage 5: Family finding with DPC
     logger.info("Executing Stage 5: Finding domain families")
@@ -688,7 +691,8 @@ def find_domains(fasta_path: Path,
                                             min_fam_sim=min_fam_sim,
                                             min_fam_dens=min_fam_dens,
                                             halo_stringency=fam_halo,
-                                            halo_method=halo_method)
+                                            halo_method=halo_method,
+                                            point_specific=point_specific_val)
 
     # 5. Stage 6: Evaluate clusters and export to GFF3
     logger.info(f"Writing predicted domain families to {output_gff}")

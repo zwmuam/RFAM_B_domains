@@ -38,6 +38,7 @@ def find_domains(fasta_path: Path,
                  reassign_targets: bool,
                  min_containment: float,
                  output_gff: Path,
+                 point_specific: bool = False,
                  tmp_dir: Optional[Path] = None,
                  result_dir: Optional[Path] = None) -> Path:
     """
@@ -74,6 +75,7 @@ def find_domains(fasta_path: Path,
         "halo_method": halo_method,
         "reassign_targets": reassign_targets,
         "min_containment": min_containment,
+        "point_specific": point_specific,
     }
 
     return df_find_domains(fasta_path=fasta_path,

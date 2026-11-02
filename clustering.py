@@ -733,67 +733,98 @@ def halo_filter(labels: np.ndarray,
                 backend: str,
                 method: str,
                 rho: np.ndarray,
-                halo_k: int = DEFAULT_HALO_K) -> np.ndarray:
+                halo_k: int = DEFAULT_HALO_K,
+                point_specific: bool = False) -> np.ndarray:
     """
     Partition clusters into core regions and sparse halo regions, reassigning halo points to -1.
 
-    Points with border scores exceeding filter_transparency are marked as border points.
-    For each cluster, the maximum local density among its border points (rho_b) is computed.
-    Cluster members with density strictly less than rho_b (rho_i < rho_b) are designated as halo (noise, -1).
+    In point_specific mode (point_specific=True):
+        Individual border points are reassigned to halo noise (-1) if and only if their foreign
+        border evidence score meets or exceeds filter_transparency and their local density is strictly
+        below the median density of their assigned cluster:
+            s_foreign(i) >= tau  and  rho_i < median_{j in Cluster(i)}(rho_j)
+        This avoids cluster-wide rho_b decapitation where a single high-density border point
+        causes all internal lower-density members of an authentic cluster to be purged.
 
-    Small clusters (<3) are exempt from halo procedure,
-    as they lack sufficient statistical sample size to define a meaningful boundary region density.
+    In traditional cluster-wide mode (point_specific=False):
+        Points with border scores exceeding filter_transparency are marked as border points.
+        For each cluster, the maximum local density among its border points (rho_b) is computed:
+            rho_b(c) = max_{i in border(c)} rho_i
+        Cluster members with density strictly less than rho_b (rho_i < rho_b) are designated as halo (-1).
+
+    Noise points (-1) are strictly excluded from cluster sizes, border sets, and cluster metrics.
 
     :param labels: 1D array of initial cluster labels (0 to C-1, with -1 for noise).
     :param similarity_mat: n x n similarity matrix (sparse CSR or dense array).
     :param filter_transparency: Sensitivity threshold in [0, 1]. Lower values filter more halo points.
+    :param halo_min_cluster_size: Minimum cluster size required to trigger halo filtering.
     :param backend: Matrix computation backend ('scipy' or 'numpy').
     :param method: Halo filtering method ('traditional', 'similarity_weighted', 'knn', or 'ndcg').
     :param rho: 1D array of precomputed local density values for all points.
     :param halo_k: Number of nearest neighbours used for neighbour-based methods.
+    :param point_specific: Whether to evaluate border filtering individually rather than cluster-wide.
     :return: 1D array of updated cluster labels where halo/noise points are set to -1.
     """
     new_labels = labels.copy()
-    if filter_transparency >= 1.0:
+    if filter_transparency >= 1.0 or new_labels.size == 0:
         return new_labels
 
-    n_clusters = int(labels.max()) + 1 if labels.size and labels.max() >= 0 else 0
+    valid_mask = new_labels >= 0
+    if not np.any(valid_mask):
+        return new_labels
+
+    n_clusters = int(new_labels[valid_mask].max()) + 1
     if n_clusters <= 1:
         return new_labels
 
-    sizes = np.bincount(labels[labels >= 0], minlength=n_clusters)
-    # Early exit: return immediately if all clusters are below minimum size threshold
+    # Noise (-1) is strictly excluded from cluster size calculation
+    sizes = np.bincount(new_labels[valid_mask], minlength=n_clusters)
     eligible_clusters = sizes >= halo_min_cluster_size
     if not np.any(eligible_clusters):
         return new_labels
 
     eligible_points = int(sizes[eligible_clusters].sum())
 
-    # Optimize target rows computation: evaluate evidence only for points in non-exempt clusters
+    # Optimize target rows computation: evaluate evidence only for valid points in eligible clusters
     evidence_rows = None
     if eligible_points * 4 < labels.size * 3:
-        evidence_rows = np.flatnonzero((labels >= 0) & eligible_clusters[labels.clip(min=0)])
+        evidence_rows = np.flatnonzero(valid_mask & eligible_clusters[new_labels.clip(min=0)])
 
     scores = border_evidence(labels, similarity_mat, method, backend, filter_transparency=filter_transparency,
                              halo_k=halo_k, rows=evidence_rows)
 
-    is_border = (scores >= filter_transparency) & (scores > 0.0)
-    rho_b = np.full(n_clusters, -1.0, dtype=np.float64)
+    is_border_relative = (scores >= filter_transparency) & (scores > 0.0)
 
-    border = np.flatnonzero(is_border) if evidence_rows is None else evidence_rows[is_border]
-    if evidence_rows is None:
-        border = border[labels[border] >= 0]
+    if evidence_rows is not None:
+        is_border = np.zeros(labels.size, dtype=bool)
+        is_border[evidence_rows] = is_border_relative
+    else:
+        is_border = valid_mask & eligible_clusters[new_labels.clip(min=0)] & is_border_relative
+
+    if point_specific:
+        # Point-specific mode: evaluate border points individually without cluster-wide rho_b
+        cluster_medians = np.zeros(n_clusters, dtype=np.float64)
+        for c in range(n_clusters):
+            members = new_labels == c
+            if np.any(members):
+                cluster_medians[c] = np.median(rho[members])
+
+        outliers = is_border & (rho < cluster_medians[new_labels.clip(min=0)])
+        new_labels[outliers] = -1
+        return new_labels
+
+    # Traditional cluster-wide mode
+    border = np.flatnonzero(is_border)
+    rho_b = np.full(n_clusters, -1.0, dtype=np.float64)
 
     if border.size > 0:
         # In-place maximum reduction O(N_b) without sorting overhead
-        np.maximum.at(rho_b, labels[border], rho[border])
+        np.maximum.at(rho_b, new_labels[border], rho[border])
 
     # Exempt small clusters (< halo_min_cluster_size) from halo reassignment
     rho_b[sizes < halo_min_cluster_size] = -1.0
 
-    assigned = labels >= 0
-    cut = assigned.copy()
-    cut[assigned] = rho[assigned] < rho_b[labels[assigned]]
+    cut = valid_mask & (rho < rho_b[new_labels.clip(min=0)])
     new_labels[cut] = -1
     return new_labels
 
@@ -813,7 +844,8 @@ def dpc(rows: np.ndarray,
         backend: str,
         weights: Optional[np.ndarray] = None,
         halo_min_cluster_size: int = 3,
-        halo_k: int = DEFAULT_HALO_K) -> Tuple[Dict[int, np.ndarray], int]:
+        halo_k: int = DEFAULT_HALO_K,
+        point_specific: bool = False) -> Tuple[Dict[int, np.ndarray], int]:
     """
     Execute Density Peak Clustering directly on a pairwise similarity graph.
 
@@ -898,7 +930,8 @@ def dpc(rows: np.ndarray,
                              backend=backend,
                              method=str(halo_method).lower(),
                              rho=densities,
-                             halo_k=halo_k)
+                             halo_k=halo_k,
+                             point_specific=point_specific)
 
     # Output formatting
     peak_to_cluster: Dict[int, np.ndarray] = {int(p): np.empty(0, dtype=np.int64) for p in peak_indices}

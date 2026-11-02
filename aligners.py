@@ -5,7 +5,7 @@ from typing import Dict, Generator, List, Optional, Tuple, Union
 
 import numpy as np
 
-from tweaks import shell, logger, default_threads
+from executor import shell, logger, default_threads
 
 
 class SequenceRegistry:
