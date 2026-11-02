@@ -476,15 +476,15 @@ del target_buffer
 ### 2.2 Analysis of Potential Conflicts, Overlaps, and Synergies
 
 #### Overlaps and Synergies
-1. **Pre-Computed Ranking and Spurious Filtering Synergy (Problem 1):**
+1. **Pre-Computed Ranking and Spurious Filtering Synergy:**
    - Pre-computing domain priority ranks via `np.lexsort` before graph pruning replaces repeated dictionary Lookups and per-iteration sorting with direct $O(1)$ integer comparisons (`domain_ranks[node]`).
    - This formulation maintains strict mathematical equivalence to biological criteria (support count, compactness, stable tie-breaking) while eliminating nested loop overhead.
-2. **Buffer Striding and Int64 Coordinates Synergy (Problems 3 & 6):**
+2. **Buffer Striding and Int64 Coordinates Synergy:**
    - Standardizing `start` and `end` fields to `np.int64` creates a contiguous structured record layout (`t_seq: int64`, `start: int64`, `end: int64`, `dom_id: int32`, 4-byte padding = 32 bytes).
    - This alignment maps cleanly onto CPU cache line boundaries (exactly two 32-byte records per 64-byte L1 cache line), speeding up in-place buffer copying and subsequent Stage 4 partition sorting (`all_targets_arr.sort(order=['t_seq', 'start'])`).
-3. **Adaptive Batch Sizing and Fork-Safety Synergy (Problems 4 & 5):**
+3. **Adaptive Batch Sizing and Fork-Safety Synergy:**
    - Combining `forkserver` worker initialization with dynamic adaptive chunk sizing eliminates IPC lock contention while shielding child workers from deadlocks caused by parent background threads.
-4. **Biological Accuracy Synergy (Problems 1 & 2):**
+4. **Biological Accuracy Synergy:**
    - Problem 1 ensures query domain candidates are validated by real target alignment hits, eliminating low-support spurious candidates before Stage 5.
    - Problem 2 guarantees that unaligned singleton noise items in Stage 5 are safely routed to noise (`-1`) rather than falsely inflating family cluster sizes.
 
