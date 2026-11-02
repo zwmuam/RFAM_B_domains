@@ -2,17 +2,13 @@
 
 Pipeline Re-Evaluation: Critical Inconsistencies, Mathematical & Biological Risks, and Architectural Bottlenecks
 
-A comprehensive, end-to-end re-evaluation of the current codebase (`aligners.py`, `domain_finder.py`, `clustering.py`, `executor.py`, and `evaluation.py`) was conducted against real biological use cases, mathematical foundations of Density Peak Clustering, and high-throughput memory/concurrency models.
-
-
-
-### Coordinate Vulnerabilities & Risks
-2. **Integer Truncation & Type Inconsistency Across Modules:**
+### Vulnerabilities & Risks
+**Integer Truncation & Type Inconsistency Across Modules:**
    - In `domain_finder.py`, structured arrays use `np.int64` for `t_seq`, `start`, and `end`, but `np.int32` for `dom_id`.
    - In `target_batch_processor`: `merged_spans = np.array(merged_spans_list, dtype=np.int32)`. For chromosome-scale sequences (>2.14 billion bases), casting coordinates down to `np.int32` will trigger silent signed integer overflow and negative genomic coordinates.
    - *Recommendation:* Unify coordinate dtypes to `np.int64` throughout `domain_finder.py` and `clustering.py`.
 
-#### A. Spurious Domain Filtering: Flawed Weighting by Length (`filter_spurious_domains`)
+### Spurious Domain Filtering: Flawed Weighting by Length (`filter_spurious_domains`)
 - **Current Implementation:**
   In `domain_finder.py`:
   ```python
@@ -76,19 +72,15 @@ A comprehensive, end-to-end re-evaluation of the current codebase (`aligners.py`
     This can force unaligned, low-density noise domains into the cluster of the first global peak!
   - *Recommendation:* Enforce noise assignment (cluster ID = -1) for low-density singleton components instead of forcing them into arbitrary cluster peaks.
 
-#### C. Self-Hit Representation Semantics
+### GOOD_PRACTICE: Self-Hit Representation Semantics
 - In `aligners.py`, self-hits (`q_seq == t_seq`) in the TSV are skipped to avoid inflating aligner metrics and duplicate hits.
 - In `domain_finder.py` (`domain_instances_on_query`), each discovered domain instance is explicitly appended as a target hit to itself:
   ```python
   self_targets[local_id] = [query_id, peak_span[0], peak_span[1], local_id]
   ```
 - *Biological Validity:* This is mathematically necessary. A domain instance originates on its query sequence. If it did not include itself in its target hit collection, two domain instances that both align to sequence $A$ (one as query, one as target) would have asymmetric representation. Adding the self-target hit ensures that the originating sequence is represented on equal footing with remote target sequences.
-
----
-
-### 7.3 Concurrency, Performance & Memory Footprint
-
-#### A. IPC Bottleneck: Static `chunk_size=1` in `domain_finder.py`
+- 
+### IPC Bottleneck: Static `chunk_size=1` in `domain_finder.py`
 - In `domain_finder.py`, lines 334 and 388:
   ```python
   query_workers = Parallel(..., chunk_size=1)
@@ -100,13 +92,13 @@ A comprehensive, end-to-end re-evaluation of the current codebase (`aligners.py`
   For a dataset with 50,000 query batches or 100,000 target sequence groups, `mpire` executes 150,000 individual IPC socket round-trips with progress-bar lock synchronization. On multi-core servers (32–64 vCPUs), workers spend over 60% of CPU time waiting on pipe serialization and queue mutexes.
 - *Remedy:* Set `chunk_size='auto'` in `domain_finder.py` so `executor.Parallel` dynamically chunks batches according to core count ($B = \max(1, \min(200, \lfloor N / (4 \times \text{n\_jobs}) \rfloor))$).
 
-#### B. Fork-Safety Warning with Multi-Threaded Processes in Python 3.12+
+### Fork-Safety Warning with Multi-Threaded Processes in Python 3.12+
 - During test execution on Python 3.12, pytest triggered:
   `DeprecationWarning: This process (pid=...) is multi-threaded, use of fork() may lead to deadlocks in the child. self.pid = os.fork()`
 - *Cause:* `mpire` defaults to `start_method='fork'` on Linux. When the calling process has initialized background threads (such as loguru worker threads or tqdm monitor threads), forking can duplicate locked mutexes, causing child worker pools to deadlock during socket I/O.
 - *Remedy:* Use `start_method='forkserver'` or `start_method='spawn'` in `executor.Parallel`, or ensure all thread pools are joined prior to spawning `WorkerPool`.
 
-#### C. Memory Overhead in Target Chunk Aggregation
+### Memory Overhead in Target Chunk Aggregation
 - In Stage 3 of `domain_finder.py`:
   ```python
   chunk = np.empty(all_targets.shape[0], dtype=target_dtype)
@@ -122,7 +114,7 @@ A comprehensive, end-to-end re-evaluation of the current codebase (`aligners.py`
 
 ---
 
-### 7.4 Programming Anti-Patterns & Risk Matrix
+### Risk Matrix
 
 | Risk / Issue | Module & Location | Severity | Mathematical / Biological Impact | Proposed Remediation |
 | :--- | :--- | :--- | :--- | :--- |
@@ -140,8 +132,6 @@ A comprehensive, end-to-end re-evaluation of the current codebase (`aligners.py`
 This section provides clear, step-by-step engineering solutions for each critical issue identified in the audit and risk matrix. Each problem is presented with a root-cause explanation, streamlined faulty versus revised code snippets incorporating pre-computed vector optimizations, an analysis of conflicts, overlaps, and synergies, and a concise risk mitigation summary.
 
 ---
-
-### 2.1 Problem-by-Problem Step-by-Step Remediations
 
 #### Problem 1: Spurious Domain Filtering: Flawed Weighting by Length (`filter_spurious_domains`)
 
