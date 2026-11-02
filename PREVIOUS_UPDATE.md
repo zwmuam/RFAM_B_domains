@@ -1,4 +1,4 @@
-# CODEBASE AUDIT & TECHNICAL PROBLEM ANALYSIS: DOMAIN FINDING PIPELINE
+# PREVIOUS REVISION DETAILS
 
 The domain-finding pipeline identifies conserved non-coding RNA (ncRNA) domain instances and family clusters from sequence alignments through a multi-stage architecture:
 1. **TSV Streaming & Coordinate Ingestion (`aligners.py`)**: Streams BLAST-TAB formatted alignment hits from MMseqs2 or RiboSeek, parses coordinates into half-open intervals $[s - 1, e)$, maps sequence identifiers to integers via `SequenceRegistry`, and groups records by query sequence.
