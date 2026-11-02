@@ -37,16 +37,6 @@ from clustering import (compare_sorted_spans,
 from executor import Parallel, default_threads, logger
 
 
-def count_fasta_queries(fasta_path: Path) -> int:
-    """
-    Count sequence headers (starting with '>') in a FASTA sequence file.
-
-    :param fasta_path: Path to the FASTA sequence file.
-    :return: Integer count of query sequence headers.
-    """
-    return count_fasta(fasta_path=fasta_path)
-
-
 def determine_strand(strands: np.ndarray) -> str:
     """
     Determine the consensus strand of a domain instance based on its target hits.
@@ -163,12 +153,20 @@ def domain_instances_on_query(query_id: int,
     span_lengths = unique_query_spans[:, 1] - unique_query_spans[:, 0]
 
     if n_spans == 1:
-        cluster_map[:] = 0
-        peak_indices = np.array([0], dtype=np.int32)
+        if weights[0] >= min_dom_dens:
+            cluster_map[:] = 0
+            peak_indices = np.array([0], dtype=np.int32)
+        else:
+            cluster_map[:] = -1
+            peak_indices = np.empty(0, dtype=np.int32)
     else:
         rows, cols, intersections = compare_sorted_spans(unique_query_spans)
         if rows.size == 0:
-            peak_indices = np.arange(n_spans, dtype=np.int32)
+            qualifying = np.flatnonzero(weights >= min_dom_dens).astype(np.int32)
+            assigned_peak_map = np.full(n_spans, -1, dtype=np.int32)
+            assigned_peak_map[qualifying] = qualifying
+            cluster_map = assigned_peak_map[cluster_map]
+            peak_indices = qualifying
         else:
             similarities = jaccard_index(intersections=intersections,
                                          row_lengths=span_lengths[rows],
@@ -366,7 +364,7 @@ def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray
         if len(merged_spans_list) <= 1:
             continue
 
-        merged_spans = np.asarray(merged_spans_list, dtype=np.int64)
+        merged_spans = np.asarray(merged_spans_list, dtype=np.int32)
         aligned_domains = np.asarray(aligned_domains_list, dtype=np.int32)
 
         sort_order = np.argsort(merged_spans[:, 0])
@@ -377,7 +375,7 @@ def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray
         if rows.size > 0:
             batch_rows.append(rows)
             batch_cols.append(cols)
-            batch_data.append(intersections.astype(np.int64, copy=False))
+            batch_data.append(intersections.astype(np.int32, copy=False))
 
     if batch_rows:
         return (np.concatenate(batch_rows),
@@ -387,7 +385,7 @@ def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray
 
     return (np.empty(0, dtype=np.int32),
             np.empty(0, dtype=np.int32),
-            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int32),
             dict(batch_dom_lengths))
 
 

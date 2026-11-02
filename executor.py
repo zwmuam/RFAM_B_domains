@@ -26,12 +26,31 @@ import numpy as np
 
 # internal repository/package imports
 from loguru import logger
+import mpire.tqdm_utils
+import mpire.utils
 from mpire import WorkerPool
 
 # Limit BLAS/MKL/OpenBLAS threads before any numerical operations
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('MKL_NUM_THREADS', '1')
 os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+
+# Ensure mpire's progress SyncManager uses the fork-safe context ('forkserver' or 'spawn')
+# to eliminate unsafe os.fork() DeprecationWarning and child deadlocks under Python 3.12+
+_avail_start_methods = mp.get_all_start_methods()
+_safe_ctx_name = 'forkserver' if 'forkserver' in _avail_start_methods else 'spawn'
+_safe_ctx = mp.get_context(_safe_ctx_name)
+
+
+def _safe_create_sync_manager(use_dill: bool = False):
+    authkey = os.urandom(24)
+    if use_dill:
+        return mpire.context.mp_dill.managers.SyncManager(authkey=authkey, ctx=_safe_ctx)
+    return mp.managers.SyncManager(authkey=authkey, ctx=_safe_ctx)
+
+
+mpire.utils.create_sync_manager = _safe_create_sync_manager
+mpire.tqdm_utils.create_sync_manager = _safe_create_sync_manager
 
 
 # LOGGING format and configuration
