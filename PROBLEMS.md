@@ -227,7 +227,7 @@ if 'start_method' not in worker_kwargs and 'start_method' not in extra_kwargs:
   `tweaks.py:154-230`.
   `domain_finder_pecomputed.py:75-80`.
 - **Recommended Remediation:**
-  Clean up residual hardcoded paths, fix file naming conventions, and apply consistent Python type hints across all utility functions.
+  Rename `domain_finder_pecomputed.py` to `domain_finder_precomputed.py`, retaining existing test dataset paths in `__main__` for benchmarking continuity, and apply consistent Python type hints across all utility functions.
 
 ---
 
@@ -235,48 +235,250 @@ if 'start_method' not in worker_kwargs and 'start_method' not in extra_kwargs:
 
 | Problem / Vulnerability | Affected Module(s) | Impact / Risk | Proposed Resolution |
 | :--- | :--- | :--- | :--- |
-| **Multiprocessing fork deadlock on Python 3.12+** | `executor.py:143` | Child workers deadlock under multi-threaded logging/tqdm contexts; emits deprecation warnings. | Implement `start_method='forkserver'` (or `'spawn'`). |
-| **Duplicate `Parallel` & CLI abstractions** | `tweaks.py`, `executor.py` | Conflicting pool implementations, code bloat, divergent bug fixes. | Consolidate `tweaks.py` and `executor.py` into a single module. |
-| **Coordinate int64 memory bloat** | `domain_finder.py`, `clustering.py` | 2x memory inflation for alignment coordinates; cache miss penalty on large runs. | Revert coordinates to `np.int32`; reserve `np.int64` for 64-bit edge bit-shift keys. |
-| **Destructive halo filtering on structured RNA** | `clustering.py:788-796` | Deletes authentic intra-cluster family members when a single member touches foreign border; exempts small clusters. | Switch to point-specific foreign border ratios; disable halo by default for ncRNA families. |
+| **Multiprocessing fork deadlock on Python 3.12+** | `executor.py:143` | Child workers deadlock under multi-threaded logging/tqdm contexts; emits deprecation warnings. | Implement `start_method='forkserver'` (or `'spawn'`) and module-level picklable dispatch. |
+| **Duplicate `Parallel` & CLI abstractions** | `tweaks.py`, `executor.py` | Conflicting pool implementations, code bloat, divergent bug fixes. | Purge `tweaks.py`, merging all essential utilities into `executor.py`. |
+| **Coordinate int64 memory bloat** | `domain_finder.py`, `clustering.py` | 2x memory inflation for alignment coordinates; cache miss penalty on large runs. | Use `np.int32` for local sequence coordinates and spans; reserve `np.int64` strictly for 64-bit edge bit-shift keys and global accumulators. |
+| **Destructive halo filtering on structured RNA** | `clustering.py:788-796` | Deletes authentic intra-cluster family members when a single member touches foreign border; exempts small clusters. | Implement point-specific foreign border filtering as a configurable mode; default halo to inactive (`None`) for ncRNA families. |
 | **Dynamic buffer copy overhead in Stage 3** | `domain_finder.py:601-614` | Repeated `np.resize` allocations on deep alignments; risk of reference locking. | Pre-compute hit capacity directly from TSV file byte size. |
 | **Discrepancies in `PREVIOUS_UPDATE.md`** | `PREVIOUS_UPDATE.md` | False claims that `forkserver` and 1M buffer allocation were already merged. | Update project documentation to reflect actual verified code state. |
-| **Workstation paths & file naming typo** | `domain_finder_pecomputed.py` | Typo in filename; hardcoded `/media/solificatus/10 TB` paths in `__main__`. | Rename to `domain_finder_precomputed.py` and remove workstation paths. |
+| **File naming typo** | `domain_finder_pecomputed.py` | Typo in filename affects module discovery and import ergonomics. | Rename to `domain_finder_precomputed.py` while preserving benchmark test paths. |
 
 ---
 
 ## 4. Unified Step-by-Step Implementation Architecture (For Next Jules Agent Run)
 
-This section outlines the concrete, phased execution roadmap for the upcoming code revision run.
+This section provides the comprehensive, harmonized implementation blueprint to guide the next Jules agent run. It resolves all identified architectural conflicts, prioritizes worker concurrency lifecycle safety, eliminates redundant abstractions, streamlines coordinate data types, and refines density peak halo partitioning for structured non-coding RNA.
 
-### Phase 1: Concurrency, Fork-Safety & Module Consolidation
-1. **Unify `executor.py` and `tweaks.py`:**
-   - Merge `default_threads`, `logger`, `shell`, and `checkpoint` from `tweaks.py` into `executor.py` (or keep a slim `tweaks.py` that re-exports them).
-   - Remove the legacy `Parallel(WorkerPool)` class from `tweaks.py`.
-   - In `executor.py`, configure `start_method='forkserver'` on Linux platforms with fallback to `'spawn'`.
-   - Update imports across `domain_finder.py`, `aligners.py`, and `evaluation.py`.
+---
 
-### Phase 2: Memory Optimization & Coordinate Type Streamlining
-1. **Convert Physical Coordinates to `np.int32`:**
-   - In `domain_finder.py:find_domains`, set `target_dtype = [('t_seq', np.int32), ('start', np.int32), ('end', np.int32), ('dom_id', np.int32)]`.
-   - In `target_batch_processor`, cast `merged_spans` to `np.int32` and `intersections` to `np.int32`.
-   - Preserve `np.int64` solely for `keys = (u_r.astype(np.int64) << 32) | u_c.astype(np.int64)` in `clustering.py:build_similarity_matrix` and `domain_finder.py:family_finder`.
-2. **Accurate Buffer Sizing in Stage 3:**
-   - Estimate target buffer capacity using `tsv_file.stat().st_size // 70`, eliminating mid-loop `np.resize` passes.
+### Implementation Principles & Guidelines for Next Jules Run
+1. **Low Structural Complexity:** Follow clear, sequential phases with concise, to-the-point instructions and single-level sectioning. Avoid nested header clutter.
+2. **Backward Compatibility is Irrelevant:** Purge obsolete wrappers and duplicate files (`tweaks.py`). Do not retain shims or legacy aliases.
+3. **Optimized Worker Lifecycle:** Use `start_method='forkserver'` (fallback to `'spawn'`) on Linux with picklable top-level worker functions. Never use `os.fork()` from multi-threaded parent processes.
+4. **Data Type Segregation:** Use `np.int32` for all physical sequence coordinates, spans, and local domain IDs; reserve `np.int64` exclusively for packed 64-bit graph edge keys (`(u_r << 32) | u_c`) and global accumulators.
+5. **Point-Specific Halo Filtering:** Provide point-specific border filtering as an explicit configuration that evaluates boundary noise individually without decapitating authentic intra-cluster density basins. Set default halo to inactive (`None`) for ncRNA family discovery.
 
-### Phase 3: DPC Halo Refinement for Structured RNA
-1. **Refine Border Isolation in `clustering.py`:**
-   - Replace the cluster-wide maximum border threshold $\rho_b(c)$ with a direct local foreign score filter:
-     A point is labeled as halo noise if and only if:
-     $$\frac{\sum_{j \notin \text{Cluster}(i)} s(i, j)}{\sum_j s(i, j)} > \tau \quad \text{and} \quad \rho_i < \text{median}(\rho_{\text{Cluster}(i)})$$
-   - In `domain_finder.py`, default `dom_halo=1.0` and `fam_halo=1.0` (or `halo_method=None`) so that legitimate biological ncRNA domain families are not fragmented.
+---
 
-### Phase 4: Verification & Test Suite Execution
-1. Run all unit and integration tests under Python 3.12:
-   ```bash
-   python3 -m pytest tests/test_aligners.py -v
-   python3 -m pytest tests/test_domain_finder.py -v
-   python3 -m pytest tests/test_dpc_and_spurious.py -v
-   python3 -m pytest tests/test_msa_benchmark.py -v
-   ```
-2. Verify zero `DeprecationWarning` regarding `fork()` and zero memory regressions.
+### Phase 1: Process Concurrency, Fork-Safety & Utility Consolidation
+
+**Objective:** Eliminate Python 3.12+ `os.fork()` child deadlocks and deprecation warnings, purge redundant module `tweaks.py`, and consolidate execution utilities into `executor.py`.
+
+#### Step 1.1: Purge `tweaks.py` and Consolidate Utilities in `executor.py`
+- Delete `tweaks.py` entirely.
+- Move essential utilities from `tweaks.py` into `executor.py`:
+  - `default_threads` (derived from logical CPU count minus 1, minimum 1).
+  - `shell(...)`: Consolidate external command invocation into an optimized process group manager with timeout and process-reaping semantics (`os.killpg`).
+  - `checkpoint(...)`: The result caching decorator.
+- Ensure `logger` configuration in `executor.py` remains the single canonical source of logging across the entire repository.
+- Update all repository imports referencing `tweaks` (`aligners.py`, `domain_finder.py`, `evaluation.py`) to import directly from `executor`.
+
+#### Step 1.2: Picklable Worker Dispatch and Safe Start Method in `executor.py`
+- In `executor.py:Parallel`:
+  - Replace the unpicklable nested `_worker_wrapper` closure with a module-level picklable dispatch helper `_parallel_worker_dispatch`.
+  - Automatically configure `start_method='forkserver'` on Linux platforms when available, falling back to `'spawn'`. Explicitly disallow `'fork'`.
+  - Maintain dynamic chunk sizing (`chunk_size='auto'`), defaulting to 32 for generator/streaming iterables and adaptive scaling ($B = \max(1, \min(64, \lfloor N / (4 \times \text{n\_jobs}) \rfloor))$) for sized collections.
+
+```python
+# FAULTY (executor.py - nested closure and hardcoded fork causes deadlocks on Python 3.12+):
+class Parallel:
+    def __init__(self, ...):
+        ...
+        if 'start_method' not in worker_kwargs and 'start_method' not in extra_kwargs:
+            worker_kwargs['start_method'] = 'fork'
+
+        def _worker_wrapper(*args: Any) -> Any:
+            item = args[0] if len(args) == 1 else args
+            return target_fn(item, **kwargs)
+
+        with WorkerPool(n_jobs=n_jobs, **worker_kwargs) as pool:
+            self.result = pool.map(_worker_wrapper, input_list, **map_kwargs)
+
+# REVISED (executor.py - top-level picklable dispatch and forkserver start method):
+def _parallel_worker_dispatch(item: Any, target_fn: Callable, kwargs: Dict[str, Any]) -> Any:
+    """Module-level picklable target dispatcher compatible with forkserver/spawn."""
+    if isinstance(item, tuple) and not hasattr(item, "_fields"):
+        return target_fn(*item, **kwargs)
+    return target_fn(item, **kwargs)
+
+class Parallel:
+    def __init__(self, parallelized_function: Optional[Callable] = None,
+                 input_collection: Optional[Collection] = None,
+                 kwargs: Optional[Dict[str, Any]] = None,
+                 n_jobs: Optional[int] = None,
+                 chunk_size: Any = 'auto',
+                 **extra_kwargs: Any) -> None:
+        ...
+        worker_kwargs = {'shared_objects': shared_objects} if shared_objects else {}
+        if 'start_method' not in worker_kwargs and 'start_method' not in extra_kwargs:
+            avail = mp.get_all_start_methods()
+            worker_kwargs['start_method'] = 'forkserver' if 'forkserver' in avail else 'spawn'
+
+        dispatch_fn = functools.partial(_parallel_worker_dispatch,
+                                        target_fn=target_fn,
+                                        kwargs=kwargs or {})
+
+        with WorkerPool(n_jobs=n_jobs, **worker_kwargs) as pool:
+            map_func = pool.map if keep_order else pool.map_unordered
+            self.result = map_func(dispatch_fn, input_list, **map_kwargs)
+        self.results = self.result
+```
+
+---
+
+### Phase 2: Memory Streamlining & Coordinate Type Segregation
+
+**Objective:** Halve RAM consumption and eliminate CPU cache penalties by enforcing `np.int32` for physical coordinates and spans while reserving `np.int64` strictly for 64-bit edge bit-shift keys and global accumulators.
+
+#### Step 2.1: Enforce `np.int32` in Alignment Ingestion and Target Overlaps
+- In `domain_finder.py`:
+  - Redefine `target_dtype` to use 32-bit integers across all fields:
+    `target_dtype = np.dtype([('t_seq', np.int32), ('start', np.int32), ('end', np.int32), ('dom_id', np.int32)])`
+    (Reduces record size from 28 bytes to 16 bytes per hit, perfectly aligning 4 records per 64-byte CPU cache line).
+  - In `target_batch_processor`:
+    - Cast `merged_spans` to `np.int32`: `np.asarray(merged_spans_list, dtype=np.int32)`.
+    - Retain `intersections` as `np.int32`: `intersections.astype(np.int32, copy=False)`.
+    - In `batch_dom_lengths`, accumulate lengths in native Python integers or `np.int64`.
+
+#### Step 2.2: Retain `np.int64` Strictly for Composite Graph Keys
+- In `clustering.py:build_similarity_matrix` and `domain_finder.py:family_finder`:
+  - When packing 32-bit row and column indices into a single 64-bit integer:
+    `keys = (u_r.astype(np.int64) << 32) | (u_c.astype(np.int64) & 0xFFFFFFFF)`
+  - Use `np.int64` for `global_dom_lengths` and total intersection sums in `family_finder` to prevent potential sum overflow across millions of hits.
+
+#### Step 2.3: Zero-Reallocation Target Buffer Sizing from TSV File Size
+- In `domain_finder.py:find_domains` (Stage 3):
+  - Estimate initial target hit capacity directly from TSV file byte size:
+    `est_capacity = max(100_000, int(tsv_file.stat().st_size // 75))`
+  - Pre-allocate `target_buffer = np.empty(est_capacity, dtype=target_dtype)`.
+  - Maintain geometric resizing (`max(capacity * 2, write_offset + n_hits + 100_000)`) as a fallback safeguard, but note that initial sizing prevents intermediate buffer copies in >95% of standard runs.
+
+```python
+# FAULTY (domain_finder.py - int64 coordinates inflate memory, small FASTA-based estimate causes repeated reallocations):
+target_dtype = np.dtype([
+    ('t_seq', np.int64),
+    ('start', np.int64),
+    ('end', np.int64),
+    ('dom_id', np.int32)
+])
+est_capacity = max(100_000, count_fasta_queries(fasta_path) * 100)
+target_buffer = np.empty(est_capacity, dtype=target_dtype)
+
+# REVISED (domain_finder.py - int32 coordinates and TSV file-size-based buffer pre-allocation):
+target_dtype = np.dtype([
+    ('t_seq', np.int32),
+    ('start', np.int32),
+    ('end', np.int32),
+    ('dom_id', np.int32)
+])
+# BLAST-TAB records average ~75 bytes per line; pre-sizing prevents buffer reallocations
+est_capacity = max(100_000, int(tsv_file.stat().st_size // 75))
+target_buffer = np.empty(est_capacity, dtype=target_dtype)
+```
+
+---
+
+### Phase 3: DPC Algorithmic Refinement & Point-Specific Halo Filtering
+
+**Objective:** Prevent catastrophic core member pruning in structured RNA families, isolate noise strictly, and provide a configurable point-specific foreign border filter.
+
+#### Step 3.1: DPC Early Termination and Validated Lineage Propagation
+- In `clustering.py:dpc()`:
+  - If no candidate satisfies `densities > min_dens`, immediately return `{}` and `int(n)` (all points classified as noise `-1`). Never fallback to `peak_indices = sorted_by_gamma[:1]`.
+  - Vectorized parent pointer doubling along non-zero similarity edges (`(nearest_higher >= 0) & (s_max_higher > 0.0)`).
+  - Mask labels such that points unable to trace their lineage to an approved peak remain `-1`.
+
+#### Step 3.2: Configurable Point-Specific Halo Filtering Option
+- In `clustering.py:halo_filter()`:
+  - Add parameter `point_specific: bool = False`.
+  - **Cluster-wide mode (`point_specific=False`):** Evaluates traditional Rodriguez-Laio halo filtering via $\rho_b(c) = \max_{i \in \text{border}(c)} \rho_i$ and reassigns points with $\rho_i < \rho_b$ to noise.
+  - **Point-specific mode (`point_specific=True`):** Disables the cluster-wide $\rho_b(c)$ cutoff. A point $i$ is reclassified as halo noise if and only if its individual foreign border score exceeds `filter_transparency` AND its local density is below the median density of its assigned cluster:
+    $$s_{\text{foreign}}(i) \ge \tau \quad \text{and} \quad \rho_i < \text{median}_{j \in \text{Cluster}(i)}(\rho_j)$$
+  - This prevents an isolated boundary point from triggering the decapitation of authentic low-density internal family members.
+- In `domain_finder.py`:
+  - Default `halo_method=None` for domain family finding (`family_finder`), ensuring structured ncRNA families with ragged alignment boundaries are preserved intact.
+
+```python
+# FAULTY (clustering.py - cluster-wide rho_b decapitates entire intra-cluster basins):
+if border.size > 0:
+    np.maximum.at(rho_b, labels[border], rho[border])
+rho_b[sizes < halo_min_cluster_size] = -1.0
+cut[assigned] = rho[assigned] < rho_b[labels[assigned]]
+new_labels[cut] = -1
+
+# REVISED (clustering.py - configurable point-specific filtering option):
+def halo_filter(labels: np.ndarray,
+                similarity_mat: Matrix,
+                filter_transparency: float,
+                halo_min_cluster_size: int,
+                backend: str,
+                method: str,
+                rho: np.ndarray,
+                halo_k: int = DEFAULT_HALO_K,
+                point_specific: bool = False) -> np.ndarray:
+    ...
+    if point_specific:
+        # Point-specific mode: only isolate points with high foreign border scores
+        # and below-median cluster density; do NOT prune entire density basins
+        cluster_medians = np.zeros(n_clusters, dtype=np.float64)
+        for c in range(n_clusters):
+            members = labels == c
+            if np.any(members):
+                cluster_medians[c] = np.median(rho[members])
+
+        is_foreign_outlier = is_border & (rho < cluster_medians[np.maximum(labels, 0)])
+        new_labels[is_foreign_outlier] = -1
+        return new_labels
+
+    # Traditional cluster-wide mode
+    if border.size > 0:
+        np.maximum.at(rho_b, labels[border], rho[border])
+    rho_b[sizes < halo_min_cluster_size] = -1.0
+    cut[assigned] = rho[assigned] < rho_b[labels[assigned]]
+    new_labels[cut] = -1
+    return new_labels
+```
+
+---
+
+### Phase 4: Module Cleanup, Typo Correction & Pipeline Harmonization
+
+**Objective:** Clean module discovery ergonomics, fix file naming typos, preserve test dataset paths, and ensure deterministic strand resolution.
+
+#### Step 4.1: Rename File and Retain Benchmark Test Paths
+- Rename `domain_finder_pecomputed.py` to `domain_finder_precomputed.py`.
+- Keep the existing test workstation paths inside `if __name__ == '__main__':` in `domain_finder_precomputed.py` to maintain exact continuity for external benchmark evaluation runs.
+- Update documentation and references to use the correct module name.
+
+#### Step 4.2: Harmonize Strand Consensus Resolution
+- In `domain_finder.py:evaluate_clusters`:
+  - When merging multiple overlapping domain instances belonging to the same family on the same query sequence, determine consensus strand using explicit vote counting with deterministic tie-breaking.
+  - If equal counts of `+` and `-` votes occur, preserve the originating query sequence annotation strand if available, or default deterministically to `+`.
+
+---
+
+### Phase 5: Verification Protocols & Regression Benchmarks
+
+**Objective:** Provide rigorous validation commands and quantitative gates to confirm correctness, performance, and absence of regressions.
+
+#### Step 5.1: Unit & Integration Test Suite
+Execute the full pytest suite under Python 3.12:
+```bash
+python3 -m pytest tests/test_aligners.py -v
+python3 -m pytest tests/test_domain_finder.py -v
+python3 -m pytest tests/test_dpc_and_spurious.py -v
+python3 -m pytest tests/test_msa_benchmark.py -v
+```
+*Gate:* All 27+ tests must pass with **0 failures and 0 warnings**. Specifically verify that `DeprecationWarning: This process is multi-threaded, use of fork() may lead to deadlocks` is completely absent.
+
+#### Step 5.2: Concurrency & Worker Lifecycle Stress Test
+- Run `find_domains` across multiple worker thread allocations ($C \in \{1, 2, 4, 8\}$):
+  - Confirm worker processes spawn cleanly using `forkserver`/`spawn` without orphan processes or zombie workers.
+  - Verify that memory per worker core remains strictly below 200 MB.
+
+#### Step 5.3: GFF3 Formatting & Semantic Output Validation
+- Inspect generated GFF3 output files:
+  - Confirm GFF3 version header: `##gff-version 3`.
+  - Confirm 1-based closed coordinate intervals $[s_{\text{gff}}, e_{\text{gff}}] = [s + 1, e]$.
+  - Ensure all coordinate values are positive integers ($s \ge 1, e \ge s$).
+  - Confirm valid consensus strand values (`+` or `-`).
