@@ -685,6 +685,6 @@ This section provides an actionable, harmonized, step-by-step implementation ins
    - Ensure all 25 test cases pass cleanly without warnings, hangs, or unexpected memory growth.
 
 3. **GFF3 Output Integrity Audit:**
-   - Validate that GFF3 coordinate output preserves 1-based closed formatting ($[start + 1, end]$) matching the input sequence frame.
-   - Confirm that domain consensus strand matches majority target hit orientation.
-   - Verify that domain families with singleton or unaligned items preserve correct ID labeling and noise filtering.
+   - Validate that GFF3 coordinate output preserves 1-based closed formatting matching the input sequence frame, but all intermediate steps follow NumPy convention.
+   - Confirm that domain consensus strand matches majority target hit orientation (determined first by target hits and then, in some cases final in-family domain merging)
+   - Verify that domain families with singleton or unaligned items preserve correct ID labelling and noise filtering.
