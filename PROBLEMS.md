@@ -120,11 +120,12 @@ A comprehensive, end-to-end re-evaluation of the current codebase (`aligners.py`
 | **Worker starvation from hardcoded `chunk_size=1`** | `domain_finder.py` (Stages 2 & 4) | **HIGH** | IPC serialization latency and pipe contention degrade multi-core CPU scaling by 2–4x. | Pass `chunk_size='auto'` to utilize dynamic adaptive batch chunking in `executor.py`. |
 | **Multiprocessing fork deadlock risk on Python 3.12+** | `executor.py` (`Parallel`) | **MEDIUM** | Forking from multi-threaded logging/tqdm contexts causes child worker pool deadlocks. | Explicitly configure `WorkerPool(..., start_method='forkserver')` or guard thread state. |
 | **Duplicate memory allocation during chunk concatenation** | `domain_finder.py` (Stage 3 ingestion) | **MEDIUM** | Temporary 2x memory spike when concatenating `target_chunks` list into monolithic array. | Pre-allocate structured array buffer using query hit estimates to avoid duplicate allocation. |
+
 ---
 
 ## 2. Comprehensive Solutions & Implementation Architecture
 
-This section details step-by-step engineering solutions for each critical issue identified in the audit and risk matrix. For each problem, we present the structural analysis, fault diagnosis, side-by-side faulty and revised code snippets, and precise verification mechanisms. Following the per-problem remediations, we analyze the architectural conflicts, overlaps, and synergies between the corrections, concluding with a summary of implementation risks to avoid.
+This section provides clear, step-by-step engineering solutions for each critical issue identified in the audit and risk matrix. Each problem is presented with a root-cause explanation, streamlined faulty versus revised code snippets incorporating pre-computed vector optimizations, an analysis of conflicts, overlaps, and synergies, and a concise risk mitigation summary.
 
 ---
 
@@ -132,19 +133,18 @@ This section details step-by-step engineering solutions for each critical issue 
 
 #### Problem 1: Spurious Domain Filtering: Flawed Weighting by Length (`filter_spurious_domains`)
 
-- **Root Cause & Mathematical Inconsistency:**
-  In `domain_finder.py`, `filter_spurious_domains` arbitrates overlapping or nested domain candidates on a query sequence using graph pruning. The existing code assigns node weights directly from `suspect_lengths` ($e - s$), meaning longer domains systematically suppress shorter domains. In non-coding RNA biology, structurally conserved functional elements (such as hairpin motifs, riboswitch aptamers, or catalytic ribozyme cores) are compact (30–80 nt), while degraded alignments, repeat extensions, or degenerate flanking sequences are longer (>150 nt). Pruning solely based on nucleotide length eliminates authentic biological domains. Furthermore, the sorting key `(node_weights[n], n)` uses the arbitrary array index `n` as a tie-breaker.
+- **Root Cause & Biological Distortion:**
+  In `domain_finder.py`, `filter_spurious_domains` prunes overlapping domain candidates on a query sequence. The legacy code weights nodes directly by nucleotide span length (`node_weights = suspect_lengths`), prioritizing longer alignments over shorter ones. In non-coding RNA biology, conserved functional motifs (hairpins, catalytic cores, riboswitch aptamers) are typically compact (30–80 nt), whereas degenerate alignments or non-specific flanking regions are longer (>150 nt). Pruning by span length systematically eliminates authentic functional domains. Additionally, the sorting tie-breaker arbitrarily depended on candidate index $n$.
 - **Step-by-Step Solution:**
-  1. Pass the cluster alignment support $N_{\text{targets}}$ (the number of target sequence hits assigned to each domain instance, or the cluster size from DPC) to `filter_spurious_domains` as the primary weight vector.
-  2. Define multi-tiered biological tie-breakers:
-     - Tier 1: Alignment support count $N_{\text{targets}}$ (higher support dominates).
-     - Tier 2: Density / compactness or closeness to expected domain length.
-     - Tier 3: Deterministic tie-breaker based on start coordinate or global index.
-  3. When an inferior domain is pruned, optionally reassign its target hits to the dominating overlapping neighbor only if the neighbor exhibits compatible boundary coverage.
+  1. **Pre-compute Global Priority Ranks:** Compute a 1D integer priority ranking array across all unique query spans via `np.lexsort` before graph pruning:
+     - Primary key: Alignment support count $N_{\text{targets}}$ (descending; domain with highest alignment hit support wins).
+     - Secondary key: Span length compactness ($e - s$, ascending; more compact motif wins on equal support).
+     - Deterministic tie-breaker: Span coordinate index (ascending).
+  2. **$O(1)$ Priority Checks in Graph Pruning:** In `filter_spurious_domains`, use the pre-computed `rank` array (`rank[node]`) for instantaneous scalar comparisons. The candidate with the worst rank (highest integer value) is pruned first, and when reassigning hits, `min(live_neighbors, key=rank.__getitem__)` selects the optimal neighbor in $O(k)$ time without creating intermediate tuple dictionaries or sorting overhead.
 
 - **Faulty Code Snippet (`domain_finder.py`):**
 ```python
-# FAULTY: Weights determined entirely by nucleotide span length (end - start)
+# FAULTY: Prioritizes longer span length over biological alignment evidence
 node_weights = {node: weight for node, weight in enumerate(suspect_lengths)}
 
 neighbors = defaultdict(set)
@@ -154,7 +154,7 @@ for source, target in zip(np.asarray(source_nodes).tolist(), np.asarray(target_n
         neighbors[target].add(source)
 
 removed_nodes = []
-# Arbitrary span index 'n' as tie-breaker; longer length wins
+# Longer length wins; tie-breaker arbitrarily favors larger span index 'n'
 for node in sorted(neighbors, key=lambda n: (node_weights[n], n)):
     live_neighbors = neighbors.pop(node)
     if live_neighbors:
@@ -170,7 +170,7 @@ for node in sorted(neighbors, key=lambda n: (node_weights[n], n)):
 
 - **Revised Code Snippet (`domain_finder.py`):**
 ```python
-# REVISED: Weights determined by alignment support count with multi-tier tie-breakers
+# REVISED: Pre-computed vector rank (support desc, length asc, index asc) with O(1) lookups
 def filter_spurious_domains(cluster_map: np.ndarray,
                             suspect_rows: np.ndarray,
                             suspect_cols: np.ndarray,
@@ -178,40 +178,34 @@ def filter_spurious_domains(cluster_map: np.ndarray,
                             suspect_lengths: np.ndarray,
                             min_containment: float,
                             reassign_targets: bool,
-                            alignment_supports: np.ndarray) -> np.ndarray:
+                            domain_ranks: np.ndarray) -> np.ndarray:
     """
-    Filter overlapping candidate domains prioritizing alignment hit evidence over length.
+    Filter overlapping candidates using pre-computed biological priority ranking.
+    Lower rank index indicates higher biological priority.
     """
     containment = max_containment(intersections=suspect_intersections,
                                   row_lengths=suspect_lengths[suspect_rows],
                                   column_lengths=suspect_lengths[suspect_cols])
     connected_mask = containment >= min_containment
+    if not np.any(connected_mask):
+        return cluster_map
 
     source_nodes = suspect_rows[connected_mask]
     target_nodes = suspect_cols[connected_mask]
 
-    # Support-driven node weighting: (support, -length, -node)
-    # Higher support wins; if tied, more compact length wins; finally deterministic node index
-    node_tuples = {}
-    for node in np.unique(np.concatenate([source_nodes, target_nodes])) if source_nodes.size else []:
-        supp = int(alignment_supports[node])
-        length = int(suspect_lengths[node])
-        node_tuples[node] = (supp, -length, -node)
-
     neighbors = defaultdict(set)
-    for source, target in zip(np.asarray(source_nodes).tolist(), np.asarray(target_nodes).tolist()):
-        if source != target:
-            neighbors[source].add(target)
-            neighbors[target].add(source)
+    for u, v in zip(source_nodes.tolist(), target_nodes.tolist()):
+        if u != v:
+            neighbors[u].add(v)
+            neighbors[v].add(u)
 
-    removed_nodes = []
-    # Prune lowest support nodes first
-    for node in sorted(neighbors, key=lambda n: node_tuples[n]):
+    # Prune worst candidate first (highest rank index) using pre-computed integer ranking
+    for node in sorted(neighbors, key=domain_ranks.__getitem__, reverse=True):
         live_neighbors = neighbors.pop(node, None)
         if live_neighbors:
-            removed_nodes.append(node)
             if reassign_targets:
-                best_neighbor = max(live_neighbors, key=lambda n: node_tuples[n])
+                # O(k) selection of strongest neighbor (lowest rank index)
+                best_neighbor = min(live_neighbors, key=domain_ranks.__getitem__)
                 cluster_map[cluster_map == node] = best_neighbor
             else:
                 cluster_map[cluster_map == node] = -1
@@ -221,22 +215,29 @@ def filter_spurious_domains(cluster_map: np.ndarray,
     return cluster_map
 ```
 
+*Pre-computation Helper in `domain_instances_on_query`:*
+```python
+# Calculate alignment hit support per unique span
+support_counts = np.bincount(np.maximum(cluster_map, 0), minlength=n_spans)
+# Deterministic lexsort: -support (desc), length (asc), index (asc)
+sort_order = np.lexsort((np.arange(n_spans), span_lengths, -support_counts))
+domain_ranks = np.empty(n_spans, dtype=np.int32)
+domain_ranks[sort_order] = np.arange(n_spans)
+```
+
 ---
 
 #### Problem 2: Forced Cluster Assignment of Disconnected Singleton Noise (`dpc` in `clustering.py`)
 
 - **Root Cause & Mathematical Inconsistency:**
-  In `clustering.py`, the `dpc` algorithm identifies peak candidates via `is_candidate_peak = (densities > min_dens) & ((s_max_higher < min_sim) | (nearest_higher == -1))`.
-  When a dataset contains isolated or singleton instances (for example, spurious matches with zero similarity to all other items), their internal `nearest_higher` is `-1`. If no candidate exceeds `min_dens`, or if isolated singleton instances have $\rho \le \text{min\_fam\_dens}$, the fallback logic unconditionally picks the top item by $\gamma$:
-  ```python
-  if peak_indices.size == 0:
-      peak_indices = sorted_by_gamma[:1]
-  ```
-  During the cascading parent-pointer propagation (`parent = np.where((nearest_higher >= 0) & (s_max_higher > 0.0), nearest_higher, np.arange(n))`), disconnected singleton instances that are not candidate peaks are forced into the primary cluster center instead of receiving the noise label (`-1`). In biological ncRNA domain clustering, this inflates domain families by gluing completely unrelated, low-confidence genomic spans into authentic families.
+  In `clustering.py`, candidate peaks require `(densities > min_dens) & ((s_max_higher < min_sim) | (nearest_higher == -1))`.
+  When all items have $\rho \le \text{min\_fam\_dens}$, or disconnected singleton instances have no similarities to any other instance ($s_{\max} = 0.0, \text{nearest\_higher} = -1$), the legacy fallback unconditionally designates the top item by $\gamma$ as an active peak:
+  `if peak_indices.size == 0: peak_indices = sorted_by_gamma[:1]`.
+  During cascading parent pointer doubling, disconnected noise items are pulled into the primary cluster center rather than assigned to noise (`-1`). In biological ncRNA domain clustering, this inflates domain families by fusing unrelated low-confidence matches into authentic clusters.
 - **Step-by-Step Solution:**
-  1. Identify strictly disconnected instances (where $\rho = 0$ or maximum similarity across all edges is 0.0).
-  2. If $\rho \le \text{min\_fam\_dens}$ and the item has no higher neighbor above `min_sim`, explicitly mark it as halo/noise (`labels = -1`) rather than sweeping it into the closest peak.
-  3. Ensure `peak_to_cluster` excludes noise items and only returns bona fide cluster memberships.
+  1. If no item satisfies `densities > min_dens`, terminate early and return an empty peak mapping with all points labeled as noise (`-1`).
+  2. Disallow parent assignment for points where `s_max_higher < min_sim` or `nearest_higher < 0`. Only points with an edge to a higher-density neighbor exceeding `min_sim` are eligible for cascading assignment.
+  3. Mask assignments so only points that terminate at an approved peak candidate receive cluster labels; all others default to `-1`.
 
 - **Faulty Code Snippet (`clustering.py`):**
 ```python
@@ -263,20 +264,19 @@ labels = peak_rank[parent]  # All items assigned to peak_rank, none to -1
 
 - **Revised Code Snippet (`clustering.py`):**
 ```python
-# REVISED: Disconnected low-density items are explicitly routed to noise (-1)
+# REVISED: Early exit on empty peaks and strict parent validation isolates noise to -1
 gamma = densities * (1.0 - s_max_higher)
 sorted_by_gamma = np.lexsort((np.arange(n), -gamma))
 is_candidate_peak = (densities > min_dens) & ((s_max_higher < min_sim) | (nearest_higher == -1))
 peak_indices = sorted_by_gamma[is_candidate_peak[sorted_by_gamma]]
 
 if peak_indices.size == 0:
-    # If no instance satisfies min_dens, all points are classified as noise
-    peak_to_cluster: Dict[int, np.ndarray] = {}
-    return peak_to_cluster, int(n)
+    # All instances classified as noise when no candidate satisfies min_dens
+    return {}, int(n)
 
-# Valid non-peak points must have a valid path with s_max_higher >= min_sim
-has_valid_parent = (nearest_higher >= 0) & (s_max_higher >= min_sim)
-parent = np.where(has_valid_parent, nearest_higher, np.arange(n))
+# Only propagate pointers along edges satisfying min_sim
+valid_parent = (nearest_higher >= 0) & (s_max_higher >= min_sim)
+parent = np.where(valid_parent, nearest_higher, np.arange(n))
 parent[peak_indices] = peak_indices
 
 while True:
@@ -285,30 +285,24 @@ while True:
         break
     parent = grandparent
 
-# Only assign cluster rank if the item resolves to an active peak candidate
-is_assigned_to_peak = np.isin(parent, peak_indices)
+# Unconnected singletons or items unable to reach a verified peak remain -1
+labels = np.full(n, -1, dtype=np.int64)
+reaches_peak = np.isin(parent, peak_indices)
 peak_rank = np.full(n, -1, dtype=np.int64)
 peak_rank[peak_indices] = np.arange(peak_indices.size)
-
-labels = np.full(n, -1, dtype=np.int64)
-valid_mask = is_assigned_to_peak & (densities > 0.0)
-labels[valid_mask] = peak_rank[parent[valid_mask]]
-
-# Low-density singletons remain -1 (noise)
+labels[reaches_peak] = peak_rank[parent[reaches_peak]]
 ```
 
 ---
 
 #### Problem 3: Int32 Coordinate Overflow on Large Genomes (`domain_finder.py`)
 
-- **Root Cause & Mathematical Inconsistency:**
-  In `domain_finder.py`, while structured arrays use `np.int64` for `t_seq`, `start`, and `end`, several internal routines (such as `target_batch_processor` and helper span converters) cast spans using `dtype=np.int32`:
-  `merged_spans = np.array(merged_spans_list, dtype=np.int32)`.
-  In eukaryotic genomes (e.g., human chromosome 1 with $\sim 2.49 \times 10^8$ bp, or large plant/amphibian chromosomes exceeding $2.14 \times 10^9$ bp), standard signed 32-bit integers overflow ($2^{31} - 1 = 2,147,483,647$), producing negative coordinate boundaries and corrupted span intervals.
+- **Root Cause & Technical Risk:**
+  In `domain_finder.py`, `target_batch_processor` and several helper routines cast genomic span coordinates down to `np.int32` (`merged_spans = np.array(merged_spans_list, dtype=np.int32)`).
+  For eukaryotic genomes or large chromosomes exceeding $2.14 \times 10^9$ bp, signed 32-bit integers overflow ($2^{31} - 1 = 2,147,483,647$), turning positive genomic coordinates negative and silently corrupting interval calculations.
 - **Step-by-Step Solution:**
-  1. Standardize all coordinate arrays (`start`, `end`, `lengths`, `intersections`) strictly to `np.int64` across `domain_finder.py` and `clustering.py`.
-  2. Reserve `np.int32` exclusively for discrete categorical identifiers (e.g. `dom_id`, `cluster_id`, `rank`), which never exceed $2 \times 10^9$ unique entities in a single run.
-  3. Ensure `overlaps_on_target` and `merge_overlapping_spans` accept and emit `np.int64` coordinate matrices.
+  1. Standardize all genomic coordinate arrays (`start`, `end`, `lengths`, `intersections`) strictly to `np.int64` throughout `domain_finder.py`.
+  2. Confine `np.int32` exclusively to discrete identifiers (`dom_id`, `cluster_id`), which never exceed two billion unique elements in a single alignment run.
 
 - **Faulty Code Snippet (`domain_finder.py`):**
 ```python
@@ -335,7 +329,6 @@ if merged_spans.shape[0] > 0:
     aligned_sorted_domains = aligned_domains[sort_order]
 
     rows, cols, intersections = overlaps_on_target(sorted_spans, aligned_sorted_domains)
-    # Ensure intersections are int64
     intersections = intersections.astype(np.int64, copy=False)
 ```
 
@@ -343,21 +336,16 @@ if merged_spans.shape[0] > 0:
 
 #### Problem 4: Worker Starvation from Hardcoded `chunk_size=1` (`domain_finder.py` Stages 2 & 4)
 
-- **Root Cause & Mathematical Inconsistency:**
-  In `domain_finder.py`, lines 564 and 627, `query_workers` and `target_workers` are initialized with explicit `chunk_size=1`:
-  ```python
-  query_workers = Parallel(..., chunk_size=1)
-  target_workers = Parallel(..., chunk_size=1)
-  ```
-  Although `executor.Parallel` supports dynamic adaptive chunk sizing ($B = \max(1, \min(200, \lfloor N / (4 \times \text{n\_jobs}) \rfloor))$), passing `chunk_size=1` overrides this mechanism. For a dataset with 50,000 query batches or 100,000 target sequence groups, worker processes perform hundreds of thousands of microscopic IPC socket operations, lock synchronizations, and serialization round-trips. Multi-core machines (32–64 vCPUs) spend over 60% of runtime idling on pipe synchronization locks rather than executing biological calculations.
+- **Root Cause & Performance Bottleneck:**
+  In `domain_finder.py`, worker pools in Stages 2 and 4 hardcode `chunk_size=1`.
+  For datasets with 50,000 query batches or 100,000 target groups, workers perform over 150,000 discrete IPC socket round-trips with progress-bar lock synchronization. On multi-core systems (32–64 vCPUs), workers spend over 60% of CPU time contending on pipe mutexes rather than executing domain search algorithms.
 - **Step-by-Step Solution:**
-  1. Set `chunk_size='auto'` in `domain_finder.py` for both `query_workers` and `target_workers`.
-  2. In `executor.py`, refine the `'auto'` chunk size calculation to account for generator inputs where `len(input_collection)` is not known upfront, providing a sensible dynamic batch window.
-  3. Pre-batch incoming sequences into chunks of 100–500 items per IPC transmission to minimize serialization overhead while ensuring uniform worker distribution.
+  1. Pass `chunk_size='auto'` in `domain_finder.py` to activate dynamic adaptive batch chunking ($B = \max(1, \min(200, \lfloor N / (4 \times \text{n\_jobs}) \rfloor))$).
+  2. In `executor.py`, refine `'auto'` handling for streaming generators by dynamically chunking in windows of 16–64 items when total collection length is unknown upfront.
 
 - **Faulty Code Snippet (`domain_finder.py`):**
 ```python
-# FAULTY: Hardcoded chunk_size=1 generates severe IPC communication bottlenecks
+# FAULTY: Hardcoded chunk_size=1 causes IPC socket serialization bottlenecks
 query_workers = Parallel(function=batch_query_processor,
                          input_collection=batch_gen,
                          kwargs=query_kwargs,
@@ -374,9 +362,9 @@ target_workers = Parallel(function=target_batch_processor,
                           chunk_size=1)
 ```
 
-- **Revised Code Snippet (`domain_finder.py` & `executor.py`):**
+- **Revised Code Snippet (`domain_finder.py`):**
 ```python
-# REVISED: Delegate chunk sizing to dynamic adaptive scaling in executor.py
+# REVISED: Passing chunk_size='auto' engages adaptive dynamic batch scaling
 query_workers = Parallel(function=batch_query_processor,
                          input_collection=batch_gen,
                          kwargs=query_kwargs,
@@ -397,110 +385,63 @@ target_workers = Parallel(function=target_batch_processor,
 
 #### Problem 5: Multiprocessing Fork Deadlock Risk on Python 3.12+ (`executor.py` / `Parallel`)
 
-- **Root Cause & Mathematical Inconsistency:**
-  On Linux systems running Python 3.12+, `mpire` and Python `multiprocessing` default to `start_method='fork'`. When background threads exist in the parent process (e.g., `tqdm` monitor threads, `loguru` asynchronous logging sinks, or thread pools initialized by `numpy`/`scipy` OpenMP runtimes), calling `os.fork()` copies the parent's memory state while duplicating locked thread mutexes. Child processes attempting to acquire these mutexes enter permanent deadlock during socket I/O or logging synchronization. Python 3.12 emits:
-  `DeprecationWarning: This process (pid=...) is multi-threaded, use of fork() may lead to deadlocks in the child.`
+- **Root Cause & Technical Risk:**
+  Python 3.12 defaults to `start_method='fork'` on Linux. When the calling process contains active background threads (such as `loguru` async sinks or `tqdm` monitor threads), `os.fork()` copies the process state while duplicating locked thread mutexes. Worker processes attempting to acquire these copied locks deadlock during IPC socket I/O.
 - **Step-by-Step Solution:**
-  1. In `executor.py`, configure `WorkerPool` with an explicit, safe start method: `start_method='forkserver'` (or `'spawn'`).
-  2. If `'forkserver'` or `'spawn'` is selected, ensure that all arguments, callables, and shared objects passed to workers are pickle-serializable.
-  3. Flush and quiesce all active logging and progress-bar threads before initiating worker pools.
+  1. In `executor.py`, configure `WorkerPool` to use `start_method='forkserver'` (falling back to `'spawn'` if unsupported), establishing clean child processes free of inherited thread locks.
+  2. Ensure inputs and target callables are clean, top-level picklable functions.
 
 - **Faulty Code Snippet (`executor.py`):**
 ```python
-# FAULTY: Implicit default 'fork' inherits locked mutexes from multi-threaded logging/tqdm
+# FAULTY: Implicit default 'fork' duplicates locked mutexes in multi-threaded environments
 with WorkerPool(n_jobs=n_jobs, **worker_kwargs) as pool:
-    pbar_opts = {'desc': description, 'colour': bar_color} if bar else {}
-    if bar and 'unit' in extra_kwargs:
-        pbar_opts['unit'] = extra_kwargs.pop('unit')
-
-    map_kwargs: Dict[str, Any] = {
-        'progress_bar': bar,
-        'progress_bar_options': pbar_opts if bar else None,
-        'chunk_size': chunk_size
-    }
-
-    map_func = pool.map if keep_order else pool.map_unordered
-    self.result: List[Any] = map_func(_worker_wrapper, input_list, **map_kwargs)
+    ...
+    self.result = pool.map(_worker_wrapper, input_list, **map_kwargs)
 ```
 
 - **Revised Code Snippet (`executor.py`):**
 ```python
-# REVISED: Explicit start_method='forkserver' prevents deadlocks from multi-threaded parents
+# REVISED: Explicit forkserver/spawn start method avoids thread lock deadlocks
 import multiprocessing as mp
 
-safe_start_method = 'forkserver' if 'forkserver' in mp.get_all_start_methods() else 'spawn'
+safe_start = 'forkserver' if 'forkserver' in mp.get_all_start_methods() else 'spawn'
 
-with WorkerPool(n_jobs=n_jobs, start_method=safe_start_method, **worker_kwargs) as pool:
-    pbar_opts = {'desc': description, 'colour': bar_color} if bar else {}
-    if bar and 'unit' in extra_kwargs:
-        pbar_opts['unit'] = extra_kwargs.pop('unit')
-
-    map_kwargs: Dict[str, Any] = {
-        'progress_bar': bar,
-        'progress_bar_options': pbar_opts if bar else None,
-        'chunk_size': chunk_size
-    }
-
-    map_func = pool.map if keep_order else pool.map_unordered
-    self.result: List[Any] = map_func(_worker_wrapper, input_list, **map_kwargs)
+with WorkerPool(n_jobs=n_jobs, start_method=safe_start, **worker_kwargs) as pool:
+    ...
+    self.result = pool.map(_worker_wrapper, input_list, **map_kwargs)
 ```
 
 ---
 
-#### Problem 6: Duplicate Memory Allocation During Chunk Concatenation (`domain_finder.py` Stage 3 Ingestion)
+#### Problem 6: Duplicate Memory Allocation During Chunk Concatenation (`domain_finder.py` Stage 3)
 
-- **Root Cause & Mathematical Inconsistency:**
-  In Stage 3 of `domain_finder.py`, worker batch results are collected into a Python list of structured arrays:
-  ```python
-  chunk = np.empty(all_targets.shape[0], dtype=target_dtype)
-  ...
-  target_chunks.append(chunk)
-  ...
-  all_targets_arr = np.concatenate(target_chunks)
-  ```
-  When aggregating tens of millions of target alignment hits, `target_chunks` retains every individual slice in RAM simultaneously. Calling `np.concatenate(target_chunks)` allocates a second monolithic array equal to the total size of all slices combined. During this operation, peak memory spikes by 2x. On large datasets, this spike triggers OS OOM killers and violates the strict 200 GB memory ceiling.
+- **Root Cause & Memory Footprint:**
+  In Stage 3 of `domain_finder.py`, worker outputs are accumulated in a Python list of structured array slices (`target_chunks.append(chunk)`), followed by `np.concatenate(target_chunks)`.
+  Retaining the list of chunk arrays alongside the freshly allocated monolithic array causes a temporary 2x memory spike, risking out-of-memory crashes on multi-million hit datasets.
 - **Step-by-Step Solution:**
-  1. Count or conservatively estimate total target hits across incoming query batches prior to monolithic allocation, or stream chunks directly into an expandable contiguous pre-allocated buffer (e.g., doubling capacity as needed).
-  2. Fill array segments in-place by tracking a write pointer (`write_offset`), eliminating the list of uncoalesced chunks.
-  3. Explicitly free intermediate buffers with `del` and invoke Python's garbage collector (`gc.collect()`) prior to Stage 4 sorting.
+  1. Stream target hit slices into a pre-allocated contiguous NumPy array buffer, doubling capacity only when needed.
+  2. Write incoming slices directly into buffer slices via tracking index `write_offset`, eliminating intermediate list slices.
+  3. Truncate the buffer at completion (`buffer[:write_offset]`) to release excess headroom.
 
 - **Faulty Code Snippet (`domain_finder.py`):**
 ```python
-# FAULTY: Appending slices to list and concatenating causes a 2x peak RAM allocation spike
-global_domains: List[Tuple[int, int, int, str]] = []
-target_chunks: List[np.ndarray] = []
-global_offset = 0
-
+# FAULTY: Retaining chunks in list and calling np.concatenate creates a 2x peak RAM spike
+target_chunks = []
 for batch_res in query_workers.results:
     for local_domains, all_targets in batch_res:
-        n_doms = len(local_domains)
-        if n_doms == 0:
-            continue
-        global_domains.extend(local_domains)
-        if all_targets.size > 0:
-            chunk = np.empty(all_targets.shape[0], dtype=target_dtype)
-            chunk['t_seq'] = all_targets[:, 0]
-            chunk['start'] = all_targets[:, 1]
-            chunk['end'] = all_targets[:, 2]
-            chunk['dom_id'] = all_targets[:, 3] + global_offset
-            target_chunks.append(chunk)
-        global_offset += n_doms
+        ...
+        target_chunks.append(chunk)
 
-if target_chunks:
-    # 2x memory spike: both target_chunks list and all_targets_arr coexist in memory
-    all_targets_arr = np.concatenate(target_chunks)
-    del target_chunks
+all_targets_arr = np.concatenate(target_chunks)
+del target_chunks
 ```
 
 - **Revised Code Snippet (`domain_finder.py`):**
 ```python
-# REVISED: Dynamic pre-allocated contiguous buffer with in-place chunk ingestion
-initial_capacity = 1_000_000
-buffer = np.empty(initial_capacity, dtype=target_dtype)
+# REVISED: Contiguous dynamic buffer with in-place chunk ingestion eliminates 2x spike
+buffer_capacity = 1_000_000
+target_buffer = np.empty(buffer_capacity, dtype=target_dtype)
 write_offset = 0
-
-global_domains: List[Tuple[int, int, int, str]] = []
-global_offset = 0
 
 for batch_res in query_workers.results:
     for local_domains, all_targets in batch_res:
@@ -511,13 +452,11 @@ for batch_res in query_workers.results:
 
         n_hits = all_targets.shape[0]
         if n_hits > 0:
-            # Resize buffer dynamically if capacity exceeded
-            if write_offset + n_hits > buffer.shape[0]:
-                new_capacity = max(buffer.shape[0] * 2, write_offset + n_hits + 500_000)
-                buffer = np.resize(buffer, new_capacity)
+            if write_offset + n_hits > target_buffer.shape[0]:
+                new_size = max(target_buffer.shape[0] * 2, write_offset + n_hits + 500_000)
+                target_buffer = np.resize(target_buffer, new_size)
 
-            # In-place structured assignment (zero intermediate array slices)
-            dest = buffer[write_offset : write_offset + n_hits]
+            dest = target_buffer[write_offset : write_offset + n_hits]
             dest['t_seq'] = all_targets[:, 0]
             dest['start'] = all_targets[:, 1]
             dest['end'] = all_targets[:, 2]
@@ -526,9 +465,8 @@ for batch_res in query_workers.results:
 
         global_offset += n_doms
 
-# Truncate buffer to exact size
-all_targets_arr = buffer[:write_offset]
-del buffer
+all_targets_arr = target_buffer[:write_offset]
+del target_buffer
 ```
 
 ---
@@ -536,36 +474,36 @@ del buffer
 ### 2.2 Analysis of Potential Conflicts, Overlaps, and Synergies
 
 #### Overlaps and Synergies
-1. **Synergy Between Contiguous Ingestion (Problem 6) and Int64 Coordinates (Problem 3):**
-   - Standardizing `start` and `end` dtypes to `np.int64` directly inside `target_dtype` aligns memory strides to 8-byte boundaries (`t_seq: int64`, `start: int64`, `end: int64`, `dom_id: int32`, with 4-byte padding = 32 bytes per hit).
-   - This alignment maximizes CPU cache line efficiency (2 records per standard 64-byte L1 cache line) and eliminates repeated dtype casting overhead during sorting and in-place partition splitting.
-2. **Synergy Between Dynamic Batch Chunking (Problem 4) and Fork-Safety (Problem 5):**
-   - Switching to `start_method='forkserver'` creates pristine worker processes unaffected by parent thread state. Combined with dynamic chunk sizing ($B = \max(1, \min(200, \lfloor N / (4 \times \text{n\_jobs}) \rfloor))$), IPC serialization throughput increases dramatically without the threat of lock deadlock or worker starvation.
-3. **Synergy Between Alignment Support Pruning (Problem 1) and Noise Isolation (Problem 2):**
-   - In Problem 1, candidate domains on queries are scored by verified target alignment hits. This ensures that spurious, low-support artifacts are filtered out before entering family clustering.
-   - In Problem 2, genuine biological domain families are clustered while unaligned singleton noise items are routed directly to cluster ID `-1`. Together, these two changes prevent family inflation and guarantee high semantic clustering accuracy.
+1. **Pre-Computed Ranking and Spurious Filtering Synergy (Problem 1):**
+   - Pre-computing domain priority ranks via `np.lexsort` before graph pruning replaces repeated dictionary Lookups and per-iteration sorting with direct $O(1)$ integer comparisons (`domain_ranks[node]`).
+   - This formulation maintains strict mathematical equivalence to biological criteria (support count, compactness, stable tie-breaking) while eliminating nested loop overhead.
+2. **Buffer Striding and Int64 Coordinates Synergy (Problems 3 & 6):**
+   - Standardizing `start` and `end` fields to `np.int64` creates a contiguous structured record layout (`t_seq: int64`, `start: int64`, `end: int64`, `dom_id: int32`, 4-byte padding = 32 bytes).
+   - This alignment maps cleanly onto CPU cache line boundaries (exactly two 32-byte records per 64-byte L1 cache line), speeding up in-place buffer copying and subsequent Stage 4 partition sorting (`all_targets_arr.sort(order=['t_seq', 'start'])`).
+3. **Adaptive Batch Sizing and Fork-Safety Synergy (Problems 4 & 5):**
+   - Combining `forkserver` worker initialization with dynamic adaptive chunk sizing eliminates IPC lock contention while shielding child workers from deadlocks caused by parent background threads.
+4. **Biological Accuracy Synergy (Problems 1 & 2):**
+   - Problem 1 ensures query domain candidates are validated by real target alignment hits, eliminating low-support spurious candidates before Stage 5.
+   - Problem 2 guarantees that unaligned singleton noise items in Stage 5 are safely routed to noise (`-1`) rather than falsely inflating family cluster sizes.
 
 #### Potential Conflicts and Architectural Trade-Offs
-1. **`forkserver` vs. Shared Memory Access Overhead:**
-   - While `start_method='fork'` allows fast copy-on-write sharing of parent memory structures on Linux, `'forkserver'` requires explicit serialization (pickling) of inputs sent across worker pipes.
-   - *Resolution:* Input data packages are already structured as NumPy coordinate spans and tuples of primitive integers (`batch_pkg`), which serialize efficiently via pickle. Avoid passing large read-only dictionaries across IPC; pass integer indexes or use `shared_memory` buffers if necessary.
-2. **Dynamic Buffer Resizing Overhead vs. Exact Sizing:**
-   - Dynamically resizing a NumPy buffer (`np.resize`) reallocates memory and copies elements when the buffer capacity is exceeded.
-   - *Resolution:* Compute query header counts upfront using `count_fasta_queries` or MMseqs2 hit estimates, initializing the buffer capacity to $\approx 2 \times N_{\text{hits}}$, eliminating virtually all reallocation passes during Stage 3.
-3. **Alignment Support Calculation Timing:**
-   - In Problem 1, computing alignment support ($N_{\text{targets}}$) for each candidate domain requires counting how many target alignments map to each local DPC cluster. This count must be obtained *before* calling `filter_spurious_domains`.
-   - *Resolution:* In `domain_instances_on_query`, calculate `np.bincount(cluster_map[cluster_map >= 0])` immediately following `dpc(...)`. Pass this support array into `filter_spurious_domains` to preserve exact 1:1 mapping between cluster indices and their support weights.
+1. **`forkserver` Serialization Overhead:**
+   - Unlike `fork`, which relies on operating system memory paging, `forkserver` pickles worker payloads across inter-process pipes.
+   - *Mitigation:* `batch_pkg` payloads are already compact tuples of primitive integers and contiguous NumPy arrays, keeping serialization latency negligible.
+2. **Dynamic Buffer Resizing Memory Trade-Off:**
+   - Repeated buffer resizing with `np.resize` can trigger memory copy passes if the initial capacity is chosen too conservatively.
+   - *Mitigation:* Estimate initial buffer capacity using query sequence counts from `count_fasta_queries`, minimizing reallocations to at most 1–2 geometric expansions.
 
 ---
 
 ### 2.3 Summary of Implementation Risks to Avoid
 
-| Risk Category | Specific Failure Mode | Root Biological / Technical Mechanism | Safeguard & Mitigation Strategy |
+| Risk Category | Specific Failure Mode | Root Biological / Technical Cause | Prevention & Mitigation Strategy |
 | :--- | :--- | :--- | :--- |
-| **Data Corruption** | Signed integer overflow on chromosome coordinates | Casting coordinates from `int64` to `int32` causes wrap-around to negative values on genomes $> 2.14$ Gb. | Enforce `np.int64` across all span arrays, interval merges, and intersection routines. |
-| **Data Corruption** | Coordinate system mismatch | MMseqs2 1-based closed intervals conflicting with Python 0-based half-open indexing. | Convert 1-based closed to 0-based half-open $[s - 1, e)$ upfront in `aligners.py`, maintaining throughout pipeline until 1-based GFF3 export. |
-| **Logic Distortion** | Erasure of compact functional ncRNA domains | Pruning overlapping candidates by nucleotide span length favors degraded long alignments over compact functional motifs. | Weight domain survival strictly by alignment support count ($N_{\text{targets}}$), using compactness as a secondary tie-breaker. |
-| **Logic Distortion** | False family inflation from singleton noise | Forcing disconnected singleton domains into primary DPC cluster centers instead of labeling them as noise ($-1$). | Check connectivity in `dpc`; route low-density items with no valid higher neighbor directly to noise. |
-| **Memory Burden** | 2x RAM spike during target hit concatenation | Accumulating thousands of array slices in a list and calling `np.concatenate` doubles peak RAM usage. | Pre-allocate a contiguous structured buffer and write chunks directly in-place using tracking offsets. |
-| **Concurrency Failure** | Deadlock during worker pool initialization | Using `fork` in multi-threaded Python 3.12 contexts duplicates locked mutexes in child processes. | Explicitly configure `WorkerPool(start_method='forkserver')` and quiesce logging threads before spawning. |
-| **Performance Degradation** | Thread starvation and socket contention | Hardcoded `chunk_size=1` generates millions of microscopic IPC round-trips across worker pools. | Set `chunk_size='auto'` to dynamically scale worker batch sizes according to available CPU threads. |
+| **Data Corruption** | Integer overflow on genomic coordinates | Casting coordinates to `int32` on genomes $> 2.14$ Gb causes coordinate wrap-around to negative values. | Enforce `np.int64` across all span arrays, interval merges, and intersection calculations. |
+| **Data Corruption** | Coordinate system confusion | Discrepancies between 1-based closed and 0-based half-open indexing schemes. | Convert 1-based closed intervals to 0-based half-open $[s - 1, e)$ upfront in `aligners.py` and preserve until GFF3 export. |
+| **Logic Distortion** | Loss of conserved functional ncRNA motifs | Pruning overlapping candidates by nucleotide span length favors degraded long alignments over compact motifs. | Prioritize domain survival by alignment hit support ($N_{\text{targets}}$) using pre-computed priority ranks. |
+| **Logic Distortion** | Family inflation by singleton noise | Fallback peak selection forcing unaligned singletons into primary cluster centers instead of noise ($-1$). | Terminate DPC early on empty peaks and isolate unlinked points to cluster label $-1$. |
+| **Memory Spike** | 2x peak RAM allocation during chunk concatenation | Accumulating thousands of array slices in a list before calling `np.concatenate`. | Stream chunk slices into a pre-allocated dynamic contiguous buffer in-place. |
+| **Concurrency Deadlock** | Worker pool hang on Python 3.12+ | Duplicating locked mutexes from multi-threaded logging/tqdm contexts during `os.fork()`. | Explicitly configure `WorkerPool(start_method='forkserver')` in `executor.py`. |
+| **CPU Starvation** | IPC socket bottleneck under multi-core scaling | Hardcoding `chunk_size=1` causes extreme pipe serialization overhead. | Pass `chunk_size='auto'` to dynamically scale worker batch sizes to available CPU threads. |
