@@ -867,11 +867,14 @@ def dpc(rows: np.ndarray,
     sorted_by_gamma = np.lexsort((np.arange(n), -gamma))
     is_candidate_peak = (densities > min_dens) & ((s_max_higher < min_sim) | (nearest_higher == -1))
     peak_indices = sorted_by_gamma[is_candidate_peak[sorted_by_gamma]]
-    if peak_indices.size == 0:
-        peak_indices = sorted_by_gamma[:1]
 
-    # Cascading assignment via vectorised pointer doubling
-    parent = np.where((nearest_higher >= 0) & (s_max_higher > 0.0), nearest_higher, np.arange(n))
+    # Early exit: if no candidate satisfies min_dens, classify all instances as noise
+    if peak_indices.size == 0:
+        return {}, int(n)
+
+    # Cascading assignment via vectorised pointer doubling along non-zero similarity edges
+    valid_parent = (nearest_higher >= 0) & (s_max_higher > 0.0)
+    parent = np.where(valid_parent, nearest_higher, np.arange(n))
     parent[peak_indices] = peak_indices
     while True:
         grandparent = parent[parent]
@@ -879,9 +882,12 @@ def dpc(rows: np.ndarray,
             break
         parent = grandparent
 
+    # Points reaching an approved peak receive cluster labels; disconnected noise remains -1
+    labels = np.full(n, -1, dtype=np.int64)
+    reaches_peak = np.isin(parent, peak_indices)
     peak_rank = np.full(n, -1, dtype=np.int64)
     peak_rank[peak_indices] = np.arange(peak_indices.size)
-    labels = peak_rank[parent]
+    labels[reaches_peak] = peak_rank[parent[reaches_peak]]
 
     # Halo refinement
     if halo_method is not None and str(halo_method).lower() != 'none' and filter_transparency < 1.0:

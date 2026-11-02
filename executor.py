@@ -7,6 +7,7 @@ execution, external process invocation, and loguru warning redirection.
 """
 
 # built-ins
+import multiprocessing as mp
 import os
 import subprocess
 import sys
@@ -131,14 +132,18 @@ class Parallel:
             total_items = len(input_list)
             if chunk_size == 'auto':
                 if total_items > 0 and n_jobs > 0:
-                    chunk_size = max(1, min(200, total_items // (n_jobs * 4)))
+                    chunk_size = max(1, min(64, total_items // (n_jobs * 4)))
                 else:
                     chunk_size = 1
         else:
             if chunk_size == 'auto':
-                chunk_size = 1
+                chunk_size = 32
 
         worker_kwargs = {'shared_objects': shared_objects} if shared_objects else {}
+
+        # Default start method for WorkerPool on Linux
+        if 'start_method' not in worker_kwargs and 'start_method' not in extra_kwargs:
+            worker_kwargs['start_method'] = 'fork'
 
         def _worker_wrapper(*args: Any) -> Any:
             item = args[0] if len(args) == 1 else args
