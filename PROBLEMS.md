@@ -1,11 +1,5 @@
 # CODEBASE AUDIT & TECHNICAL PROBLEM ANALYSIS: DOMAIN FINDING PIPELINE
 
-This document provides a comprehensive, rigorous technical evaluation of the domain-finding pipeline (`domain_finder.py`, `domain_finder_pecomputed.py`) and its supporting modules (`aligners.py`, `clustering.py`, `executor.py`, `tweaks.py`). It examines coordinate system transformations, mathematical and numerical consistency, biological validity in the context of structured ncRNA, algorithmic bottlenecks, memory scaling, and architectural risks. It also presents a critical audit of claims made in `PREVIOUS_UPDATE.md` to identify discrepancies between reported updates and actual code state.
-
----
-
-## 1. Executive Summary & Architectural Overview
-
 The domain-finding pipeline identifies conserved non-coding RNA (ncRNA) domain instances and family clusters from sequence alignments through a multi-stage architecture:
 1. **TSV Streaming & Coordinate Ingestion (`aligners.py`)**: Streams BLAST-TAB formatted alignment hits from MMseqs2 or RiboSeek, parses coordinates into half-open intervals, maps sequence identifiers to integers via `SequenceRegistry`, and groups records by query sequence.
 2. **Query Domain Instance Discovery (`domain_finder.py:domain_instances_on_query`)**: Performs Density Peak Clustering (DPC) on query alignment spans using Jaccard similarity of 1D coordinate intervals (`clustering.py`), prunes spurious overlapping candidate domains using biological alignment support, assigns consensus strands, and supplements self-hits.
