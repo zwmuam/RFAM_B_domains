@@ -11,7 +11,7 @@ from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from tqdm import tqdm
 
 from annotations import NucleotideSeq
-from tweaks import logger
+from executor import logger
 
 u_prefix = 'UNL_'  # prefix for generated IDs of unlabeled regions (e.g., UNL_1, UNL_2, etc.)
 
