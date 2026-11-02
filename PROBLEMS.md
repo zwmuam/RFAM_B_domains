@@ -69,7 +69,7 @@ if 'start_method' not in worker_kwargs and 'start_method' not in extra_kwargs:
   `tweaks.py:106-151` (`def shell(...)`).
   `executor.py:173-356` (`def run_external(...)`).
 - **Recommended Remediation:**
-  Streamline and merge `executor.py` and `tweaks.py` into a unified execution and system utility module. Deprecate the inheritance-based `Parallel` in `tweaks.py` in favor of the battle-tested composition wrapper in `executor.py`. Migrate `default_threads`, `logger`, `checkpoint`, and `shell` (or consolidate with `run_external`) into a single canonical module, eliminating duplicate logging hooks and parallel pool definitions.
+  Streamline and merge `executor.py` and `tweaks.py` into a unified execution and system utility module. Deprecate the inheritance-based `Parallel` in `tweaks.py` in favor of the battle-tested composition wrapper in `executor.py`. Migrate `default_threads`, `logger`, `checkpoint`, and `shell` (consolidate the with `run_external` and into one optimised versatile solutions for shell comand handling) into a single canonical module, eliminating duplicate logging hooks and parallel pool definitions.
 
 ---
 
