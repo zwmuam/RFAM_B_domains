@@ -435,7 +435,7 @@ target_buffer = np.empty(est_capacity, dtype=target_dtype)
     $$s_{\text{foreign}}(i) \ge \tau \quad \text{and} \quad \rho_i < \text{median}_{j \in \text{Cluster}(i)}(\rho_j)$$
   - **Cluster-wide mode (`point_specific=False`):** Evaluates traditional Rodriguez-Laio halo filtering via $\rho_b(c) = \max_{i \in \text{border}(c)} \rho_i$ and reassigns points with $\rho_i < \rho_b(c)$ to noise ($-1$).
 - In `domain_finder.py`:
-  - Default `halo_method=None` for domain family finding (`family_finder`), ensuring structured ncRNA families with ragged alignment boundaries are preserved intact.
+  - Default `halo_method=similarity_weighted` for domain family finding (`family_finder`), ensuring structured ncRNA families with ragged alignment boundaries are preserved intact.
 
 ```python
 # FAULTY (clustering.py - cluster-wide rho_b decapitates entire intra-cluster basins, lacks strict noise masking):
