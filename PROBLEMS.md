@@ -133,7 +133,7 @@ target_dtype = np.dtype([
   1. Provide a simplified point-specific halo filtering mode (`point_specific=True`): a point $i$ is reclassified as halo noise if and only if it is an assigned member (`labels[i] >= 0`), belongs to an eligible cluster, its foreign border score exceeds `filter_transparency`, and its density is below its cluster median:
      $$s_{\text{foreign}}(i) \ge \tau \quad \text{and} \quad \rho_i < \text{median}_{j \in \text{Cluster}(i)}(\rho_j)$$
   2. Ensure noise points ($-1$) are strictly masked out from cluster property computations (`labels >= 0`).
-  3. Default `halo_method=None` for ncRNA family discovery (`family_finder`).
+  3. Default `halo_method='similarity_weighted'` for ncRNA family discovery (`family_finder`).
 
 ```python
 # FAULTY (clustering.py:788-796 - cluster-wide rho_b decapitates entire intra-cluster basins):
@@ -280,7 +280,7 @@ target_buffer = np.empty(est_capacity, dtype=target_dtype)
 | **Multiprocessing fork deadlock on Python 3.12+** | `executor.py:143` | Child workers deadlock under multi-threaded logging/tqdm contexts; emits deprecation warnings. | Implement `start_method='forkserver'` (or `'spawn'`) and module-level picklable dispatcher `_parallel_worker_dispatch`. |
 | **Duplicate `Parallel` & CLI abstractions** | `tweaks.py`, `executor.py` | Conflicting pool implementations, code bloat, divergent bug fixes. | Purge `tweaks.py`, consolidating essential utilities into `executor.py`. |
 | **Coordinate int64 memory bloat** | `domain_finder.py`, `clustering.py` | 2x memory inflation for alignment coordinates; cache miss penalty on large runs. | Use `np.int32` for physical coordinates and spans; reserve `np.int64` strictly for 64-bit edge bit-shift keys and global accumulators. |
-| **Destructive halo filtering on structured RNA** | `clustering.py:788-796` | Deletes authentic intra-cluster family members; fails to cleanly isolate noise ($-1$). | Implement point-specific foreign border filtering as a configurable mode; ensure noise ($-1$) is strictly excluded from cluster metrics; default halo to `None` for ncRNA families. |
+| **Destructive halo filtering on structured RNA** | `clustering.py:788-796` | Deletes authentic intra-cluster family members; fails to cleanly isolate noise ($-1$). | Implement point-specific foreign border filtering as a configurable mode; ensure noise ($-1$) is strictly excluded from cluster metrics; default halo to `similarity_weighted` for ncRNA families. |
 | **Dynamic buffer copy overhead in Stage 3** | `domain_finder.py:601-614` | Repeated `np.resize` allocations on deep alignments; risk of memory spikes. | Pre-allocate hit capacity directly from TSV file byte size ($\approx \text{file\_size} / 75$). |
 | **Discrepancies in `PREVIOUS_UPDATE.md`** | `PREVIOUS_UPDATE.md` | False claims that `forkserver` and 1M buffer allocation were already merged. | Document verified code state and implement genuine fixes. |
 | **File naming typo** | `domain_finder_pecomputed.py` | Typo in filename affects module discovery and import ergonomics. | Rename to `domain_finder_precomputed.py` while preserving benchmark test paths. |
