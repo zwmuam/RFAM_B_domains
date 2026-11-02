@@ -4,44 +4,58 @@
 
 ## 1. Problem Analysis
 
-**Problem 1: Unsafe Fork Trigger in MPIRE Progress Bar SyncManager on Python 3.12+ (`executor.py`)**
+**Problem 1: Unsafe Fork in MPIRE Progress Bar SyncManager on Python 3.12+ (`executor.py`)**
 
-- **Module / Component:** `executor.py` (`Parallel.__init__`), `mpire` dependency interaction
+- **Module / Component:** `executor.py` (`Parallel.__init__`), `mpire.tqdm_utils` interaction
 - **Severity / Category:** CRITICAL | Concurrency / Subprocess Deadlock / Deprecation Warning
 - **Detailed Bioinformatic & Technical Analysis:**
-  The repository aims to eliminate unsafe `os.fork()` on Linux under Python 3.12+ by passing `start_method='forkserver'` (or `'spawn'`) to `mpire.WorkerPool`. However, when `bar=True` is enabled (the default across `domain_finder.py`), MPIRE invokes `TqdmManager.start_manager()`.
-  Under the hood, `TqdmManager` creates a standard Python `multiprocessing.managers.SyncManager`. In Python's standard library, `SyncManager` defaults to the global default multiprocessing context, which remains `'fork'` on Linux unless explicitly configured.
-  Consequently, executing `Parallel(..., bar=True)` triggers:
+  The repository aims to eliminate unsafe `os.fork()` on Linux under Python 3.12+ by passing `start_method='forkserver'` (or `'spawn'`) to `mpire.WorkerPool`. However, when progress monitoring is enabled (`bar=True`), MPIRE initializes its progress synchronization manager via `TqdmManager.start_manager()`, which calls `mpire.utils.create_sync_manager()`.
+  In standard MPIRE, `create_sync_manager()` instantiates `SyncManager(authkey=authkey)` without specifying an execution context (`ctx=None`). In Python's standard library `multiprocessing.managers`, `SyncManager` falls back to `multiprocessing.get_context()`, which defaults to `'fork'` on Linux.
+  Consequently, launching `Parallel(..., bar=True)` from a multi-threaded parent process (such as runners executing background I/O, logging, or test runners) triggers:
   `DeprecationWarning: This process (pid=...) is multi-threaded, use of fork() may lead to deadlocks in the child. self.pid = os.fork()`
-  When a multi-threaded parent process (such as a runner executing background I/O, Loguru logging, or Pytest runners) invokes `os.fork()`, mutex locks in C-extensions and file descriptors can be cloned in an acquired state, leading to child process deadlocks.
+  When multi-threaded processes invoke `os.fork()`, mutex locks and open file descriptors can be cloned in an acquired or inconsistent state, introducing severe risks of child process deadlocks.
 - **Evidence in Code:**
-  Executing `pytest` triggers 2 `DeprecationWarning`s originating from `multiprocessing/popen_fork.py:66` when `SyncManager` is started during Stage 2 and Stage 4 progress tracking.
+  Running `python3 -m pytest tests/test_domain_finder.py` emits 2 `DeprecationWarning`s originating from `multiprocessing/popen_fork.py:66` during Stage 2 and Stage 4 progress tracking.
 - **Recommended Solution:**
-  Explicitly initialize multiprocessing contexts using `mp.get_context('forkserver')` and ensure `mpire.tqdm_utils.SyncManager` or the multiprocessing manager uses the safe non-fork context, or inject a forkserver-bound manager before invoking MPIRE mapping.
+  Ensure that any `SyncManager` created for progress bar synchronization uses a fork-safe context (`forkserver` or `spawn`). In `executor.py`, configure or monkey-patch `mpire.utils.create_sync_manager` and `mpire.tqdm_utils.create_sync_manager` to pass `ctx=mp.get_context(ctx_name)` so that `SyncManager` never falls back to `os.fork()`.
 
 ```python
-# FAULTY (Current executor.py:272 - WorkerPool receives forkserver, but internal SyncManager still forks):
-worker_kwargs['start_method'] = 'forkserver' if 'forkserver' in avail else 'spawn'
+# FAULTY (mpire defaults SyncManager to global context, triggering fork() on Linux):
+# mpire/utils.py:
+def create_sync_manager(use_dill: bool) -> SyncManager:
+    authkey = os.urandom(24)
+    return mp_dill.managers.SyncManager(authkey=authkey) if use_dill else SyncManager(authkey=authkey)
 
-# REVISED (Explicitly configure manager context to forkserver/spawn to prevent SyncManager forks):
+# REVISED (executor.py: Ensure mpire's progress SyncManager uses the fork-safe context):
 import multiprocessing as mp
-ctx_name = 'forkserver' if 'forkserver' in mp.get_all_start_methods() else 'spawn'
-worker_kwargs['start_method'] = ctx_name
-if hasattr(mp, 'set_forkserver_preload'):
-    try:
-        mp.set_forkserver_preload(['numpy', 'scipy', 'mpire'])
-    except Exception:
-        pass
+import mpire.utils
+import mpire.tqdm_utils
+
+avail = mp.get_all_start_methods()
+safe_ctx_name = 'forkserver' if 'forkserver' in avail else 'spawn'
+safe_ctx = mp.get_context(safe_ctx_name)
+
+_orig_create_sync_manager = mpire.utils.create_sync_manager
+
+def _safe_create_sync_manager(use_dill: bool):
+    import os
+    authkey = os.urandom(24)
+    if use_dill:
+        return mpire.context.mp_dill.managers.SyncManager(authkey=authkey, ctx=safe_ctx)
+    return mp.managers.SyncManager(authkey=authkey, ctx=safe_ctx)
+
+mpire.utils.create_sync_manager = _safe_create_sync_manager
+mpire.tqdm_utils.create_sync_manager = _safe_create_sync_manager
 ```
 
 ---
 
-**Problem 2: Bypassing Minimum Density and Noise Classification for Single or Disjoint Spans (`domain_finder.py`)**
+**Problem 2: Bypassing Minimum Density and Noise Classification for Solitary or Disjoint Spans (`domain_finder.py`)**
 
 - **Module / Component:** `domain_finder.py` (`domain_instances_on_query`)
 - **Severity / Category:** HIGH | Mathematical Inconsistency / Biological Edge Case
 - **Detailed Bioinformatic & Technical Analysis:**
-  In `domain_finder.py:domain_instances_on_query`, sequence alignment spans on a query sequence are grouped into unique spans with hit count weights:
+  In `domain_finder.py:domain_instances_on_query`, sequence alignment spans on a query sequence are deduplicated into unique spans with hit count weights:
   ```python
   unique_query_spans, cluster_map, weights = np.unique(sorted_query_spans, axis=0, return_inverse=True, return_counts=True)
   ```
@@ -50,19 +64,19 @@ if hasattr(mp, 'set_forkserver_preload'):
   cluster_map[:] = 0
   peak_indices = np.array([0], dtype=np.int32)
   ```
-  Similarly, if `n_spans > 1` but `rows.size == 0` (no two spans share any overlapping nucleotides):
+  If `n_spans > 1` but `rows.size == 0` (no two spans share any overlapping nucleotides):
   ```python
   peak_indices = np.arange(n_spans, dtype=np.int32)
   ```
-  In both scenarios, Density Peak Clustering (`dpc`) is entirely bypassed. This creates a severe biological discrepancy:
-  If a user configures `min_dom_dens = 5.0` (requiring at least 5 supporting alignment hits to validate a conserved biological domain candidate), a solitary span supported by only 1 hit (`weights[0] == 1`) bypasses `dpc` and is automatically accepted as a validated domain instance! Solitary, low-evidence noise hits thus escape biological density thresholds.
+  In both scenarios, Density Peak Clustering (`dpc`) is entirely bypassed without validating candidate hit weights against `min_dom_dens`.
+  This creates an acute biological inconsistency: if a user sets `min_dom_dens = 5.0` (requiring at least 5 supporting alignment hits to validate a conserved biological domain candidate), a solitary span supported by only 1 hit (`weights[0] == 1`) bypasses density filtering and is unconditionally accepted as a validated domain instance. Solitary, low-confidence noise hits thus escape biological density thresholds.
 - **Evidence in Code:**
-  `domain_finder.py:171-177`: Unconditional assignment of `cluster_map[:] = 0` and `peak_indices = np.arange(n_spans)` without checking whether `weights >= min_dom_dens`.
+  `domain_finder.py:165-175`: Unconditional assignment of `cluster_map[:] = 0` and `peak_indices = np.arange(n_spans)` without checking whether `weights >= min_dom_dens`.
 - **Recommended Solution:**
-  Verify that unique spans satisfy `weights >= min_dom_dens` before accepting them as domain instances. Spans failing the density threshold must be classified as noise (`-1`).
+  Enforce density threshold validation uniformly across all span topologies. Any unique span failing `weights >= min_dom_dens` must be classified as noise (`-1`), returning an empty domain list if no spans qualify.
 
 ```python
-# FAULTY (domain_finder.py:171-177 - bypasses density filtering when no intersections exist):
+# FAULTY (domain_finder.py:165-175 - density filtering bypassed when spans do not intersect):
 if n_spans == 1:
     cluster_map[:] = 0
     peak_indices = np.array([0], dtype=np.int32)
@@ -71,7 +85,7 @@ else:
     if rows.size == 0:
         peak_indices = np.arange(n_spans, dtype=np.int32)
 
-# REVISED (Enforce density thresholds uniformly across all hit topologies):
+# REVISED (Uniformly enforce weights >= min_dom_dens across all topologies):
 if n_spans == 1:
     if weights[0] >= min_dom_dens:
         cluster_map[:] = 0
@@ -91,108 +105,131 @@ else:
 
 ---
 
-**Problem 4: Coordinate Data Type Inconsistency Between Modules (`domain_finder.py` vs `aligners.py`)**
+**Problem 3: Inconsistent Coordinate Data Typing and Lack of Clear Type Boundaries (`domain_finder.py`, `clustering.py`)**
 
-- **Module / Component:** `domain_finder.py` (`target_batch_processor`, `find_domains`), `aligners.py`
-- **Severity / Category:** MEDIUM | Numerical Precision / Memory Bloat
+- **Module / Component:** `domain_finder.py` (`target_batch_processor`, `find_domains`), `clustering.py`
+- **Severity / Category:** MEDIUM | Memory Optimization / Data Type Specification
 - **Detailed Bioinformatic & Technical Analysis:**
-  `PREVIOUS_UPDATE.md` claimed that all physical genomic coordinates were standardized to `np.int32` to halve memory and fit four records into a 64-byte CPU cache line.
-  However, in `domain_finder.py:target_batch_processor`:
+  There is conflicting usage between 32-bit and 64-bit integer types across coordinate processing stages.
+  In `domain_finder.py:target_batch_processor`:
   ```python
   merged_spans = np.asarray(merged_spans_list, dtype=np.int64)
   ...
   batch_data.append(intersections.astype(np.int64, copy=False))
   ```
-  The function explicitly casts `merged_spans` and `intersections` to `np.int64`. Then, in `find_domains`:
+  In `domain_finder.py:find_domains`:
   ```python
   all_inters = np.concatenate(accumulated_inters) if accumulated_inters else np.empty(0, dtype=np.int32)
   ```
-  If `accumulated_inters` is non-empty, `all_inters` becomes `int64`. But if it is empty, it initializes as `np.int32`.
-  While 64-bit integers prevent potential overflow when accumulating large multi-megabase overlaps, physical RNA sequence coordinates in transcriptomic datasets never exceed millions of bases. Casting back and forth creates type confusion and increases cache line misses.
-  On the other hand, global domain index can reach the billions of items so `np.int64` may be required to safely handle the registry.
-
+  When `accumulated_inters` is empty, `all_inters` is `int32`, but when non-empty, it becomes `int64`.
+  Unnecessary 64-bit coordinate arrays double memory consumption (from 16 bytes to 28 bytes per record) and increase CPU cache misses. Physical sequence coordinates in transcriptomics and ncRNA alignments never exceed hundreds of millions of nucleotides ($< 10^8$ nt), fitting safely within signed 32-bit integers ($\le 2 \times 10^9$).
+  Conversely, 64-bit integers (`np.int64`) are strictly required in two specific contexts:
+  1. Packed 64-bit composite graph edge keys: `(u_r.astype(np.int64) << 32) | (u_c.astype(np.int64) & 0xFFFFFFFF)`.
+  2. Genome-wide accumulators and registries: global nucleotide length arrays (`global_dom_lengths`) and global domain indices that aggregate across millions of hits.
+- **Evidence in Code:**
+  `domain_finder.py:369, 380`: Redundant casts to `np.int64` for local `merged_spans` and `intersections`.
+  `domain_finder.py:680`: Inconsistent initialization of `all_inters` (`int32` fallback vs `int64` populated array).
 - **Recommended Solution:**
-  Standardize `intersections` and `spans` to `np.int32` throughout all local processing stages, reserving `np.int64` strictly for 64-bit packed composite edge keys (`(u_r << 32) | u_c`) and global genome-wide summation accumulators (`global_dom_lengths`) AND GLOBAL DOMAIN INDEXING (needs update).
+  Establish strict, unambiguous data typing boundaries across the pipeline:
+  - Enforce `np.int32` for all local physical sequence coordinates, interval spans, pairwise intersections, and local domain IDs (`target_dtype`, `merged_spans`, `intersections`, `all_inters`).
+  - Reserve `np.int64` strictly for 64-bit bit-shifted composite edge keys (`keys = (u_r << 32) | u_c`), cumulative global nucleotide length arrays (`global_dom_lengths`), and global domain registry indexing.
 
+```python
+# FAULTY (domain_finder.py: Local coordinates and intersections cast to int64):
+merged_spans = np.asarray(merged_spans_list, dtype=np.int64)
+batch_data.append(intersections.astype(np.int64, copy=False))
+all_inters = np.concatenate(accumulated_inters) if accumulated_inters else np.empty(0, dtype=np.int32)
 
-  1. **Claim of Zero Warnings on Python 3.12:**
-     `PREVIOUS_UPDATE.md:534, 558` claimed that child worker deadlocks and `DeprecationWarning: This process is multi-threaded, use of fork() may lead to deadlocks` were completely eliminated.
-     *Reality:* Running `python3 -m pytest` on Python 3.12.13 emits 2 `DeprecationWarning`s because `mpire`'s `TqdmManager` internally starts a `SyncManager` using `os.fork()`.
-  2. **Claim of Uniform int32 Coordinates:**
-     `PREVIOUS_UPDATE.md:282, 381` claimed physical coordinates were converted to `int32` throughout.
-     *Reality:* `domain_finder.py:378` and `domain_finder.py:388` still explicitly cast `merged_spans` and `intersections` to `np.int64`. Conversely, global doamain index risks overflowing during massive multi-GB analyses.
-- **Recommended Solution:**
-  Sort out final range requirements and ensure no DeprecationWarning occurs.
+# REVISED (Strict type segregation: int32 for local coordinates, int64 for global graph keys):
+merged_spans = np.asarray(merged_spans_list, dtype=np.int32)
+batch_data.append(intersections.astype(np.int32, copy=False))
+all_inters = np.concatenate(accumulated_inters) if accumulated_inters else np.empty(0, dtype=np.int32)
+
+# Bit-shifted composite keys strictly use int64:
+keys = (u_r.astype(np.int64) << 32) | (u_c.astype(np.int64) & 0xFFFFFFFF)
+```
 
 ---
 
-**Problem 8: Redundant FASTA Header Counting and I/O Pass (`domain_finder.py`, `aligners.py`)**
+**Problem 4: Redundant FASTA Header Counting and Dead Code (`domain_finder.py`)**
 
 - **Module / Component:** `domain_finder.py` (`count_fasta_queries`), `aligners.py` (`count_fasta`)
 - **Severity / Category:** LOW | Redundant Computation / Code Cleanliness
 - **Detailed Bioinformatic & Technical Analysis:**
-  `domain_finder.py` defines `count_fasta_queries(fasta_path: Path) -> int`, which is an alias for `aligners.count_fasta(fasta_path)`.
-  However, in `domain_finder.find_domains`:
-  `sequence_registry = populate_registry_from_fasta(fasta_path)` is called, which already scans the entire FASTA file and counts headers to populate the registry. Calling `count_fasta_queries` separately is completely redundant.
-  Furthermore, `count_fasta_queries` is no longer used in `find_domains` because buffer pre-sizing now relies on `tsv_file.stat().st_size // 75`. The function is unused dead code in `domain_finder.py`.
+  `domain_finder.py` defines `count_fasta_queries(fasta_path: Path) -> int`, which is an unused alias wrapping `aligners.count_fasta(fasta_path)`.
+  In `domain_finder.find_domains`:
+  `sequence_registry = populate_registry_from_fasta(fasta_path)` is executed upfront, which parses the FASTA file and populates the sequence registry in a single pass.
+  Furthermore, Stage 3 target buffer pre-sizing now estimates capacity directly from the TSV file byte size (`tsv_file.stat().st_size // 75`). Consequently, `count_fasta_queries` is completely unused dead code in `domain_finder.py`.
 - **Evidence in Code:**
-  `domain_finder.py:40-47`: Unused wrapper function `count_fasta_queries`.
+  `domain_finder.py:40-47`: Unused definition of `count_fasta_queries`.
 - **Recommended Solution:**
-  Remove `count_fasta_queries` from `domain_finder.py` and rely directly on `len(sequence_registry)` or `aligners.count_fasta` where needed.
+  Remove `count_fasta_queries` from `domain_finder.py`. Where sequence counts are needed, rely directly on `len(sequence_registry)` or `aligners.count_fasta`.
 
+```python
+# FAULTY (domain_finder.py:40-47 - unused redundant wrapper):
+def count_fasta_queries(fasta_path: Path) -> int:
+    return count_fasta(fasta_path)
 
----
-
-## 3. Phased Implementation Architecture (For Future Agent Run)
-
-This section provides a clear, sequential implementation guide for a future code revision run.
-
----
-
-**Phase 1: Concurrency Safety and Subprocess Hardening**
-
-**Objective:** Ensure that subprocess can be spawned seamlessly and their lifecycle ensures optimal CPU thread utilisation on linux Ubuntu machine with up to 36 threads.
-
-1. **Context-Bound SyncManager Initialization:**
-   In `executor.py`, before launching `WorkerPool(..., progress_bar=True)`, configure `mpire.tqdm_utils.SyncManager` to use `mp.get_context('forkserver')` instead of the default `'fork'`.
-2. **Explicit Process Tree Validation:**
-   Ensure worker processes spawned by `WorkerPool` terminate cleanly upon task completion, with zero orphan processes and zero warnings under `pytest -W error::DeprecationWarning`.
+# REVISED:
+# Purge count_fasta_queries entirely from domain_finder.py.
+# Use len(sequence_registry) if query count is needed downstream.
+```
 
 ---
 
-**Phase 2: Biological Density Enforcement and Algorithmic Precision**
+## 2. Phased Implementation Architecture (For Future Agent Run)
 
-**Objective:** Correct edge-case handling in DPC and domain candidate pruning to maintain strict biological fidelity.
+This section outlines the sequential execution plan for the future code revision run.
+
+---
+
+**Phase 1: Process Concurrency and Subprocess Hardening**
+
+**Objective:** Guarantee safe worker spawning and lifecycle management, eliminating Python 3.12+ `os.fork()` child deadlocks and deprecation warnings on Linux systems with up to 36 threads.
+
+1. **Context-Bound SyncManager Configuration:**
+   In `executor.py`, configure `mpire.utils.create_sync_manager` and `mpire.tqdm_utils.create_sync_manager` to pass `ctx=mp.get_context('forkserver')` (falling back to `'spawn'`). This prevents MPIRE's `TqdmManager` from falling back to `os.fork()`.
+2. **Clean Worker Pool Lifecycle:**
+   Ensure worker pools shut down cleanly without orphan processes, and confirm that running `python3 -m pytest -W error::DeprecationWarning` passes with zero warnings.
+
+---
+
+**Phase 2: Biological Density Filtering and Edge-Case Robustness**
+
+**Objective:** Maintain biological consistency by enforcing minimum alignment density thresholds across all query span topologies.
 
 1. **Uniform Minimum Density Filtering:**
    In `domain_finder.py:domain_instances_on_query`:
-   - If `n_spans == 1`, check `weights[0] >= min_dom_dens`. If not, assign `cluster_map[:] = -1` and return empty local domains.
-   - If `n_spans > 1` and `rows.size == 0`, filter unique spans by `weights >= min_dom_dens`, assigning failing spans to `-1`.
+   - For `n_spans == 1`: verify `weights[0] >= min_dom_dens`. If not, assign `cluster_map[:] = -1` and return empty domain arrays.
+   - For `n_spans > 1` where `rows.size == 0`: filter spans with `weights >= min_dom_dens`. Spans below the threshold are mapped to `-1`, and only qualifying spans are retained as peak instances.
+2. **Strict Noise Exclusion:**
+   Ensure noise points (`-1`) are excluded from downstream domain instantiation, strand determination, and target hit aggregation.
 
 ---
 
-**Phase 3: Memory Streamlining and Coordinate Type Harmonization**
+**Phase 3: Coordinate Data Type Harmonization and Memory Streamlining**
 
-**Objective:** Eliminate redundant memory conversions and optimize Stage 3 hit buffer allocation.
+**Objective:** Minimize memory footprint and CPU cache misses by establishing strict boundaries between 32-bit physical coordinates and 64-bit composite graph keys.
 
 1. **Strict 32-bit Coordinate Typing:**
    In `domain_finder.py:target_batch_processor`:
    - Cast `merged_spans` to `np.int32`.
    - Cast `intersections` to `np.int32`.
-   - Ensure `accumulated_inters` in `find_domains` initializes as `np.int32`.
-   - the global domain index is exempt and should be protected from overflowing by use of NymPy 64 bit integer.
-2. **Robust Hit Buffer Capacity Sizing:**
-   In `domain_finder.py:find_domains`, use `est_capacity = max(100_000, int(tsv_file.stat().st_size // 50))` to prevent memory reallocations even when sequence identifiers are long.
-3. **Dead Code Cleanup:**
+   - In `find_domains`, ensure `all_inters` initializes as `np.int32`.
+2. **Dedicated 64-bit Usage:**
+   Reserve `np.int64` strictly for 64-bit bit-shifted edge keys (`(u_r.astype(np.int64) << 32) | u_c.astype(np.int64)`), global hit length accumulators (`global_dom_lengths`), and global domain registry indexing.
+3. **Dead Code Removal:**
    Remove `count_fasta_queries` from `domain_finder.py` and replace any external references with `len(sequence_registry)` or `aligners.count_fasta`.
 
 ---
 
-**Phase 4: Test Suite Hardening and Warning Elimination**
+**Phase 4: Test Suite Verification and Regression Gates**
 
+**Objective:** Validate pipeline correctness, numerical stability, and performance.
 
-2. **Pytest Verification:**
-   Run `python3 -m pytest -W error` across the entire repository to ensure:
-   - 0 test failures
-   - 0 deprecation warnings
-   - 0 resource warnings
+1. **Pytest Verification:**
+   Execute `python3 -m pytest -v` and `python3 -m pytest -W error::DeprecationWarning` to verify:
+   - 100% test pass rate across all test modules (`tests/test_aligners.py`, `tests/test_domain_finder.py`, `tests/test_dpc_and_spurious.py`, `tests/test_msa_benchmark.py`).
+   - Zero `DeprecationWarning` occurrences related to `multiprocessing` or `os.fork()`.
+2. **Resource Validation:**
+   Verify that per-worker memory consumption remains strictly below 200 MB during parallel execution.
