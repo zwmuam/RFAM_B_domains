@@ -248,8 +248,8 @@ domain_ranks[sort_order] = np.arange(n_spans)
   During cascading parent pointer doubling, disconnected noise items are pulled into the primary cluster center rather than assigned to noise (`-1`). In biological ncRNA domain clustering, this inflates domain families by fusing unrelated low-confidence matches into authentic clusters.
 - **Step-by-Step Solution:**
   1. If no item satisfies `densities > min_dens`, terminate early and return an empty peak mapping with all points labeled as noise (`-1`).
-  2. Disallow parent assignment for points where `s_max_higher < min_sim` or `nearest_higher < 0`. Only points with an edge to a higher-density neighbor exceeding `min_sim` are eligible for cascading assignment.
-  3. Mask assignments so only points that terminate at an approved peak candidate receive cluster labels; all others default to `-1`.
+  2. Maintain cascading parent pointer propagation for points possessing a valid higher-density neighbour (`nearest_higher >= 0` and `s_max_higher > 0.0`), preventing premature fragmentation of cluster density basins.
+  3. Mask cluster assignments so only points whose cascading lineage reaches an approved peak candidate (`np.isin(parent, peak_indices)`) receive cluster labels; disconnected singletons or subgraphs lacking a qualifying peak remain strictly labeled as noise (`-1`).
 
 - **Faulty Code Snippet (`clustering.py`):**
 ```python
@@ -276,7 +276,7 @@ labels = peak_rank[parent]  # All items assigned to peak_rank, none to -1
 
 - **Revised Code Snippet (`clustering.py`):**
 ```python
-# REVISED: Early exit on empty peaks and strict parent validation isolates noise to -1
+# REVISED: Early exit on empty peaks and validated parent pointer propagation
 gamma = densities * (1.0 - s_max_higher)
 sorted_by_gamma = np.lexsort((np.arange(n), -gamma))
 is_candidate_peak = (densities > min_dens) & ((s_max_higher < min_sim) | (nearest_higher == -1))
@@ -286,8 +286,8 @@ if peak_indices.size == 0:
     # All instances classified as noise when no candidate satisfies min_dens
     return {}, int(n)
 
-# Only propagate pointers along edges satisfying min_sim
-valid_parent = (nearest_higher >= 0) & (s_max_higher >= min_sim)
+# Propagate pointers along edges with non-zero similarity to higher-density neighbor
+valid_parent = (nearest_higher >= 0) & (s_max_higher > 0.0)
 parent = np.where(valid_parent, nearest_higher, np.arange(n))
 parent[peak_indices] = peak_indices
 
@@ -519,3 +519,182 @@ del target_buffer
 | **Memory Spike** | 2x peak RAM allocation during chunk concatenation | Accumulating thousands of array slices in a list before calling `np.concatenate`. | Stream chunk slices into a pre-allocated dynamic contiguous buffer in-place. |
 | **Concurrency Deadlock** | Worker pool hang on Python 3.12+ | Duplicating locked mutexes from multi-threaded logging/tqdm contexts during `os.fork()`. | Explicitly configure `WorkerPool(start_method='forkserver')` in `executor.py`. |
 | **CPU Starvation** | IPC socket bottleneck under multi-core scaling | Hardcoding `chunk_size=1` causes extreme pipe serialization overhead. | Pass `chunk_size='auto'` to dynamically scale worker batch sizes to available CPU threads. |
+
+---
+
+## 3. Unified Update Implementation Plan
+
+This section provides an actionable, harmonized, step-by-step implementation instruction manual designed to guide the next Jules agent run. It synthesizes all problem analyses, vectorizations, and risk mitigation strategies into four sequential phases, strictly prioritizing mathematical validity, biological accuracy, memory efficiency, and concurrency scaling.
+
+---
+
+### Phase 1: Core Mathematical & Algorithmic Corrections
+
+**Objective:** Correct mathematical inconsistencies and biological biases in Density Peak Clustering (`clustering.py`) and candidate domain selection (`domain_finder.py`).
+
+1. **Refine DPC Empty Peak Handling & Noise Isolation (`clustering.py`):**
+   - In `clustering.py:dpc()`, inspect the candidate peak condition:
+     ```python
+     is_candidate_peak = (densities > min_dens) & ((s_max_higher < min_sim) | (nearest_higher == -1))
+     peak_indices = sorted_by_gamma[is_candidate_peak[sorted_by_gamma]]
+     ```
+   - *Empty Peak Exit:* If `peak_indices.size == 0`, immediately return `{}` (empty peak-to-cluster dictionary) and `int(n)` (all points classified as noise/unassigned). Remove the legacy fallback `peak_indices = sorted_by_gamma[:1]`.
+   - *Lineage Masking:* Maintain standard parent pointer doubling along edges possessing a valid higher-density neighbor (`(nearest_higher >= 0) & (s_max_higher > 0.0)`).
+   - After pointer doubling terminates (`parent = grandparent`), identify all points that successfully trace their lineage to an approved peak:
+     ```python
+     reaches_peak = np.isin(parent, peak_indices)
+     labels = np.full(n, -1, dtype=np.int64)
+     peak_rank = np.full(n, -1, dtype=np.int64)
+     peak_rank[peak_indices] = np.arange(peak_indices.size)
+     labels[reaches_peak] = peak_rank[parent[reaches_peak]]
+     ```
+   - Ensure points in disconnected components lacking a qualifying density peak retain label `-1` and are counted in `n_noise`.
+
+2. **Implement Support-Based Spurious Domain Filtering (`domain_finder.py`):**
+   - Update `domain_instances_on_query` to compute alignment support per unique query span:
+     ```python
+     # Compute alignment hit support per unique query span
+     support_counts = np.bincount(np.maximum(cluster_map, 0), minlength=n_spans)
+     # Lexsort: -support (descending), span length (ascending), span index (ascending)
+     sort_order = np.lexsort((np.arange(n_spans), span_lengths, -support_counts))
+     domain_ranks = np.empty(n_spans, dtype=np.int32)
+     domain_ranks[sort_order] = np.arange(n_spans)
+     ```
+   - Pass `domain_ranks` into `filter_spurious_domains(...)`.
+   - Update `filter_spurious_domains`:
+     - Sort candidate nodes by `domain_ranks.__getitem__` in reverse order (pruning lowest-priority candidates first).
+     - When reassigning hits (`reassign_targets=True`), select the strongest live neighbor via `min(live_neighbors, key=domain_ranks.__getitem__)`.
+     - When `reassign_targets=False`, mark pruned candidates directly as `-1`.
+
+3. **Phase 1 Verification Checkpoint:**
+   - Run unit tests: `pytest tests/test_domain_finder.py`.
+   - Verify that compact query spans with high alignment support survive over degenerate long spans.
+   - Verify that datasets with zero density peaks return no false-positive clusters and classify all instances as noise.
+
+---
+
+### Phase 2: Genomic Coordinate Standardisation & Contiguous Memory Buffers
+
+**Objective:** Prevent silent 32-bit integer overflow on chromosome-scale sequences (>2.14 Gb) and eliminate the 2x peak RAM allocation spike during Stage 3 chunk aggregation.
+
+1. **Standardize Genomic Coordinates to `np.int64` (`domain_finder.py`):**
+   - In `target_batch_processor`:
+     - Ensure `merged_spans` is created with `dtype=np.int64`:
+       ```python
+       merged_spans = np.asarray(merged_spans_list, dtype=np.int64)
+       aligned_domains = np.asarray(aligned_domains_list, dtype=np.int32)
+       ```
+     - Ensure intersections returned from `overlaps_on_target` are cast to `np.int64`:
+       ```python
+       intersections = intersections.astype(np.int64, copy=False)
+       ```
+   - In `target_batch_generator`:
+     - Ensure spans unpacked from `target_seq_groups` are cast to `np.int64`:
+       ```python
+       spans = np.column_stack((grp['start'], grp['end'])).astype(np.int64, copy=False)
+       ```
+   - In `family_finder`:
+     - Standardize `all_rows`, `all_cols`, and `all_inters` arrays to `np.int64` during bit-shift edge compression (`(u_r << 32) | u_c`).
+
+2. **In-Place Dynamic Buffer Allocation for Target Chunks (`domain_finder.py` Stage 3):**
+   - Replace `target_chunks: List[np.ndarray] = []` with a contiguous structured array buffer:
+     ```python
+     # Estimate initial buffer capacity using query sequence count
+     est_capacity = max(1_000_000, count_fasta_queries(fasta_path) * 100)
+     target_buffer = np.empty(est_capacity, dtype=target_dtype)
+     write_offset = 0
+     ```
+   - Iterate through `query_workers.results`:
+     - For each batch output, if `write_offset + n_hits > target_buffer.shape[0]`:
+       ```python
+       new_size = max(target_buffer.shape[0] * 2, write_offset + n_hits + 500_000)
+       target_buffer = np.resize(target_buffer, new_size)
+       ```
+     - Write chunks directly into buffer slices:
+       ```python
+       dest = target_buffer[write_offset : write_offset + n_hits]
+       dest['t_seq'] = all_targets[:, 0]
+       dest['start'] = all_targets[:, 1]
+       dest['end'] = all_targets[:, 2]
+       dest['dom_id'] = all_targets[:, 3] + global_offset
+       write_offset += n_hits
+       ```
+   - Slice buffer to active hits upon loop exit:
+     ```python
+     all_targets_arr = target_buffer[:write_offset]
+     del target_buffer
+     ```
+
+3. **Phase 2 Verification Checkpoint:**
+   - Execute domain extraction tests with coordinate values exceeding $3 \times 10^9$ to guarantee absence of integer wrapping.
+   - Profile heap allocations in Stage 3 to verify elimination of intermediate chunk list references.
+
+---
+
+### Phase 3: Concurrency, IPC Scaling & Multi-Threading Fork-Safety
+
+**Objective:** Eliminate multi-process socket contention and child process deadlocks on Python 3.12+.
+
+1. **Multiprocessing Start Method Configuration (`executor.py`):**
+   - Inspect platform and environment start methods:
+     ```python
+     import multiprocessing as mp
+     safe_start = 'forkserver' if 'forkserver' in mp.get_all_start_methods() else 'spawn'
+     ```
+   - Update `Parallel.__init__`:
+     - Pass `start_method=safe_start` into `WorkerPool`:
+       ```python
+       with WorkerPool(n_jobs=n_jobs, start_method=safe_start, **worker_kwargs) as pool:
+       ```
+     - Ensure all worker functions (`batch_query_processor`, `target_batch_processor`) and arguments are top-level picklable callables.
+
+2. **Adaptive Batch Chunking for Generators (`executor.py` & `domain_finder.py`):**
+   - In `executor.py:Parallel`:
+     - When `chunk_size == 'auto'` and `input_list` is a generator or iterator (not `list` or `tuple`), apply an adaptive chunk size window (e.g., `chunk_size = 32`) rather than defaulting to `1`.
+   - In `domain_finder.py`:
+     - Update Stages 2 and 4 to pass `chunk_size='auto'` instead of hardcoded `chunk_size=1`:
+       ```python
+       query_workers = Parallel(function=batch_query_processor,
+                                input_collection=batch_gen,
+                                kwargs=query_kwargs,
+                                n_jobs=cpu,
+                                bar=True,
+                                description="Finding domain instances",
+                                chunk_size='auto')
+       ```
+       ```python
+       target_workers = Parallel(function=target_batch_processor,
+                                 input_collection=target_batch_generator(),
+                                 n_jobs=cpu,
+                                 bar=True,
+                                 description="Calculating target overlaps",
+                                 chunk_size='auto')
+       ```
+
+3. **Phase 3 Verification Checkpoint:**
+   - Run test suite under Python 3.12 (`pytest tests/`) and confirm that `DeprecationWarning: This process is multi-threaded, use of fork() may lead to deadlocks` is eliminated.
+   - Benchmark multi-core execution across 4 to 16 threads; verify CPU utilization remains above 85% during Stages 2 and 4 without socket starvation.
+
+---
+
+### Phase 4: Integration, Verification & Quality Checks
+
+**Objective:** Ensure full end-to-end pipeline integrity, compliance with formatting standards, and zero regression across all test suites.
+
+1. **Code Formatting & Linting Compliance:**
+   - Protect visual indentation layouts in modified modules using `# fmt: off` / `# fmt: on` annotations where applicable.
+   - Verify that all modified files adhere to visual indent standards and line length limits ($\le 99$ characters).
+
+2. **End-to-End Test Suite Execution:**
+   - Run the complete repository test suite:
+     ```bash
+     python3 -m pytest tests/test_aligners.py -v
+     python3 -m pytest tests/test_domain_finder.py -v
+     python3 -m pytest tests/test_msa_benchmark.py -v
+     ```
+   - Ensure all 25 test cases pass cleanly without warnings, hangs, or unexpected memory growth.
+
+3. **GFF3 Output Integrity Audit:**
+   - Validate that GFF3 coordinate output preserves 1-based closed formatting ($[start + 1, end]$) matching the input sequence frame.
+   - Confirm that domain consensus strand matches majority target hit orientation.
+   - Verify that domain families with singleton or unaligned items preserve correct ID labeling and noise filtering.
