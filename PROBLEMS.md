@@ -34,7 +34,10 @@ A comprehensive, end-to-end re-evaluation of the current codebase (`aligners.py`
   5. The sorting key `(node_weights[n], n)` uses the arbitrary span index `n` as a tie-breaker, introducing non-biological ordering bias.
 - **Proposed Correction & Solution:**
   Domain survival must be governed by **alignment support** (the number of verified target alignment hits in the primary DPC cluster, equivalent to cluster member count or sum of target hit weights), not raw nucleotide span length:
-  $$\text{Support}(d) = N_{\text{targets}}(d) = \sum_{t \in \text{Cluster}(d)} w_t$$
+
+```math
+\text{Support}(d) = N_{\text{targets}}(d) = \sum_{t \in \text{Cluster}(d)} w_t
+```
   - **Multi-Tiered Biological Tie-Breakers:**
     1. Primary key: Cluster alignment support $N_{\text{targets}}$ (highest support wins).
     2. Secondary key (if density is equal): Domain length compactness or proximity to expected motif size.
@@ -43,10 +46,19 @@ A comprehensive, end-to-end re-evaluation of the current codebase (`aligners.py`
 ### Target Overlap Accumulation & Global Multi-Sequence Jaccard
 - **Current Mathematical Model in `family_finder`:**
   For domain instances $d_r$ and $d_c$:
-  $$\text{Overlap}(d_r, d_c) = \sum_{t \in \mathcal{S}} \text{Intersection}_t(\text{merged\_hits}(d_r), \text{merged\_hits}(d_c))$$
-  $$\text{TotalLength}(d) = \sum_{t \in \mathcal{S}} \text{Length}_t(\text{merged\_hits}(d))$$
-  $$\text{Union}(d_r, d_c) = \text{TotalLength}(d_r) + \text{TotalLength}(d_c) - \text{Overlap}(d_r, d_c)$$
-  $$\text{Sim}(d_r, d_c) = \frac{\text{Overlap}(d_r, d_c)}{\text{Union}(d_r, d_c)}$$
+
+```math
+\text{Overlap}(d_r, d_c) = \sum_{t \in \mathcal{S}} \text{Intersection}_t(\text{merged\_hits}(d_r), \text{merged\_hits}(d_c))
+```
+```math
+\text{TotalLength}(d) = \sum_{t \in \mathcal{S}} \text{Length}_t(\text{merged\_hits}(d))
+```
+```math
+\text{Union}(d_r, d_c) = \text{TotalLength}(d_r) + \text{TotalLength}(d_c) - \text{Overlap}(d_r, d_c)
+```
+```math
+\text{Sim}(d_r, d_c) = \frac{\text{Overlap}(d_r, d_c)}{\text{Union}(d_r, d_c)}
+```
 - **Mathematical & Biological Evaluation:**
   - This metric evaluates the **global concatenated Jaccard similarity** across all target sequence instances $\mathcal{S}$.
   - *Biological Validity:* This formulation is sound for homologous domain family grouping. Two domains that share identical target hits across numerous homologous sequences receive high similarity, while domains that only match target instances on non-overlapping subsets of sequences are penalized.
