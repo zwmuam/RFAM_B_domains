@@ -1,8 +1,4 @@
-# Core Domain-Finding Pipeline Audit and Architectural Risk Assessment
-
----
-
-## 1. Problem Analysis
+# 1. Problem Analysis
 
 **Problem 1: Bypassing Minimum Density Filtering in Disjoint DPC (`clustering.py`, `domain_finder.py`)**
 
@@ -34,51 +30,6 @@ if rows.size == 0:
         return {}, int(n)
     peak_to_cluster = {int(p): np.array([p], dtype=np.int64) for p in qualifying}
     return peak_to_cluster, int(n - qualifying.size)
-```
-
----
-
-**Problem 2: Strand-Blind Merging in Target Hits and GFF3 Cluster Evaluation (`domain_finder.py`)**
-
-- **Module / Component:** `domain_finder.py` (`domain_instances_on_query`, `target_batch_processor`, `evaluate_clusters`)
-- **Severity / Category:** HIGH | Biological Validity & Annotation Corruption
-- **Detailed Bioinformatic & Technical Analysis:**
-  Non-coding RNA transcripts and regulatory elements function strictly in a directionally constrained manner. Transcription from opposite genomic strands (`+` vs `-`) produces distinct sequence molecules with inverted secondary structure folding thermodynamics and distinct biological functions.
-  In the current pipeline:
-  1. `domain_finder.py:domain_instances_on_query` determines a consensus strand for the query domain instance, but subsequently strips strand information when emitting `all_targets`.
-  2. `target_batch_processor` aggregates all target hits on a target sequence and merges same-domain intervals using `merge_overlapping_spans(d_spans)` regardless of hit orientation. If a domain matches both the forward and reverse strand of a locus (e.g., in inverted repeats, convergent promoters, or bidirectional ncRNA loci), hits on opposite strands are merged into a single chimeric interval.
-  3. `domain_finder.py:evaluate_clusters` groups all member domain instances on the same query sequence and unconditionally merges overlapping spans using `merge_overlapping_spans(spans_arr)`. The consensus strand is decided by simple majority voting of the merged instances (`neg > pos`).
-  This causes biologically distinct antisense domains located on opposite strands of the same locus to be merged into a single feature, erasing the antisense feature and misrepresenting genomic coordinates.
-- **Evidence in Code:**
-  - `domain_finder.py:214-219`: `partner_targets = np.column_stack((t_seqs, t_starts, t_ends, t_doms))` completely drops target alignment strands (`t_strands`).
-  - `domain_finder.py:447-458`: `cluster_domains_per_seq[d[0]].append(d)` groups strictly by `seq_id` (`d[0]`) rather than `(seq_id, strand)`.
-  - `domain_finder.py:459-467`: Overlapping domains on opposite strands are merged and assigned a single consensus strand.
-- **Recommended Solution:**
-  Partition domain instances by `(seq_id, strand)` prior to interval merging in `evaluate_clusters`. Same-cluster domain instances on opposite strands must be preserved as separate GFF3 records. Similarly, retain strand qualifiers in target hit processing where bidirectional transcriptomics requires strand discrimination.
-
-```python
-# FAULTY (domain_finder.py:447-458 - grouping strictly by sequence ID, ignoring strand):
-cluster_domains_per_seq: Dict[int, List[Tuple[int, int, int, str]]] = defaultdict(list)
-for d_id in member_ids:
-    d = domain_registry[int(d_id)]
-    cluster_domains_per_seq[d[0]].append(d)
-
-# REVISED (domain_finder.py: Group by (seq_id, strand) to preserve antisense features):
-cluster_domains_per_seq: Dict[Tuple[int, str], List[Tuple[int, int, int, str]]] = defaultdict(list)
-for d_id in member_ids:
-    d = domain_registry[int(d_id)]
-    cluster_domains_per_seq[(d[0], d[3])].append(d)
-
-component_domains: List[Tuple[int, int, int, str]] = []
-for (seq_id, dom_strand), domains in cluster_domains_per_seq.items():
-    if len(domains) == 1:
-        component_domains.append(domains[0])
-        continue
-    sorted_domains = sorted(domains, key=lambda x: x[1])
-    spans_arr = np.array([[x[1], x[2]] for x in sorted_domains], dtype=np.int32)
-    merged_spans = merge_overlapping_spans(spans_arr)
-    for m_start, m_end in merged_spans:
-        component_domains.append((seq_id, int(m_start), int(m_end), dom_strand))
 ```
 
 ---
@@ -261,25 +212,6 @@ cols = np.ascontiguousarray(cols, dtype=np.int32)
 
 ---
 
-**Problem 7: Style Violations of Repository PEP 8 Visual Indent and Line Length (`domain_finder.py`, `clustering.py`)**
-
-- **Module / Component:** `domain_finder.py`, `clustering.py`, `executor.py`
-- **Severity / Category:** LOW | Code Quality & PEP 8 Visual Indent Compliance
-- **Detailed Bioinformatic & Technical Analysis:**
-  The repository specification requires strict delimiter-anchored visual alignment (Visual Indent Style) and an absolute maximum line length of $\le 99$ characters.
-  An automated line length audit revealed:
-  - `domain_finder.py`: 11 lines exceeding 99 characters (up to 105 characters, e.g., lines 101, 192, 205).
-  - `clustering.py`: 31 lines exceeding 99 characters (up to 123 characters, e.g., lines 22, 49, 67, 107).
-  - `executor.py`: 5 lines exceeding 99 characters (up to 111 characters, e.g., lines 22, 190, 258).
-  These lines violate the project's formatting standard (`templates/formatting_template.py`) and must be wrapped to maintain visual consistency.
-- **Evidence in Code:**
-  - `clustering.py:67`: `# check for indices outside the valid range >1 and <0, which can occur due to numerical issues...` (123 chars)
-  - `domain_finder.py:205`: `suspect_intersections=intersections[peak_mask], suspect_lengths=span_lengths, ...` (105 chars)
-- **Recommended Solution:**
-  Refactor all lines exceeding 99 characters to comply strictly with the visual alignment style defined in `templates/formatting_template.py`.
-
----
-
 ## 2. Architectural Risks and Warning Guidelines
 
 The following risks should be considered prior to code refactoring:
@@ -301,19 +233,17 @@ This phased plan outlines the sequence of updates recommended for future executi
 
 1. **Phase 1: Algorithmic & Biological Correctness**
    - Correct disjoint density thresholding in `clustering.py:dpc` so that points failing $\text{min\_dens}$ are assigned to noise ($-1$).
-   - Refactor `domain_finder.py:evaluate_clusters` to group domain instances by `(seq_id, strand)` prior to interval merging, preventing antisense domain obliteration.
    - Replace `np.resize` in `domain_finder.py:find_domains` with safe buffer copying.
 
 2. **Phase 2: Performance & Concurrency Optimization**
    - Optimize `compare_sorted_spans` in `clustering.py` by eliminating sub-array slicing in `np.searchsorted`.
-   - Update Stage 4 batch generation in `domain_finder.py` with dynamic batch sizing and `chunk_size = 1` to eliminate worker starvation on multi-core systems.
-   - Refactor `target_batch_processor` to use sorted domain slicing rather than repeated boolean masking.
+   - Update generation to ensure optimal batch sizing to 100-150 GB ram capacity.
+   - Refactor `target_batch_processor` to use sorted domain slicing rather than repeated boolean masking. If really faster and/ore more memory-efficient.
 
 3. **Phase 3: Coordinate Type Harmonization & Cleanup**
    - Standardize all coordinates, spans, and local index arrays to `np.int32` in `evaluate_clusters` and `clustering.py`.
    - Purge dead import `count_fasta` from `domain_finder.py`.
    - Correct outdated docstrings in `target_batch_processor`.
 
-4. **Phase 4: Style Compliance & Test Verification**
-   - Reformat all lines exceeding 99 characters across `domain_finder.py`, `clustering.py`, and `executor.py` to adhere to `templates/formatting_template.py`.
+4. **Phase 4: Test Verification**
    - Run `python3 -m pytest -v -W error::DeprecationWarning` to ensure zero regressions across the complete test suite.
