@@ -71,9 +71,14 @@ def filter_spurious_domains(cluster_map: np.ndarray,
                             suspect_intersections: np.ndarray,
                             suspect_lengths: np.ndarray,
                             min_containment: float,
-                            reassign_targets: bool) -> np.ndarray:
+                            reassign_targets: bool,
+                            domain_ranks: Optional[np.ndarray] = None) -> np.ndarray:
     """
-    Filter out low-scoring overlapping domains.
+    Filter overlapping candidates using pre-computed biological priority ranking.
+    Lower rank index indicates higher biological priority:
+    1. Primary: Alignment hit support N_targets (highest support wins).
+    2. Secondary: Span compactness (shorter length wins on equal support).
+    3. Deterministic tie-breaker: Coordinate index (ascending).
 
     :param cluster_map: Cluster map to filter.
     :param suspect_rows: Indices of the suspect overlaps (in the unique_spans array).
@@ -82,17 +87,26 @@ def filter_spurious_domains(cluster_map: np.ndarray,
     :param suspect_lengths: Lengths of unique domain instances.
     :param min_containment: Minimum containment threshold for filtering.
     :param reassign_targets: Whether targets should be reassigned to strongest neighbors.
+    :param domain_ranks: 1D array of priority ranks (0 = best candidate).
     :return: Refined cluster map with spurious domains removed or reassigned.
     """
     containment = max_containment(intersections=suspect_intersections,
                                   row_lengths=suspect_lengths[suspect_rows],
                                   column_lengths=suspect_lengths[suspect_cols])
     connected_mask = containment >= min_containment
+    if not np.any(connected_mask):
+        return cluster_map
 
     source_nodes = suspect_rows[connected_mask]
     target_nodes = suspect_cols[connected_mask]
 
-    node_weights = {node: weight for node, weight in enumerate(suspect_lengths)}
+    n_spans = suspect_lengths.shape[0]
+    if domain_ranks is None:
+        valid_mask = cluster_map >= 0
+        support_counts = np.bincount(cluster_map[valid_mask], minlength=n_spans)
+        sort_order = np.lexsort((np.arange(n_spans), suspect_lengths, -support_counts))
+        domain_ranks = np.empty(n_spans, dtype=np.int32)
+        domain_ranks[sort_order] = np.arange(n_spans, dtype=np.int32)
 
     neighbors = defaultdict(set)
     for source, target in zip(np.asarray(source_nodes).tolist(), np.asarray(target_nodes).tolist()):
@@ -100,18 +114,18 @@ def filter_spurious_domains(cluster_map: np.ndarray,
             neighbors[source].add(target)
             neighbors[target].add(source)
 
-    removed_nodes = []
-    for node in sorted(neighbors, key=lambda n: (node_weights[n], n)):
-        live_neighbors = neighbors.pop(node)
+    # Prune worst candidate first (highest rank index) using pre-computed integer ranking
+    for node in sorted(neighbors, key=domain_ranks.__getitem__, reverse=True):
+        live_neighbors = neighbors.pop(node, None)
         if live_neighbors:
-            removed_nodes.append(node)
             if reassign_targets:
-                best_neighbor = max(live_neighbors, key=lambda n: node_weights[n])
+                # O(k) selection of strongest neighbor (lowest rank index)
+                best_neighbor = min(live_neighbors, key=domain_ranks.__getitem__)
                 cluster_map[cluster_map == node] = best_neighbor
             else:
                 cluster_map[cluster_map == node] = -1
             for neighbor in live_neighbors:
-                neighbors[neighbor].remove(node)
+                neighbors[neighbor].discard(node)
 
     return cluster_map
 
@@ -180,13 +194,22 @@ def domain_instances_on_query(query_id: int,
                 unique_domain_indices = np.array(list(peak_to_cluster.keys()), dtype=np.int32)
                 peak_mask = np.isin(rows, unique_domain_indices) & np.isin(cols, unique_domain_indices)
                 if np.any(peak_mask):
+                    # Compute alignment hit support per unique span, excluding negative noise (-1)
+                    valid_mask = cluster_map >= 0
+                    support_counts = np.bincount(cluster_map[valid_mask], minlength=n_spans)
+                    # Lexsort: -support (desc), length (asc), index (asc)
+                    sort_order = np.lexsort((np.arange(n_spans), span_lengths, -support_counts))
+                    domain_ranks = np.empty(n_spans, dtype=np.int32)
+                    domain_ranks[sort_order] = np.arange(n_spans, dtype=np.int32)
+
                     cluster_map = filter_spurious_domains(cluster_map=cluster_map,
                                                           suspect_rows=rows[peak_mask],
                                                           suspect_cols=cols[peak_mask],
                                                           suspect_intersections=intersections[peak_mask],
                                                           suspect_lengths=span_lengths,
                                                           min_containment=min_containment,
-                                                          reassign_targets=reassign_targets)
+                                                          reassign_targets=reassign_targets,
+                                                          domain_ranks=domain_ranks)
 
             active_peaks = np.unique(cluster_map)
             active_peaks = active_peaks[active_peaks >= 0]
@@ -319,6 +342,7 @@ def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray
     """
     Process a batch of target sequences to merge same-domain intervals, compute
     per-domain target lengths, and calculate pairwise target overlaps.
+    Maintains 64-bit integers for all physical genomic coordinate operations.
 
     :param batch_targets: List of (target_id, target_spans, domain_pointers).
     :return: Tuple of (rows, cols, intersections, domain_lengths_dict).
@@ -343,8 +367,8 @@ def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray
         if len(merged_spans_list) <= 1:
             continue
 
-        merged_spans = np.array(merged_spans_list, dtype=np.int32)
-        aligned_domains = np.array(aligned_domains_list, dtype=np.int32)
+        merged_spans = np.asarray(merged_spans_list, dtype=np.int64)
+        aligned_domains = np.asarray(aligned_domains_list, dtype=np.int32)
 
         sort_order = np.argsort(merged_spans[:, 0])
         sorted_spans = merged_spans[sort_order]
@@ -354,7 +378,7 @@ def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray
         if rows.size > 0:
             batch_rows.append(rows)
             batch_cols.append(cols)
-            batch_data.append(intersections)
+            batch_data.append(intersections.astype(np.int64, copy=False))
 
     if batch_rows:
         return (np.concatenate(batch_rows),
@@ -364,7 +388,7 @@ def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray
 
     return (np.empty(0, dtype=np.int32),
             np.empty(0, dtype=np.int32),
-            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.int64),
             dict(batch_dom_lengths))
 
 
@@ -561,7 +585,7 @@ def find_domains(fasta_path: Path,
                              n_jobs=cpu,
                              bar=True,
                              description="Finding domain instances",
-                             chunk_size=1)
+                             chunk_size='auto')
 
     target_dtype = np.dtype([
         ('t_seq', np.int64),
@@ -571,8 +595,12 @@ def find_domains(fasta_path: Path,
     ])
 
     global_domains: List[Tuple[int, int, int, str]] = []
-    target_chunks: List[np.ndarray] = []
     global_offset = 0
+
+    # In-place pre-allocated dynamic buffer eliminates 2x peak RAM allocation spike
+    est_capacity = max(100_000, count_fasta_queries(fasta_path) * 100)
+    target_buffer = np.empty(est_capacity, dtype=target_dtype)
+    write_offset = 0
 
     for batch_res in query_workers.results:
         for local_domains, all_targets in batch_res:
@@ -580,25 +608,31 @@ def find_domains(fasta_path: Path,
             if n_doms == 0:
                 continue
             global_domains.extend(local_domains)
-            if all_targets.size > 0:
-                chunk = np.empty(all_targets.shape[0], dtype=target_dtype)
-                chunk['t_seq'] = all_targets[:, 0]
-                chunk['start'] = all_targets[:, 1]
-                chunk['end'] = all_targets[:, 2]
-                chunk['dom_id'] = all_targets[:, 3] + global_offset
-                target_chunks.append(chunk)
+            n_hits = all_targets.shape[0] if all_targets.size > 0 else 0
+            if n_hits > 0:
+                if write_offset + n_hits > target_buffer.shape[0]:
+                    new_size = max(target_buffer.shape[0] * 2, write_offset + n_hits + 100_000)
+                    target_buffer = np.resize(target_buffer, new_size)
+
+                dest = target_buffer[write_offset:write_offset + n_hits]
+                dest['t_seq'] = all_targets[:, 0]
+                dest['start'] = all_targets[:, 1]
+                dest['end'] = all_targets[:, 2]
+                dest['dom_id'] = all_targets[:, 3] + global_offset
+                write_offset += n_hits
             global_offset += n_doms
 
     n_total_domains = len(global_domains)
 
-    if target_chunks:
-        all_targets_arr = np.concatenate(target_chunks)
-        del target_chunks
+    if write_offset > 0:
+        all_targets_arr = target_buffer[:write_offset]
+        del target_buffer
         all_targets_arr.sort(order=['t_seq', 'start'])
         seq_breaks = np.flatnonzero(np.diff(all_targets_arr['t_seq'])) + 1
         target_seq_groups = np.split(all_targets_arr, seq_breaks)
         n_target_seqs = len(target_seq_groups)
     else:
+        del target_buffer
         target_seq_groups = []
         n_target_seqs = 0
 
@@ -624,7 +658,7 @@ def find_domains(fasta_path: Path,
                               n_jobs=cpu,
                               bar=True,
                               description="Calculating target overlaps",
-                              chunk_size=1)
+                              chunk_size='auto')
 
     accumulated_rows: List[np.ndarray] = []
     accumulated_cols: List[np.ndarray] = []
@@ -642,7 +676,7 @@ def find_domains(fasta_path: Path,
 
     all_rows = np.concatenate(accumulated_rows) if accumulated_rows else np.empty(0, dtype=np.int32)
     all_cols = np.concatenate(accumulated_cols) if accumulated_cols else np.empty(0, dtype=np.int32)
-    all_inters = np.concatenate(accumulated_inters) if accumulated_inters else np.empty(0, dtype=np.int32)
+    all_inters = np.concatenate(accumulated_inters) if accumulated_inters else np.empty(0, dtype=np.int64)
 
     # 4. Stage 5: Family finding with DPC
     logger.info("Executing Stage 5: Finding domain families")
