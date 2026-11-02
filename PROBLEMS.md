@@ -5,14 +5,12 @@ The domain-finding pipeline identifies conserved non-coding RNA (ncRNA) domain i
 2. **Query Domain Instance Discovery (`domain_finder.py:domain_instances_on_query`)**: Performs Density Peak Clustering (DPC) on query alignment spans using Jaccard similarity of 1D coordinate intervals (`clustering.py`), prunes spurious overlapping candidate domains using biological alignment support, assigns consensus strands, and supplements self-hits.
 3. **Target Chunk Ingestion & Aggregation (`domain_finder.py:find_domains`)**: Aggregates worker outputs from Stage 2 into a contiguous array buffer, re-indexing domain identifiers globally, and sorts by target sequence.
 4. **Target Overlap & Intersection Calculation (`domain_finder.py:target_batch_processor`)**: Merges overlapping same-domain hits on target sequences, extracts pairwise coordinate intersections across domains, and computes total aligned target nucleotide lengths per domain.
-5. **Family Finding via Graph DPC (`domain_finder.py:family_finder`)**: Constructs a global multi-sequence similarity graph using concatenated Jaccard similarity across shared target sequences, and groups domain instances into families using sparse DPC.
-6. **Cluster Evaluation & GFF3 Export (`domain_finder.py:evaluate_clusters`)**: Groups family members by query sequence, resolves overlaps among members of the same family on the same sequence, and exports annotations in 1-based closed GFF3 format.
-
-While the core pipeline is logically well-structured and functional, this audit identifies critical concurrency bugs, redundant multiprocessing modules, unneeded 64-bit integer bloat on sequence coordinates, problematic halo filtering semantics for biological ncRNA data, and misleading claims in `PREVIOUS_UPDATE.md`.
+5. **Family Finding via Graph DPC (`domain_finder.py:family_finder`)**: Constructs a global multi-sequence similarity graph using cum of Jaccard similarity across shared target sequences, and groups domain instances into families using sparse DPC.
+6. **Cluster Evaluation & GFF3 Export (`domain_finder.py:evaluate_clusters`)**: Groups family members, resolves overlaps among members of the same family on the same sequence, and exports annotations in 1-based closed GFF3 format.
 
 ---
 
-## 2. Per-Problem Analysis & Audit Findings
+## 2. Problem Analysis
 
 ### Problem 1: Unfulfilled Fork-Safety Claim and Concurrency Deadlock in Multiprocessing (`executor.py` vs `PREVIOUS_UPDATE.md`)
 
