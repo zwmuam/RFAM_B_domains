@@ -80,9 +80,7 @@ if 'start_method' not in worker_kwargs and 'start_method' not in extra_kwargs:
 - **Detailed Technical Analysis:**
   `PREVIOUS_UPDATE.md` (Sections 1, 2.1, 3, and 4) heavily emphasized promoting all physical sequence coordinates (`start`, `end`, `lengths`, `intersections`) strictly to `np.int64` to prevent signed 32-bit overflow on "chromosome-scale eukaryotic genomes (>2.14 Gb)".
   However, in non-coding RNA biology and RNA transcriptomics, sequence lengths never approach billions of base pairs; individual ncRNA sequences, viral genomes, riboswitches, and RNA transcripts are bounded well below millions of nucleotides ($< 10^6$ nt). An unsigned or signed 32-bit integer easily accommodates coordinates up to $2,147,483,647$ nt, which is more than $2,000\times$ larger than the largest known RNA molecule.
-  Using `np.int64` for `start`, `end`, `lengths`, and `intersections` inflates the structured record size:
-  - Structured target record with `int64` coordinates: `t_seq` (int64) + `start` (int64) + `end` (int64) + `dom_id` (int32) + 4-byte padding = 32 bytes per alignment hit.
-  - Structured target record with `int32` coordinates: `t_seq` (int32) + `start` (int32) + `end` (int32) + `dom_id` (int32) = 16 bytes per alignment hit.
+  Using `np.int64` for `start`, `end`, `lengths`, and `intersections` inflates the structured record size. Structured target record with `int32` coordinates: `t_seq` (int32) + `start` (int32) + `end` (int32) + `dom_id` (int32) = 16 bytes per alignment hit.
   For large alignment runs containing 50 million to 100 million hits, storing coordinates in `int64` wastes 0.8 GB to 1.6 GB of unneeded RAM per array buffer, while degrading CPU L1/L2 cache line occupancy by $50\%$ (only 2 records fit in a 64-byte cache line instead of 4).
   Conversely, `np.int64` is mathematically and technically necessary **only** for packed bit-shift registers and composite identifiers, such as `keys = (u_r << 32) | u_c` in `clustering.py:build_similarity_matrix` and `domain_finder.py:family_finder`, where two 32-bit indices are packed into a single 64-bit integer.
 - **Evidence in Code:**
