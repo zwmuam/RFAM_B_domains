@@ -13,7 +13,7 @@ The pipeline extracts conserved structural RNA domain instances from pairwise al
 Two claims from `PREVIOUS_UPDATE.md` were incompletely implemented or introduced subsequent complications:
 
 ### Disjoint Graph Density Thresholding in family_finder Was Partially Bypassed
-- **Audit Finding:** In `domain_finder.py:family_finder` (lines 430-442), when domain instances share zero target overlaps across other sequences (`u_r.size == 0`), solitary domains are filtered against `min_fam_dens` under the assumption that their local density is $1.0$ (`np.ones(n_domains, dtype=np.float64)`). However, in biological reality, solitary domain instances possess alignment target support proportional to their number of target occurrences $N_{\text{targets}}$. Forcing their local density to $1.0$ discards high-confidence solitary domains if $`\text{min\_fam\_dens} > 1.0$`, while admitting zero-overlap spurious singletons if $`\text{min\_fam\_dens} \le 1.0$`.
+- **Audit Finding:** In `domain_finder.py:family_finder` (lines 430-442), when domain instances share zero target overlaps across other sequences (`u_r.size == 0`), solitary domains are filtered against `min_fam_dens` under the assumption that their local density is $1.0$ (`np.ones(n_domains, dtype=np.float64)`). However, in biological reality, solitary domain instances possess alignment target support proportional to their number of target occurrences $N_{\text{targets}}$. Forcing their local density to $1.0$ discards high-confidence solitary domains if `min_fam_dens` > 1.0, while admitting zero-overlap spurious singletons if `min_fam_dens` <= 1.0.
 - **Subsequent Problem:** In `clustering.py:dpc` (lines 871-877), the empty edge handler checks `densities >= min_dens`. However, if `rows.size > 0` and points are disconnected components with zero edge weights, disconnected points bypass candidate peak selection unless their self-density meets `min_dens`. When `family_finder` delegates to `dpc`, it passes `weights=None`, causing `dpc` to compute densities purely from edge sums plus diagonal 1.0, losing track of real alignment support counts.
 
 ### Coordinate Typing Harmonization and Docstring Drift
@@ -216,7 +216,7 @@ target_batch_size = max(1, min(250, int(np.ceil(n_target_seqs / max(1, cpu * 4))
 
 ### Phase 1: Mathematical Integrity and Halo Noise Mask Correction
 1. In `clustering.py:_foreign_mask`, update the boolean mask so that neighbor points with label $-1$ (noise) are excluded from foreign contamination calculations (`(reference >= 0) & (nbr_labels >= 0) & (reference != nbr_labels)`).
-2. In `domain_finder.py:family_finder`, update solitary domain density calculation when $u\_r\text{.size} == 0$ to use actual domain target occurrence counts rather than uniform $1.0$.
+2. In `domain_finder.py:family_finder`, update solitary domain density calculation when `u_r.size == 0` to use actual domain target occurrence counts rather than uniform $1.0$.
 3. Forward `point_specific` parameter consistently to `domain_instances_on_query` in Stage 2.
 
 ### Phase 2: Memory Ceiling Optimization for >100GB Alignments
