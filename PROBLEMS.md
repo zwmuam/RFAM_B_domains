@@ -1,4 +1,4 @@
-# PROBLEMS: Comprehensive Audit of the Domain Finding Codebase and Dependencies
+# ABSTRACT
 
 The pipeline extracts conserved structural RNA domain instances from pairwise alignments (MMseqs2 or RiboSeek) and clusters them into global domain families via Density Peak Clustering (DPC). Processing large multi-gigabyte alignment datasets imposes strict operational requirements:
 1. Peak system memory must stay bounded below 200 GB.
@@ -8,7 +8,7 @@ The pipeline extracts conserved structural RNA domain instances from pairwise al
 
 ---
 
-## Re-Assessment and Audit of PREVIOUS_UPDATE.md Claims
+# Re-Assessment and Audit of PREVIOUS_UPDATE.md Claims
 
 Two claims from `PREVIOUS_UPDATE.md` were incompletely implemented or introduced subsequent complications:
 
