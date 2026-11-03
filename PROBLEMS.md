@@ -191,39 +191,6 @@ with WorkerPool(n_jobs=cpu, start_method='forkserver') as pool:
 
 ---
 
-## TSV Ingestion Bottleneck in Aligner Parsing
-
-- **Evidence**:
-  In `aligners.py:175-228` (`parse_mmseqs_tsv`):
-  Alignment results are parsed line-by-line using pure Python `line.rstrip('\n').split('\t')` and `int()` conversions.
-- **Impact**:
-  Pure Python line parsing processes ~300,000 lines/second on modern server CPUs. For large alignment datasets with $10^8$ lines (7.5 GB TSV), line parsing alone consumes over 5 minutes of wall-clock time on a single core before any parallel processing begins.
-- **Proposed Fix**:
-  Accelerate TSV ingestion by reading tabular chunks using `pandas.read_csv(..., sep='\t', engine='c', chunksize=100_000)` or PyArrow, vectorizing coordinate transformation ($[s-1, e)$) and filtering self-hits with NumPy operations.
-
-```python
-# FAULTY (aligners.py:177-228 - Python loop with string splits and scalar int parsing):
-for line in handle:
-    fields = line.split("\t")
-    raw_qs, raw_qe = int(fields[6]), int(fields[7])
-    ...
-
-# REVISED (aligners.py - Vectorized chunked CSV parsing):
-for df_chunk in pd.read_csv(tsv_file, sep='\t', header=None,
-                            usecols=[0, 1, 6, 7, 8, 9],
-                            names=['q', 't', 'qs', 'qe', 'ts', 'te'],
-                            chunksize=100_000, engine='c'):
-    df_valid = df_chunk[df_chunk['q'] != df_chunk['t']]
-    # Vectorized NumPy coordinate conversions
-    ...
-```
-
-- **Validation**:
-  1. Profile parsing throughput on a 10M-line MMseqs2 BLAST-TAB file.
-  2. Verify ingestion speed exceeds 2,000,000 lines/second with identical coordinate tuples.
-
----
-
 ## Memory Expansion During Geometric Target Buffer Reallocation
 
 - **Evidence**:
