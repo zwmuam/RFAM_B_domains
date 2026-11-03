@@ -70,43 +70,6 @@ for r, c, inter, dom_lens_dict in target_workers.imap_unordered():
 
 ---
 
-## Batch Sizing Discrepancy on Small Target Sequence Counts
-
-- **Evidence**:
-  `PREVIOUS_UPDATE.md` claimed: *"On $n_{\text{target\_seqs}} = 35$ with 32 worker threads, verify $\ge 32$ batches are generated and all worker cores receive tasks."*
-  However, the implemented formula in `domain_finder.py:603` is:
-  ```python
-  if n_target_seqs <= cpu * 4:
-      target_batch_size = max(1, int(np.ceil(n_target_seqs / max(1, cpu))))
-  ```
-  For $n_{\text{target\_seqs}} = 35$ and $\text{cpu} = 32$:
-  $$\text{target\_batch\_size} = \max(1, \lceil 35 / 32 \rceil) = 2$$
-  This yields $\lceil 35 / 2 \rceil = 18$ batches total.
-- **Impact**:
-  Only 18 of the 32 available CPU cores receive tasks, leaving 14 worker cores (43.75% of compute capacity) idle. The claim that $\ge 32$ batches are generated was mathematically false under the implemented formula.
-- **Proposed Fix**:
-  When $n_{\text{target\_seqs}} \le \text{cpu}$, set `target_batch_size = 1`. For $n_{\text{target\_seqs}} \le \text{cpu} \times 4$, set `target_batch_size = max(1, n_target_seqs // (cpu * 2))` or enforce `target_batch_size = 1` whenever $n_{\text{target\_seqs}} \le \text{cpu} \times 2$.
-
-```python
-# FAULTY (domain_finder.py:603 - np.ceil(n / cpu) yields batch size 2 for n=35, cpu=32, starving 14 cores):
-if n_target_seqs <= cpu * 4:
-    target_batch_size = max(1, int(np.ceil(n_target_seqs / max(1, cpu))))
-
-# REVISED (domain_finder.py - Guarantees full core saturation when sequence count <= cpu * 2):
-if n_target_seqs <= cpu * 2:
-    target_batch_size = 1
-elif n_target_seqs <= cpu * 4:
-    target_batch_size = max(1, n_target_seqs // (cpu * 2))
-else:
-    target_batch_size = max(10, min(1000, n_target_seqs // (cpu * 4)))
-```
-
-- **Validation**:
-  1. Test $n_{\text{target\_seqs}} = 35$ with $\text{cpu} = 32$; verify 35 batches are produced and dispatched across all 32 workers.
-  2. Test $n_{\text{target\_seqs}} = 100,000$; verify batch size caps at 1,000.
-
----
-
 # Scientific, Mathematical, and Algorithmic Vulnerabilities
 
 ## Arbitrary Nearest-Higher Tie-Breaking in Sparse Matrix Traversal
