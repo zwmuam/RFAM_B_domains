@@ -4,7 +4,7 @@ The pipeline extracts conserved structural RNA domain instances from pairwise al
 1. Peak system memory must stay bounded below 200 GB.
 2. Parallel worker memory overhead must remain below 200 MB per CPU core.
 3. Multi-core execution must scale smoothly up to 30+ threads without worker starvation or inter-process communication bottlenecks.
-4. Noise instances ($-1$) must never be assigned to valid clusters or bias downstream biological metrics.
+4. 0-similarity mist never link domain targets. It should be ignored domain finding (no overlap), halo filtering (0 is NOT a link to other clusters), merging/filtering (0-overlap spans are disjoint) and family findin (0-similarity domains are unlinked, unless they are connected indirectly by other domain).
 
 ---
 
