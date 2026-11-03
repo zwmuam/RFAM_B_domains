@@ -23,17 +23,12 @@ def compare_sorted_spans(spans: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.
     starts = spans[:, 0]
     ends = spans[:, 1]
 
-
-    if not isinstance(starts, np.ndarray):
-        starts = np.array(starts, dtype=np.int64)
-        ends = np.array(ends, dtype=np.int64)
-
     lows, highs, inters = [], [], []
 
-    # Vectorized searchsorted binary range slice for O(N log N + K) complexity
+    # Vectorized searchsorted binary range slice on full array without ephemeral slice allocations
     for i in range(n):
         end_i = ends[i]
-        r = np.searchsorted(starts[i + 1:], end_i, side="left") + (i + 1)
+        r = max(i + 1, int(np.searchsorted(starts, end_i, side="left")))
         if r > i + 1:
             st_js = starts[i + 1:r]
             en_js = ends[i + 1:r]
@@ -43,7 +38,7 @@ def compare_sorted_spans(spans: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.
                 js = np.arange(i + 1, r, dtype=np.int32)[valid]
                 lows.append(np.full(js.size, i, dtype=np.int32))
                 highs.append(js)
-                inters.append(overlap[valid].astype(np.int32))
+                inters.append(overlap[valid].astype(np.int32, copy=False))
 
     if not lows:
         return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
@@ -869,7 +864,12 @@ def dpc(rows: np.ndarray,
              - Integer count of unassigned or halo/noise points.
     """
     if rows.size == 0:
-        return {int(p): np.array([p], dtype=np.int64) for p in range(n)}, 0
+        densities = np.ones(n, dtype=np.float64) if weights is None else np.asarray(weights, dtype=np.float64)
+        qualifying = np.flatnonzero(densities >= min_dens)
+        if qualifying.size == 0:
+            return {}, int(n)
+        peak_to_cluster = {int(p): np.array([p], dtype=np.int64) for p in qualifying}
+        return peak_to_cluster, int(n - qualifying.size)
 
     if not (0.0 < min_sim < 1.0):
         raise ValueError('min_sim must be in (0, 1)')
@@ -878,8 +878,9 @@ def dpc(rows: np.ndarray,
     if backend not in ('numpy', 'scipy'):
         raise ValueError("backend must be 'numpy' or 'scipy'")
 
-    rows = np.ascontiguousarray(rows, dtype=np.int64)
-    cols = np.ascontiguousarray(cols, dtype=np.int64)
+    ## mem_opt ## Retain 32-bit integer representations for sparse graph coordinates
+    rows = np.ascontiguousarray(rows, dtype=np.int32)
+    cols = np.ascontiguousarray(cols, dtype=np.int32)
     sims = np.ascontiguousarray(sims, dtype=np.float64)
 
     if sims.size and (sims.min() < 0.0 or sims.max() > 1.0):

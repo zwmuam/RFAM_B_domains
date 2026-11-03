@@ -28,7 +28,7 @@ import numpy as np
 from tqdm import tqdm
 
 # internal repository/package imports
-from aligners import (SequenceRegistry, count_fasta,
+from aligners import (SequenceRegistry,
                       populate_registry_from_fasta,
                       batch_parse_mmseqs_tsv)
 from clustering import (compare_sorted_spans,
@@ -339,7 +339,7 @@ def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray
     """
     Process a batch of target sequences to merge same-domain intervals, compute
     per-domain target lengths, and calculate pairwise target overlaps.
-    Maintains 64-bit integers for all physical genomic coordinate operations.
+    Maintains 32-bit integers for all physical genomic coordinate operations.
 
     :param batch_targets: List of (target_id, target_spans, domain_pointers).
     :return: Tuple of (rows, cols, intersections, domain_lengths_dict).
@@ -348,18 +348,28 @@ def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray
     batch_dom_lengths: Dict[int, int] = defaultdict(int)
 
     for target_id, target_spans, domain_pointers in batch_targets:
-        uniq_domains = np.unique(domain_pointers)
+        if domain_pointers.size == 0:
+            continue
+
+        ## mem_opt ## Group domain intervals contiguously using boundary indexing instead of repeated unvectorized boolean masks
+        d_order = np.argsort(domain_pointers)
+        s_doms = domain_pointers[d_order]
+        s_spans = target_spans[d_order]
+
+        dom_boundaries = np.flatnonzero(np.diff(s_doms)) + 1
+        dom_splits = np.split(s_doms, dom_boundaries)
+        span_splits = np.split(s_spans, dom_boundaries)
+
         merged_spans_list = []
         aligned_domains_list = []
 
-        for d_id in uniq_domains:
-            dom_mask = domain_pointers == d_id
-            d_spans = target_spans[dom_mask]
-            m_spans = merge_overlapping_spans(d_spans)
+        for d_group, sp_group in zip(dom_splits, span_splits):
+            d_id = int(d_group[0])
+            m_spans = merge_overlapping_spans(sp_group)
             for sp in m_spans:
                 merged_spans_list.append(sp)
                 aligned_domains_list.append(d_id)
-                batch_dom_lengths[int(d_id)] += int(sp[1] - sp[0])
+                batch_dom_lengths[d_id] += int(sp[1] - sp[0])
 
         if len(merged_spans_list) <= 1:
             continue
@@ -419,17 +429,27 @@ def family_finder(rows: np.ndarray,
     :param halo_method: Halo filtering algorithm.
     :return: Tuple of (peak_to_cluster dictionary, n_noise count).
     """
-    if rows.size == 0 or n_domains <= 1:
-        return {int(i): np.array([i], dtype=np.int64) for i in range(n_domains)}, 0
+    if n_domains == 0:
+        return {}, 0
 
     # Ensure canonical undirected edges (rows < cols)
-    u_r = np.minimum(rows, cols).astype(np.int64)
-    u_c = np.maximum(rows, cols).astype(np.int64)
-    diff = u_r != u_c
-    u_r, u_c, inters = u_r[diff], u_c[diff], intersections[diff].astype(np.int64)
+    if rows.size > 0:
+        u_r = np.minimum(rows, cols).astype(np.int64)
+        u_c = np.maximum(rows, cols).astype(np.int64)
+        diff = u_r != u_c
+        u_r, u_c, inters = u_r[diff], u_c[diff], intersections[diff].astype(np.int64)
+    else:
+        u_r = np.empty(0, dtype=np.int64)
+        u_c = np.empty(0, dtype=np.int64)
+        inters = np.empty(0, dtype=np.int64)
 
     if u_r.size == 0:
-        return {int(i): np.array([i], dtype=np.int64) for i in range(n_domains)}, 0
+        # Trivial self-similarity diagonal correction (self-density = 1.0)
+        # Qualified solitary domains must meet min_fam_dens
+        qualifying = np.flatnonzero(np.ones(n_domains, dtype=np.float64) >= min_fam_dens)
+        if qualifying.size == 0:
+            return {}, int(n_domains)
+        return {int(i): np.array([i], dtype=np.int64) for i in qualifying}, int(n_domains - qualifying.size)
 
     keys = (u_r << 32) | u_c
     order = np.argsort(keys)
@@ -497,7 +517,8 @@ def evaluate_clusters(peak_to_cluster: Dict[int, np.ndarray],
                     continue
 
                 sorted_domains = sorted(domains, key=lambda d: d[1])
-                spans_arr = np.array([[d[1], d[2]] for d in sorted_domains], dtype=np.int64)
+                ## mem_opt ## Standardize interval spans array to np.int32
+                spans_arr = np.array([[d[1], d[2]] for d in sorted_domains], dtype=np.int32)
                 merged_spans = merge_overlapping_spans(spans_arr)
 
                 for m_start, m_end in merged_spans:
@@ -578,14 +599,6 @@ def find_domains(fasta_path: Path,
         "halo_method": halo_method,
     }
 
-    query_workers = Parallel(function=batch_query_processor,
-                             input_collection=batch_gen,
-                             kwargs=query_kwargs,
-                             n_jobs=cpu,
-                             bar=True,
-                             description="Finding domain instances",
-                             chunk_size='auto')
-
     target_dtype = np.dtype([
         ('t_seq', np.int32),
         ('start', np.int32),
@@ -601,25 +614,52 @@ def find_domains(fasta_path: Path,
     target_buffer = np.empty(est_capacity, dtype=target_dtype)
     write_offset = 0
 
-    for batch_res in query_workers.results:
-        for local_domains, all_targets in batch_res:
-            n_doms = len(local_domains)
-            if n_doms == 0:
-                continue
-            global_domains.extend(local_domains)
-            n_hits = all_targets.shape[0] if all_targets.size > 0 else 0
-            if n_hits > 0:
-                if write_offset + n_hits > target_buffer.shape[0]:
-                    new_size = max(target_buffer.shape[0] * 2, write_offset + n_hits + 100_000)
-                    target_buffer = np.resize(target_buffer, new_size)
+    ## mem_opt ## Stream worker pool results chunk-by-chunk to prevent accumulating >200GB in a monolithic Python list
+    # Process queries in streaming chunks through WorkerPool rather than gathering entire TSV in memory
+    def stream_query_batches(batch_generator: Generator[List[Tuple[int, np.ndarray, np.ndarray]], None, None],
+                             chunk_window: int = 50) -> Generator[List[List[Tuple[int, np.ndarray, np.ndarray]]], None, None]:
+        window: List[List[Tuple[int, np.ndarray, np.ndarray]]] = []
+        for b in batch_generator:
+            window.append(b)
+            if len(window) >= chunk_window:
+                yield window
+                window = []
+        if window:
+            yield window
 
-                dest = target_buffer[write_offset:write_offset + n_hits]
-                dest['t_seq'] = all_targets[:, 0]
-                dest['start'] = all_targets[:, 1]
-                dest['end'] = all_targets[:, 2]
-                dest['dom_id'] = all_targets[:, 3] + global_offset
-                write_offset += n_hits
-            global_offset += n_doms
+    with tqdm(desc="Finding domain instances", unit="batch") as pbar:
+        for batch_window in stream_query_batches(batch_gen, chunk_window=50):
+            query_workers = Parallel(function=batch_query_processor,
+                                     input_collection=batch_window,
+                                     kwargs=query_kwargs,
+                                     n_jobs=cpu,
+                                     bar=False,
+                                     chunk_size=1)
+
+            for batch_res in query_workers.results:
+                for local_domains, all_targets in batch_res:
+                    n_doms = len(local_domains)
+                    if n_doms == 0:
+                        continue
+                    global_domains.extend(local_domains)
+                    n_hits = all_targets.shape[0] if all_targets.size > 0 else 0
+                    if n_hits > 0:
+                        if write_offset + n_hits > target_buffer.shape[0]:
+                            ## mem_opt ## Safe geometric reallocation copying only active prefix without cyclic data duplication
+                            new_size = max(target_buffer.shape[0] * 2, write_offset + n_hits + 100_000)
+                            new_buffer = np.empty(new_size, dtype=target_dtype)
+                            new_buffer[:write_offset] = target_buffer[:write_offset]
+                            target_buffer = new_buffer
+
+                        dest = target_buffer[write_offset:write_offset + n_hits]
+                        dest['t_seq'] = all_targets[:, 0]
+                        dest['start'] = all_targets[:, 1]
+                        dest['end'] = all_targets[:, 2]
+                        dest['dom_id'] = all_targets[:, 3] + global_offset
+                        write_offset += n_hits
+                    global_offset += n_doms
+            pbar.update(len(batch_window))
+            del query_workers
 
     n_total_domains = len(global_domains)
 
@@ -627,25 +667,32 @@ def find_domains(fasta_path: Path,
         all_targets_arr = target_buffer[:write_offset]
         del target_buffer
         all_targets_arr.sort(order=['t_seq', 'start'])
+        ## mem_opt ## Index target sequence groups directly via boundary offsets instead of creating intermediate Python list slices with np.split
         seq_breaks = np.flatnonzero(np.diff(all_targets_arr['t_seq'])) + 1
-        target_seq_groups = np.split(all_targets_arr, seq_breaks)
-        n_target_seqs = len(target_seq_groups)
+        seq_starts = np.concatenate(([0], seq_breaks))
+        seq_ends = np.concatenate((seq_breaks, [all_targets_arr.shape[0]]))
+        n_target_seqs = len(seq_starts)
     else:
         del target_buffer
-        target_seq_groups = []
+        seq_starts = np.empty(0, dtype=np.intp)
+        seq_ends = np.empty(0, dtype=np.intp)
         n_target_seqs = 0
 
     logger.info(f"Found {n_total_domains} domain instances across {n_target_seqs} target sequences")
 
     # 3. Stage 4: Parallel target sequence overlap calculation
+    ## mem_opt ## Adaptive workstation batch sizing ensuring uniform multi-core utilization without thread starvation
+    target_batch_size = max(10, min(250, n_target_seqs // max(1, cpu * 4)))
+
     def target_batch_generator() -> Generator[List[Tuple[int, np.ndarray, np.ndarray]], None, None]:
         batch_pkg: List[Tuple[int, np.ndarray, np.ndarray]] = []
-        for grp in target_seq_groups:
+        for st, en in zip(seq_starts, seq_ends):
+            grp = all_targets_arr[st:en]
             t_seq = int(grp['t_seq'][0])
             spans = np.column_stack((grp['start'], grp['end']))
             dom_ptrs = grp['dom_id']
             batch_pkg.append((t_seq, spans, dom_ptrs))
-            if len(batch_pkg) >= 1000:
+            if len(batch_pkg) >= target_batch_size:
                 yield batch_pkg
                 batch_pkg = []
         if batch_pkg:
@@ -657,7 +704,7 @@ def find_domains(fasta_path: Path,
                               n_jobs=cpu,
                               bar=True,
                               description="Calculating target overlaps",
-                              chunk_size='auto')
+                              chunk_size=1)
 
     accumulated_rows: List[np.ndarray] = []
     accumulated_cols: List[np.ndarray] = []
