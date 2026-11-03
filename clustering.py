@@ -895,7 +895,7 @@ def dpc(rows: np.ndarray,
     # Peak selection on the decision graph
     gamma = densities * (1.0 - s_max_higher)
     sorted_by_gamma = np.lexsort((np.arange(n), -gamma))
-    is_candidate_peak = (densities > min_dens) & ((s_max_higher < min_sim) | (nearest_higher == -1))
+    is_candidate_peak = (densities >= min_dens) & ((s_max_higher < min_sim) | (nearest_higher == -1))
     peak_indices = sorted_by_gamma[is_candidate_peak[sorted_by_gamma]]
 
     # Early exit: if no candidate satisfies min_dens, classify all instances as noise
