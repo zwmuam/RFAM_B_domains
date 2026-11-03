@@ -1,27 +1,16 @@
 # PROBLEMS: Comprehensive Audit of the Domain Finding Codebase and Dependencies
 
-## 1. Executive Summary & Codebase Audit Overview
-
-This audit evaluates the scientific validity, mathematical rigor, computational efficiency, memory scaling, and architectural cohesion of the conserved ncRNA domain-finding pipeline (`domain_finder.py`, `clustering.py`, `aligners.py`, and `executor.py`).
-
 The pipeline extracts conserved structural RNA domain instances from pairwise alignments (MMseqs2 or RiboSeek) and clusters them into global domain families via Density Peak Clustering (DPC). Operating on massive multi-gigabyte or >100GB alignment datasets imposes strict operational requirements:
 1. Peak system memory must stay bounded below 200 GB.
 2. Parallel worker memory overhead must not exceed 200 MB per CPU core.
 3. Multi-core execution must scale efficiently up to 30+ threads without worker starvation or IPC communication bottlenecks.
 4. Noise instances ($-1$) must never be assigned to valid clusters or corrupt downstream metrics.
 
-While past refactorings addressed several critical bottlenecks (such as streaming batch processing in Stage 2 and vectorizing range searches), this audit identified significant unresolved issues, mathematical border-case inconsistencies, memory bloats on >100GB datasets, and lingering discrepancies from `PREVIOUS_UPDATE.md`.
-
 ---
 
 ## 2. Re-Assessment and Audit of PREVIOUS_UPDATE.md Claims
 
-`PREVIOUS_UPDATE.md` documented five key problems and reported their resolution. Our re-evaluation confirmed that three solutions were applied effectively:
-- Safe geometric reallocation copying only the active prefix in Stage 3 (`domain_finder.py:613-625`) eliminated cyclic data duplication from `np.resize`.
-- Direct binary search on the full sorted array in `compare_sorted_spans` (`clustering.py:32-45`) eliminated ephemeral sub-array view allocations.
-- Sorting target spans by `domain_pointers` with boundary splitting (`domain_finder.py:355-365`) replaced unvectorized boolean masking in worker loops.
-
-However, two claims from `PREVIOUS_UPDATE.md` were incompletely implemented or introduced subsequent complications:
+Two claims from `PREVIOUS_UPDATE.md` were incompletely implemented or introduced subsequent complications:
 
 ### Disjoint Graph Density Thresholding in family_finder Was Partially Bypassed
 - **Audit Finding:** In `domain_finder.py:family_finder` (lines 430-442), when domain instances share zero target overlaps across other sequences (`u_r.size == 0`), solitary domains are filtered against `min_fam_dens` under the assumption that their local density is $1.0$ (`np.ones(n_domains, dtype=np.float64)`). However, in biological reality, solitary domain instances possess alignment target support proportional to their number of target occurrences $N_{\text{targets}}$. Forcing their local density to $1.0$ discards high-confidence solitary domains if $\text{min\_fam\_dens} > 1.0$, while admitting zero-overlap spurious singletons if $\text{min\_fam\_dens} \le 1.0$.
