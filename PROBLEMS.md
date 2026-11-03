@@ -12,30 +12,8 @@ The pipeline extracts conserved structural RNA domain instances from pairwise al
 
 Two claims from `PREVIOUS_UPDATE.md` were incompletely implemented or introduced subsequent complications:
 
-**Disjoint Graph Density Thresholding in family_finder Was Partially Bypassed**
-- **Audit Finding:** In `domain_finder.py:family_finder`, when candidate domain instances share zero pairwise target overlaps across sequences (`u_r.size == 0`), the code checks whether domains meet `min_fam_dens` by assuming every domain has a fixed self-density of $1.0$ (`np.ones(n_domains, dtype=np.float64)`). In biological datasets, solitary domain instances possess real alignment support proportional to their number of target occurrences $N_{\text{targets}}$. Forcing solitary density to $1.0$ causes two distinct failures:
-  1. If a user sets `min_fam_dens > 1.0` (e.g. requiring at least 3 supporting hits), all solitary domains are discarded as noise—even highly conserved domains supported by hundreds of hits across genomes.
-  2. If `min_fam_dens <= 1.0`, single-hit spurious noise artifacts are accepted as valid domain family peaks.
-- **Subsequent Problem:** In `clustering.py:dpc`, an empty edge check (`rows.size == 0`) evaluates `densities >= min_dens`. However, when `family_finder` calls `dpc`, it does not pass domain weights (`weights=None`). Consequently, `dpc` calculates density solely from edge similarities plus diagonal $1.0$, completely losing track of underlying alignment hit counts. If candidate domains share no target overlaps, or form disconnected graph components with zero mutual edges, their real biological support is ignored.
 
-```python
-# FAULTY (domain_finder.py:family_finder - Solitary domains assigned artificial density 1.0):
-if u_r.size == 0:
-    qualifying = np.flatnonzero(np.ones(n_domains, dtype=np.float64) >= min_fam_dens)
-    if qualifying.size == 0:
-        return {}, int(n_domains)
-    return {int(i): np.array([i], dtype=np.int64) for i in qualifying}, int(n_domains - qualifying.size)
-
-# REVISED (domain_finder.py:family_finder - Evaluate density using true alignment hit support):
-if u_r.size == 0:
-    densities = np.ones(n_domains, dtype=np.float64) if dom_weights is None else np.asarray(dom_weights, dtype=np.float64)
-    qualifying = np.flatnonzero(densities >= min_fam_dens)
-    if qualifying.size == 0:
-        return {}, int(n_domains)
-    return {int(i): np.array([i], dtype=np.int64) for i in qualifying}, int(n_domains - qualifying.size)
-```
-
-**Coordinate Typing Harmonization and Docstring Drift**
+**Coordinate Typing Harmonization**
 - **Audit Finding:** `PREVIOUS_UPDATE.md` stated that coordinates and sparse edge arrays were standardized to 32-bit integers (`np.int32`). While `domain_finder.py:evaluate_clusters` was updated to `np.int32`, `clustering.py:build_similarity_matrix` still casts 32-bit row and column indices to `np.int64` and allocates 64-bit diagonal arrays unconditionally. This doubles memory usage during sparse matrix construction. Furthermore, docstrings in `target_batch_processor` still claim 64-bit coordinate operations are maintained.
 
 ```python
