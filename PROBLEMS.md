@@ -148,10 +148,7 @@ for fields in reader:
 - **Evidence in Code:**
   - `domain_finder.py:657`: Hard floor of `10` in `target_batch_size`.
 - **Recommended Solution:**
-  Scale `target_batch_size` dynamically down to 1 when sequence counts are small:
-  $$
-  \text{target\_batch\_size} = \max\left(1, \min\left(250, \left\lceil \frac{\text{n\_target\_seqs}}{\text{cpu} \times 4} \right\rceil\right)\right)
-  $$
+  Scale `target_batch_size` dynamically down to 1 when sequence counts are small
 
 ```python
 # FAULTY (domain_finder.py:657 - Hard floor of 10 starves workers on <= 40 sequences):
