@@ -1,3 +1,4 @@
+# PREVIOUS_UPDATE
 **Problem 1: Bypassing Minimum Density Filtering in Disjoint DPC (`clustering.py`, `domain_finder.py`)**
 
 - **Module / Component:** `clustering.py` (`dpc`), `domain_finder.py` (`domain_instances_on_query`, `family_finder`)
@@ -30,6 +31,7 @@ if rows.size == 0:
     peak_to_cluster = {int(p): np.array([p], dtype=np.int64) for p in qualifying}
     return peak_to_cluster, int(n - qualifying.size)
 ```
+WAS THIS PROBLEM EVER AMMENDED? IS IT STILL IN THE CODE?
 
 ---
 
