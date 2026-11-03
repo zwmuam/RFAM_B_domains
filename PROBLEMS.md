@@ -1,4 +1,5 @@
 # Abstract
+The pipeline extracts conserved structural RNA domain instances from pairwise alignments (MMseqs2 or RiboSeek) and clusters them into global domain families via Density Peak Clustering (DPC). Processing large hundreds-gigabyte alignment datasets imposes strict operational requirements:
 
 1. Peak system memory must stay bounded strictly below 200 GB.
 2. Parallel worker memory overhead must remain strictly below 500 MB per worker process.
