@@ -215,34 +215,32 @@ cols = np.ascontiguousarray(cols, dtype=np.int32)
 
 The following risks should be considered prior to code refactoring:
 
-1. **Euclidean Halo Filtering on Structured ncRNA:**
+1. **AVOID Euclidean Halo Filtering - it does not work with Structured ncRNA :**
    Traditional Rodriguez-Laio halo filtering assumes Gaussian clusters with dense spherical centers. Structured ncRNA domains display non-uniform coverage and ragged alignment boundaries. Applying traditional halo filtering can aggressively discard legitimate biological variants and multimeric duplications. The `similarity_weighted` halo method with `point_specific=True` must remain the default.
 
 2. **Multiprocessing Context Under Linux (`forkserver` vs `spawn`):**
    The monkey-patch in `executor.py` redirects MPIRE's `SyncManager` to `forkserver`. However, if `forkserver` is initialized after background threads have been spawned, worker processes can still inherit corrupted lock states. Any synchronization manager initialization must strictly precede worker pool dispatch.
 
 3. **Peak Memory Ceiling on Multi-Gigabyte Alignments:**
-   For multi-GB alignment files ($> 10^7$ hits), sorting `all_targets_arr` in-place requires up to 32 bytes per hit. For 100 million hits, this requires 3.2 GB of RAM. The pipeline must avoid converting structured arrays into intermediate Python dictionaries or object lists.
+   For multi-GB alignment files ($> 10^7$ hits), sorting `all_targets_arr` in-place requires up to 32 bytes per hit. For 100 million hits, this requires 3.2 GB of RAM. The pipeline must avoid converting structured arrays into intermediate Python dictionaries or object lists. Additionally accumulation of target hits still requires immense chunk of RAM. If any memory optimisations are available try to include them at this stage.
 
 ---
 
-## 3. Phased Implementation Plan
+## 3. Implementation Plan
 
-This phased plan outlines the sequence of updates recommended for future execution:
-
-1. **Phase 1: Algorithmic & Biological Correctness**
+**Phase 1: Algorithmic & Biological Correctness**
    - Correct disjoint density thresholding in `clustering.py:dpc` so that candidate instances failing $\text{min\_dens}$ are assigned to noise ($-1$).
    - Replace `np.resize` in `domain_finder.py:find_domains` with safe geometric buffer reallocation.
 
-2. **Phase 2: Performance & Concurrency Optimization**
+**Phase 2: Performance & Concurrency Optimization**
    - Optimize `compare_sorted_spans` in `clustering.py` by performing binary search directly on the full `starts` array without slice allocations.
    - Configure adaptive target batch sizing in `domain_finder.py:find_domains` and set `chunk_size = 1` for generator inputs in `Parallel`.
    - Refactor `target_batch_processor` to group domain intervals by sorting `domain_pointers` and splitting on contiguous boundaries.
 
-3. **Phase 3: Coordinate Type Harmonization & Cleanup**
+**Phase 3: Coordinate Type Harmonization & Cleanup**
    - Standardize all coordinates, spans, and local index arrays to `np.int32` in `domain_finder.py:evaluate_clusters` and `clustering.py:dpc`.
    - Remove unused import `count_fasta` from `domain_finder.py`.
    - Correct outdated docstrings in `target_batch_processor`.
 
-4. **Phase 4: Test Verification**
+**Phase 4: Test Verification**
    - Run `python3 -m pytest -v -W error::DeprecationWarning` to ensure zero regressions across the complete test suite.
