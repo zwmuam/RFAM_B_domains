@@ -268,7 +268,7 @@ peak_to_cluster, n_noise = dpc(rows=rows,
 
 **Phase: High-Throughput Streaming Parser Optimization**
 1. In `aligners.py:parse_mmseqs_tsv`, optimize BLAST-TAB line parsing using buffered `csv.reader` to reduce intermediate Python string allocations during multi-gigabyte file streaming.
-2. Ensure `target_batch_size` dynamically scales down to 1 when target sequence counts are small to guarantee 100% CPU thread saturation.
+2. Ensure `target_batch_size` dynamically scales down to 1 when target sequence counts are small to get optimal CPU thread saturation.
 
 **Phase: Test Verification and Benchmarking**
 1. Validate cluster results and noise assignments across synthetic benchmarks with known ground-truth borders.
