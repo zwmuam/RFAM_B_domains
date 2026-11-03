@@ -258,45 +258,11 @@ if mp.get_start_method(allow_none=True) != _safe_ctx_name:
 
 ---
 
-## Asymmetric Point-Specific Parameter Exposure
-
-- **Evidence**:
-  In `domain_finder.py:find_domains`:
-  ```python
-  point_specific_val = bool(attributes.get("point_specific", False))
-  ```
-  `point_specific_val` is passed uniformly to both Stage 2 `batch_query_processor` and Stage 5 `family_finder`.
-  In `domain_finder_precomputed.py`:
-  ```python
-  def find_domains(..., point_specific: bool = False, ...):
-      attributes = { ..., "point_specific": point_specific }
-  ```
-- **Impact**:
-  Stage 2 operates on query alignment spans (identifying domain instances on single RNA sequences), whereas Stage 5 operates on target overlaps (grouping domain instances across genomes into families).
-  Biologically, query spans often have ragged ends requiring point-specific halo filtering, whereas family clustering on Jaccard graphs may benefit from traditional halo filtering. Users cannot configure Stage 2 and Stage 5 independently.
-- **Proposed Fix**:
-  Support independent controls `point_specific_spans` and `point_specific_families`, falling back to `point_specific` when individual flags are omitted.
-
-```python
-# FAULTY (domain_finder.py:512 - Single parameter forces identical mode in both stages):
-point_specific_val = bool(attributes.get("point_specific", False))
-
-# REVISED (domain_finder.py - Decoupled stage-specific parameters with backward fallback):
-ps_spans = bool(attributes.get("point_specific_spans", attributes.get("point_specific", False)))
-ps_families = bool(attributes.get("point_specific_families", attributes.get("point_specific", False)))
-```
-
-- **Validation**:
-  1. Test running with `point_specific_spans=True` and `point_specific_families=False`.
-  2. Verify Stage 2 uses point-specific filtering while Stage 5 uses cluster-wide halo filtering.
-
----
-
 # Phased Implementation Plan for Future Revisions
 
 This implementation plan provides direct, step-by-step instructions for future engineering runs. Each phase specifies exact file modifications, coding conventions, anti-patterns to avoid, and risk controls.
 
-## Phase: Correcting Inequality Inconsistencies and Ties in Clustering
+## Phase: Correcting Inconsistencies and Ties in Clustering
 1. **Target File:** `clustering.py`
    - **Target Functions:** `dpc` and `_nearest_higher_sparse`
    - **Specific Instructions:**
