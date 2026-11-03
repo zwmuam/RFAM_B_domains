@@ -29,6 +29,7 @@ mat = csr_matrix((max_s, (u_r.astype(np.int32), u_c.astype(np.int32))), shape=(n
 mat.setdiag(1.0)
 ```
 
+
 **Unbounded Accumulation of Intermediate Edge Triplets in Stage 4 Master Process**
 - **Module / Component:** `domain_finder.py` (`find_domains`, Stage 4)
 - **Severity / Category:** HIGH | Memory Scaling & RAM Ceiling Risk on >100GB TSVs
@@ -88,7 +89,8 @@ for r, c, inter, dom_lens_dict in target_workers.results:
             global_dom_lengths[d_id] += d_len
 ```
 
-** BLAST-TAB TSV Parsing Inefficiency with Python String Splitting**
+
+**BLAST-TAB TSV Parsing Inefficiency with Python String Splitting**
 - **Module / Component:** `aligners.py` (`parse_mmseqs_tsv`)
 - **Severity / Category:** MEDIUM | Performance Bottleneck on >100GB Alignments
 - **Detailed Bioinformatic & Technical Analysis:**
@@ -132,9 +134,8 @@ for fields in reader:
     raw_ts, raw_te = int(fields[8]), int(fields[9])
 ```
 
----
 
-** Suboptimal Single-Worker Dispatch in target_batch_generator on Low Sequence Counts**
+**Suboptimal Single-Worker Dispatch in target_batch_generator on Low Sequence Counts**
 - **Module / Component:** `domain_finder.py` (`find_domains`, Stage 4)
 - **Severity / Category:** MEDIUM | Parallel Concurrency Bottleneck
 - **Detailed Bioinformatic & Technical Analysis:**
@@ -199,26 +200,13 @@ mat = csr_matrix((max_s, (u_r.astype(np.int32), u_c.astype(np.int32))), shape=(n
 mat.setdiag(1.0)
 ```
 
----
 
-**Problem G: Inconsistent Point-Specific Parameter Exposure in domain_finder.py**
+**Inconsistent Point-Specific Parameter Exposure in domain_finder.py**
 - **Module / Component:** `domain_finder.py` (`domain_instances_on_query`, `find_domains`)
 - **Severity / Category:** LOW | API & Pipeline Consistency
 - **Detailed Bioinformatic & Technical Analysis:**
   In `domain_finder.py:find_domains`, `point_specific_val` is retrieved from `attributes.get("point_specific", False)` and forwarded to Stage 5 `family_finder`.
   However, in Stage 2 `domain_instances_on_query`, `dpc` is invoked for query domain instance discovery without passing `point_specific`:
-  ```python
-  peak_to_cluster, n_noise = dpc(rows=rows,
-                                 cols=cols,
-                                 sims=similarities,
-                                 n=n_spans,
-                                 min_sim=min_dom_sim,
-                                 weights=weights,
-                                 backend="numpy",
-                                 filter_transparency=halo_stringency,
-                                 halo_method=halo_method,
-                                 min_dens=min_dom_dens)
-  ```
   `dpc` defaults to `point_specific=False`. Consequently, halo filtering in Stage 2 uses traditional cluster-wide density thresholding (which aggressively prunes ragged biological RNA domain clusters), while Stage 5 permits `point_specific=True`.
   To maintain consistent halo filtering semantics across all stages, `point_specific` should be configurable in `domain_instances_on_query` and passed via `query_kwargs`.
 - **Evidence in Code:**
@@ -257,10 +245,8 @@ peak_to_cluster, n_noise = dpc(rows=rows,
 
 ## Phased Implementation Plan for Future Revisions
 
-**Phase: Mathematical Integrity and Halo Noise Mask Correction**
-1. In `clustering.py:_foreign_mask`, update the boolean mask so that neighbor points with label $-1$ (noise) are excluded from foreign contamination calculations (`(reference >= 0) & (nbr_labels >= 0) & (reference != nbr_labels)`).
-2. In `domain_finder.py:family_finder`, update solitary domain density calculation when `u_r.size == 0` to use actual domain target occurrence counts rather than uniform $1.0$.
-3. Forward `point_specific` parameter consistently to `domain_instances_on_query` in Stage 2.
+**Phase: Interface update**
+1. Forward `point_specific` parameter consistently to `domain_instances_on_query` in Stage 2.
 
 **Phase: Memory Ceiling Optimization for >100GB Alignments**
 1. In `domain_finder.py:find_domains` Stage 4, replace list accumulation in `accumulated_rows`, `accumulated_cols`, and `accumulated_inters` with direct array pre-allocation to eliminate memory duplication during `np.concatenate`.
