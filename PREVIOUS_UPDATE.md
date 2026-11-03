@@ -12,6 +12,8 @@ The pipeline extracts conserved structural RNA domain instances from pairwise al
 
 ---
 
+# PREVIOUS UPDATE - PROBLEMS AND SOLUTIONS
+
 ## Memory Accumulation in Stage 4 Target Overlap Collection
 
 - **Evidence**:
