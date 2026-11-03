@@ -205,16 +205,13 @@ def build_similarity_matrix(rows: np.ndarray,
             max_s = np.maximum.reduceat(s_s, starts)
             u_r, u_c = r_s[starts], c_s[starts]
 
-        diag = np.arange(n, dtype=np.int64)
-        all_r = np.concatenate((u_r, diag))
-        all_c = np.concatenate((u_c, diag))
-        all_s = np.concatenate((max_s, np.ones(n, dtype=np.float64)))
+        idx_dtype = np.int32 if (n < (1 << 31) - 1 and (u_r.size + n) < (1 << 31) - 1) else np.int64
+        mat = csr_matrix((max_s, (u_r.astype(idx_dtype), u_c.astype(idx_dtype))), shape=(n, n))
     else:
-        all_r = np.arange(n, dtype=np.int64)
-        all_c = all_r
-        all_s = np.ones(n, dtype=np.float64)
+        idx_dtype = np.int32 if n < (1 << 31) - 1 else np.int64
+        mat = csr_matrix((n, n), dtype=np.float64)
 
-    mat = csr_matrix((all_s, (all_r, all_c)), shape=(n, n))
+    mat.setdiag(1.0)
     mat.sort_indices()
 
     if backend == 'numpy':
