@@ -29,38 +29,7 @@ mat = csr_matrix((max_s, (u_r.astype(np.int32), u_c.astype(np.int32))), shape=(n
 mat.setdiag(1.0)
 ```
 
-**Problem A: Halo Filtering Border Contamination Treats Noise Points as Foreign Cluster Neighbors**
-- **Module / Component:** `clustering.py` (`_foreign_mask`, `halo_filter`)
-- **Severity / Category:** CRITICAL | Mathematical & Algorithmic Correctness
-- **Detailed Bioinformatic & Technical Analysis:**
-  In Density Peak Clustering, halo filtering removes ambiguous border points that lie between two competing, authentic clusters.
-  In `clustering.py:_foreign_mask`, the mask identifying foreign cluster neighbors is computed as:
-  ```python
-  valid = nbr_idx >= 0
-  safe_idx = np.maximum(nbr_idx, 0)
-  reference = labels if query_labels is None else query_labels
-  foreign = valid & (reference[:, np.newaxis] != labels[safe_idx])
-  ```
-  If a neighboring point was classified as noise ($-1$) during DPC cascading assignment or density thresholding, its label is $-1$. For an authentic cluster member with label $c \ge 0$, the inequality $c \ne -1$ evaluates to `True`.
-  As a result, **unassigned noise points and low-confidence alignment artifacts are treated as foreign cluster neighbors**. When a genuine core domain instance borders discarded noise, its foreign contamination ratio artificially spikes. The point is erroneously flagged as border contamination and pruned to noise.
-  Biologically, halo filtering should measure competition between two distinct biological families, not proximity to discarded background noise.
-- **Evidence in Code:**
-  - `clustering.py:544`: `foreign = valid & (reference[:, np.newaxis] != labels[safe_idx])`
-- **Recommended Solution:**
-  Require that both the reference point and its neighbor belong to valid, distinct clusters ($\ge 0$):
-
-```python
-# FAULTY (clustering.py:544 - Noise (-1) neighbors count as foreign cluster contamination):
-foreign = valid & (reference[:, np.newaxis] != labels[safe_idx])
-
-# REVISED (clustering.py - Only genuine, distinct clusters qualify as foreign neighbors):
-nbr_labels = labels[safe_idx]
-foreign = valid & (reference[:, np.newaxis] >= 0) & (nbr_labels >= 0) & (reference[:, np.newaxis] != nbr_labels)
-```
-
----
-
-**Problem B: Unbounded Accumulation of Intermediate Edge Triplets in Stage 4 Master Process**
+**Unbounded Accumulation of Intermediate Edge Triplets in Stage 4 Master Process**
 - **Module / Component:** `domain_finder.py` (`find_domains`, Stage 4)
 - **Severity / Category:** HIGH | Memory Scaling & RAM Ceiling Risk on >100GB TSVs
 - **Detailed Bioinformatic & Technical Analysis:**
@@ -119,64 +88,7 @@ for r, c, inter, dom_lens_dict in target_workers.results:
             global_dom_lengths[d_id] += d_len
 ```
 
----
-
-**Problem C: Discarding Biological Domain Support Counts in family_finder**
-- **Module / Component:** `domain_finder.py` (`family_finder`), `clustering.py` (`dpc`)
-- **Severity / Category:** HIGH | Scientific Rigor & Biological Validity
-- **Detailed Bioinformatic & Technical Analysis:**
-  In `domain_finder.py:family_finder`, `dpc` is invoked with `weights=None`:
-  ```python
-  peak_to_cluster, n_halo = dpc(rows=final_r,
-                                cols=final_c,
-                                sims=similarities,
-                                n=n_domains,
-                                min_sim=min_fam_sim,
-                                backend="scipy",
-                                min_dens=min_fam_dens)
-  ```
-  When `weights` is `None`, local density is computed as $\rho_i = \sum_{j} s(i, j)$, where self-similarity is $s(i, i) = 1.0$.
-  Each domain instance $i$ represents an ncRNA domain supported by $N_i$ target alignments across the genome. In DPC family clustering, a domain instance supported by 5,000 alignment hits currently receives the exact same baseline weight ($w_i = 1.0$) as a domain instance supported by a single alignment hit.
-  Biologically, alignment hit support ($N_{\text{targets}}$) represents evolutionary conservation depth. Weighting domain instances by hit support grounds DPC density in biological conservation depth rather than treating all domain instances uniformly.
-  Hit counts are already recorded in `all_targets_arr['dom_id']` at the end of Stage 3, meaning $N_i$ can be computed with zero algorithmic overhead via `np.bincount(all_targets_arr['dom_id'], minlength=n_total_domains)`.
-- **Evidence in Code:**
-  - `domain_finder.py:476-486`: `dpc` invoked without `weights` parameter in `family_finder`.
-- **Recommended Solution:**
-  Compute per-domain hit counts at the end of Stage 3, pass them to `family_finder`, and forward them to `dpc(..., weights=dom_weights)`.
-
-```python
-# FAULTY (domain_finder.py:476-486 - dpc invoked without biological hit weights):
-peak_to_cluster, n_halo = dpc(rows=final_r,
-                              cols=final_c,
-                              sims=similarities,
-                              n=n_domains,
-                              min_sim=min_fam_sim,
-                              backend="scipy",
-                              filter_transparency=halo_stringency,
-                              halo_method=halo_method,
-                              min_dens=min_fam_dens,
-                              point_specific=point_specific)
-
-# REVISED (Compute domain hit weights from Stage 3 targets and pass to family_finder & dpc):
-dom_weights = np.bincount(all_targets_arr['dom_id'], minlength=n_total_domains).astype(np.float64)
-
-# In family_finder:
-peak_to_cluster, n_halo = dpc(rows=final_r,
-                              cols=final_c,
-                              sims=similarities,
-                              n=n_domains,
-                              min_sim=min_fam_sim,
-                              weights=dom_weights,
-                              backend="scipy",
-                              filter_transparency=halo_stringency,
-                              halo_method=halo_method,
-                              min_dens=min_fam_dens,
-                              point_specific=point_specific)
-```
-
----
-
-**Problem D: BLAST-TAB TSV Parsing Inefficiency with Python String Splitting**
+** BLAST-TAB TSV Parsing Inefficiency with Python String Splitting**
 - **Module / Component:** `aligners.py` (`parse_mmseqs_tsv`)
 - **Severity / Category:** MEDIUM | Performance Bottleneck on >100GB Alignments
 - **Detailed Bioinformatic & Technical Analysis:**
@@ -222,7 +134,7 @@ for fields in reader:
 
 ---
 
-**Problem E: Suboptimal Single-Worker Dispatch in target_batch_generator on Low Sequence Counts**
+** Suboptimal Single-Worker Dispatch in target_batch_generator on Low Sequence Counts**
 - **Module / Component:** `domain_finder.py` (`find_domains`, Stage 4)
 - **Severity / Category:** MEDIUM | Parallel Concurrency Bottleneck
 - **Detailed Bioinformatic & Technical Analysis:**
@@ -249,7 +161,7 @@ target_batch_size = max(1, min(250, int(np.ceil(n_target_seqs / max(1, cpu * 4))
 
 ---
 
-**Problem F: Redundant Memory Allocation in Sparse build_similarity_matrix**
+**Redundant Memory Allocation in Sparse build_similarity_matrix**
 - **Module / Component:** `clustering.py` (`build_similarity_matrix`)
 - **Severity / Category:** MEDIUM | Memory Optimization on Graph Construction
 - **Detailed Bioinformatic & Technical Analysis:**
