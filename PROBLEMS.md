@@ -205,7 +205,6 @@ peak_to_cluster, n_noise = dpc(rows=rows,
 - **Validation**:
   1. Regression testing: verify that when `point_specific=False` (default), Stage 2 clustering output is identical to prior releases.
   2. Test with `point_specific=True`: confirm that valid lower-density border spans in ragged ncRNA alignments are retained rather than pruned.
-  3. Validate that noise points (-1) are never assigned to valid clusters or included in cluster property calculations.
 
 ---
 
@@ -223,8 +222,6 @@ This implementation plan provides direct, step-by-step instructions for a future
    - **Practices to Adhere to:**
      - Ensure the default remains `False` to maintain full backward compatibility with existing unit tests.
      - Document parameter semantics with clear docstrings explaining point-specific border filtering vs cluster-wide $\rho_b$ thresholding.
-   - **Anti-Patterns & Risks to Avoid:**
-     - Do not modify noise point mapping (`labels < 0` $\to$ `-1`); unassigned halo points must remain strictly excluded from domain instances.
 
 ## Phase: Master Memory Bounding in Stage 4 Target Overlaps
 1. **Target File:** `domain_finder.py`
@@ -256,24 +253,6 @@ This implementation plan provides direct, step-by-step instructions for a future
    - **Anti-Patterns & Risks to Avoid:**
      - Never assume $n < 2^{31} - 1$ alone guarantees 32-bit CSR safety; non-zero count $nnz$ can exceed 32-bit limits even when $n$ is small.
      - Avoid converting sparse matrices to dense arrays unless `backend == 'numpy'` is explicitly requested.
-
-## Phase: High-Throughput Vectorized Alignment Streaming
-1. **Target File:** `aligners.py`
-   - **Target Function:** `parse_mmseqs_tsv`
-   - **Specific Instructions:**
-     - Implement chunked parsing using `pandas.read_csv(chunksize=100_000)` with `engine='c'`, reading columns `[0, 1, 6, 7, 8, 9]`.
-     - Perform vectorized coordinate transformations:
-       - Relative strand: `t_strand = np.where((raw_qs > raw_qe) ^ (raw_ts > raw_te), -1, 1).astype(np.int8)`
-       - 0-based half-open query intervals: `q_start = np.minimum(raw_qs, raw_qe) - 1`, `q_end = np.maximum(raw_qs, raw_qe)`
-       - 0-based half-open target intervals: `t_start = np.minimum(raw_ts, raw_te) - 1`, `t_end = np.maximum(raw_ts, raw_te)`
-     - Filter self-hits (`q_seq_str == t_seq_str`) in vectorized boolean masks.
-     - Map string identifiers against the frozen `SequenceRegistry`, raising an explicit error (🛑) if an unknown sequence is encountered.
-   - **Practices to Adhere to:**
-     - Ensure query batch ordering matches the deterministic sort order required downstream.
-     - Maintain closed-set verification without memory leaks.
-   - **Anti-Patterns & Risks to Avoid:**
-     - Do not use `csv.reader`, as it does not improve parsing throughput over standard line splitting in pure Python.
-     - Avoid loading entire multi-gigabyte TSVs into memory at once; always stream via chunk windows.
 
 ## Phase: Adaptive Worker Batch Scaling
 1. **Target File:** `domain_finder.py`
