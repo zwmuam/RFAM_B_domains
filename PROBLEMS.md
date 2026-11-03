@@ -1,5 +1,3 @@
-# 1. Problem Analysis
-
 **Problem 1: Bypassing Minimum Density Filtering in Disjoint DPC (`clustering.py`, `domain_finder.py`)**
 
 - **Module / Component:** `clustering.py` (`dpc`), `domain_finder.py` (`domain_instances_on_query`, `family_finder`)
@@ -35,7 +33,7 @@ if rows.size == 0:
 
 ---
 
-**Problem 3: Unsafe Array Resizing with `np.resize` in Target Hit Buffer (`domain_finder.py`)**
+**Problem 2: Unsafe Array Resizing with `np.resize` in Target Hit Buffer (`domain_finder.py`)**
 
 - **Module / Component:** `domain_finder.py` (`find_domains`, Stage 3 Target Hit Aggregation)
 - **Severity / Category:** HIGH | Numerical & Algorithmic Bug / Memory Corruption Risk
@@ -69,7 +67,7 @@ if write_offset + n_hits > target_buffer.shape[0]:
 
 ---
 
-**Problem 4: Sub-Array View Overhead in `compare_sorted_spans` Range Queries (`clustering.py`)**
+**Problem 3: Sub-Array View Overhead in `compare_sorted_spans` Range Queries (`clustering.py`)**
 
 - **Module / Component:** `clustering.py` (`compare_sorted_spans`)
 - **Severity / Category:** MEDIUM | Performance Bottleneck / Excessive Object Allocations
@@ -113,7 +111,7 @@ for i in range(n):
 
 ---
 
-**Problem 5: Inefficient Nested Sequence Grouping and IPC Starvation in Stage 4 (`domain_finder.py`)**
+**Problem 4: Inefficient Nested Sequence Grouping and IPC Starvation in Stage 4 (`domain_finder.py`)**
 
 - **Module / Component:** `domain_finder.py` (`find_domains`, `target_batch_processor`), `executor.py` (`Parallel`)
 - **Severity / Category:** MEDIUM | Parallel Worker Starvation & IPC Bottlenecks
@@ -168,7 +166,7 @@ target_workers = Parallel(function=target_batch_processor,
 
 ---
 
-**Problem 6: Contradictory Data Typing Claims and Outdated Docstrings (`domain_finder.py`, `clustering.py`)**
+**Problem 5: Contradictory Data Typing Claims and Outdated Docstrings (`domain_finder.py`, `clustering.py`)**
 
 - **Module / Component:** `domain_finder.py` (`target_batch_processor`, `evaluate_clusters`), `clustering.py` (`dpc`)
 - **Severity / Category:** MEDIUM | Data Typing Inconsistency & Documentation Drift
@@ -211,7 +209,7 @@ cols = np.ascontiguousarray(cols, dtype=np.int32)
 
 ---
 
-## 2. Architectural Risks and Warning Guidelines
+## 2. Warning Guidelines
 
 The following risks should be considered prior to code refactoring:
 
