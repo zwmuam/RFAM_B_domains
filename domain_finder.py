@@ -127,7 +127,8 @@ def domain_instances_on_query(query_id: int,
                               reassign_targets: bool,
                               halo_stringency: float,
                               min_dom_dens: float,
-                              halo_method: Optional[str]) \
+                              halo_method: Optional[str],
+                              point_specific: bool = False) \
         -> Tuple[List[Tuple[int, int, int, str]], np.ndarray]:
     """
     Process a query sequence and identify conserved domain instances using DPC.
@@ -141,6 +142,7 @@ def domain_instances_on_query(query_id: int,
     :param halo_stringency: Stringency for halo filtering.
     :param min_dom_dens: Minimum density for domain identification.
     :param halo_method: Halo filtering algorithm.
+    :param point_specific: Whether to evaluate halo border filtering individually per point.
     :return: Tuple of:
              - local_domains: List of (query_id, peak_start, peak_end, consensus_strand)
              - all_targets: 2D NumPy array of (t_seq_int, t_start, t_end, local_domain_id)
@@ -180,7 +182,8 @@ def domain_instances_on_query(query_id: int,
                                            backend="numpy",
                                            filter_transparency=halo_stringency,
                                            halo_method=halo_method,
-                                           min_dens=min_dom_dens)
+                                           min_dens=min_dom_dens,
+                                           point_specific=point_specific)
 
             assigned_peak_map = np.full(n_spans, -1, dtype=np.int32)
             for peak_id, member_ids in peak_to_cluster.items():
@@ -255,7 +258,8 @@ def batch_query_processor(batch: List[Tuple[int, np.ndarray, np.ndarray]],
                           reassign_targets: bool,
                           halo_stringency: float,
                           min_dom_dens: float,
-                          halo_method: Optional[str]) \
+                          halo_method: Optional[str],
+                          point_specific: bool = False) \
         -> List[Tuple[List[Tuple[int, int, int, str]], np.ndarray]]:
     """
     Process a batch of queries and identify domain instances and associated targets.
@@ -267,6 +271,7 @@ def batch_query_processor(batch: List[Tuple[int, np.ndarray, np.ndarray]],
     :param halo_stringency: Stringency for halo filtering.
     :param min_dom_dens: Minimum density for domain identification.
     :param halo_method: Halo filtering algorithm.
+    :param point_specific: Whether to evaluate halo border filtering individually per point.
     :return: List of tuples (local_domains, all_targets) for each query in the batch.
     """
     batch_results = []
@@ -279,7 +284,8 @@ def batch_query_processor(batch: List[Tuple[int, np.ndarray, np.ndarray]],
                                         reassign_targets=reassign_targets,
                                         halo_stringency=halo_stringency,
                                         min_dom_dens=min_dom_dens,
-                                        halo_method=halo_method)
+                                        halo_method=halo_method,
+                                        point_specific=point_specific)
         batch_results.append(res)
     return batch_results
 
@@ -588,6 +594,8 @@ def find_domains(fasta_path: Path,
                                        n=1000,
                                        registry=sequence_registry)
 
+    point_specific_val = bool(attributes.get("point_specific", False))
+
     # 2. Stage 2 & 3: Parallel query processing and domain identification
     logger.info("Executing Stage 2: Finding domain instances across queries")
     query_kwargs = {
@@ -597,6 +605,7 @@ def find_domains(fasta_path: Path,
         "halo_stringency": dom_halo,
         "min_dom_dens": min_dom_dens,
         "halo_method": halo_method,
+        "point_specific": point_specific_val,
     }
 
     target_dtype = np.dtype([
@@ -682,7 +691,10 @@ def find_domains(fasta_path: Path,
 
     # 3. Stage 4: Parallel target sequence overlap calculation
     ## mem_opt ## Adaptive workstation batch sizing ensuring uniform multi-core utilization without thread starvation
-    target_batch_size = max(10, min(250, n_target_seqs // max(1, cpu * 4)))
+    if n_target_seqs <= cpu * 4:
+        target_batch_size = max(1, int(np.ceil(n_target_seqs / max(1, cpu))))
+    else:
+        target_batch_size = max(10, min(1000, n_target_seqs // (cpu * 4)))
 
     def target_batch_generator() -> Generator[List[Tuple[int, np.ndarray, np.ndarray]], None, None]:
         batch_pkg: List[Tuple[int, np.ndarray, np.ndarray]] = []
@@ -706,25 +718,31 @@ def find_domains(fasta_path: Path,
                               description="Calculating target overlaps",
                               chunk_size=1)
 
-    accumulated_rows: List[np.ndarray] = []
-    accumulated_cols: List[np.ndarray] = []
-    accumulated_inters: List[np.ndarray] = []
+    ## mem_opt ## Eager popping/consumption of worker results with bounded memory
+    results_list = target_workers.results
+    total_edges = 0
+    for r, _, _, _ in results_list:
+        total_edges += r.size
+
+    all_rows = np.empty(total_edges, dtype=np.int32)
+    all_cols = np.empty(total_edges, dtype=np.int32)
+    all_inters = np.empty(total_edges, dtype=np.int32)
     global_dom_lengths = np.zeros(n_total_domains, dtype=np.int64)
 
-    for rows, cols, inters, dom_lens_dict in target_workers.results:
-        if rows.size > 0:
-            accumulated_rows.append(rows)
-            accumulated_cols.append(cols)
-            accumulated_inters.append(inters)
+    write_pos = 0
+    while results_list:
+        r, c, inter, dom_lens_dict = results_list.pop(0)
+        k = r.size
+        if k > 0:
+            all_rows[write_pos:write_pos + k] = r
+            all_cols[write_pos:write_pos + k] = c
+            all_inters[write_pos:write_pos + k] = inter
+            write_pos += k
+        del r, c, inter
         for d_id, d_len in dom_lens_dict.items():
             if d_id < n_total_domains:
                 global_dom_lengths[d_id] += d_len
-
-    all_rows = np.concatenate(accumulated_rows) if accumulated_rows else np.empty(0, dtype=np.int32)
-    all_cols = np.concatenate(accumulated_cols) if accumulated_cols else np.empty(0, dtype=np.int32)
-    all_inters = np.concatenate(accumulated_inters) if accumulated_inters else np.empty(0, dtype=np.int32)
-
-    point_specific_val = bool(attributes.get("point_specific", False))
+    del target_workers.results
 
     # 4. Stage 5: Family finding with DPC
     logger.info("Executing Stage 5: Finding domain families")
