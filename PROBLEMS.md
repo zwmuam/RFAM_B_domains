@@ -132,7 +132,7 @@ mat.sort_indices()
 - **Evidence**:
   In `domain_finder.py:657`:
   ```python
-  target_batch_size = max(10, min(250, n_target_seqs // max(1, cpu * 4)))
+  target_batch_size = max(10, min(1000, n_target_seqs // max(1, cpu * 4)))
   ```
 - **Impact**:
   For datasets with few target sequences (e.g. $n_{\text{target\_seqs}} = 35$ on a 32-core machine), integer division yields $35 // (32 \times 4) = 0$, giving `target_batch_size = max(10, 0) = 10`. This partitions the work into only $\lceil 35 / 10 \rceil = 4$ batches, leaving 28 worker threads completely idle.
@@ -142,18 +142,18 @@ mat.sort_indices()
 
 ```python
 # FAULTY (domain_finder.py:657 - Hard floor of 10 starves workers when sequence count <= 40):
-target_batch_size = max(10, min(250, n_target_seqs // max(1, cpu * 4)))
+target_batch_size = max(10, min(1000, n_target_seqs // max(1, cpu * 4)))
 
 # REVISED (domain_finder.py - Dynamic batch scaling balancing saturation and IPC overhead):
 if n_target_seqs <= cpu * 4:
     target_batch_size = max(1, int(np.ceil(n_target_seqs / max(1, cpu))))
 else:
-    target_batch_size = max(10, min(250, n_target_seqs // (cpu * 4)))
+    target_batch_size = max(10, min(1000, n_target_seqs // (cpu * 4)))
 ```
 
 - **Validation**:
   1. On $n_{\text{target\_seqs}} = 35$ with 32 worker threads, verify $\ge 32$ batches are generated and all worker cores receive tasks.
-  2. On $n_{\text{target\_seqs}} = 50,000$ sequences, verify batch size scales between 10 and 250, avoiding task flooding.
+  2. On $n_{\text{target\_seqs}} = 50,000$ sequences, verify batch size scales between 10 and 1000, avoiding task flooding.
   3. Measure elapsed runtime across 4, 16, and 32 threads, confirming monotonic scaling without performance regressions.
 
 ---
@@ -263,7 +263,7 @@ This implementation plan provides direct, step-by-step instructions for a future
        if n_target_seqs <= cpu * 4:
            target_batch_size = max(1, int(np.ceil(n_target_seqs / max(1, cpu))))
        else:
-           target_batch_size = max(10, min(250, n_target_seqs // (cpu * 4)))
+           target_batch_size = max(10, min(1000, n_target_seqs // (cpu * 4)))
        ```
    - **Practices to Adhere to:**
      - Retain `chunk_size = 1` in `Parallel` mapping to ensure fine-grained worker dispatch.
