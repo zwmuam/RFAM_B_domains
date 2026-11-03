@@ -12,34 +12,6 @@ The pipeline extracts conserved structural RNA domain instances from pairwise al
 
 ---
 
-# Audit and Problem Re-Evaluation
-
-## Evaluation of Previous Solutions and External Criticism
-
-A rigorous evaluation of proposed optimizations and external criticisms demonstrates:
-
-1. **Stage 4 Memory Accumulation**:
-   - *Criticism Validity*: Highly credible. The previous proposal replaced `np.concatenate` with pre-allocation of `all_rows`, `all_cols`, and `all_inters` after summing sizes from `target_workers.results`. Because `target_workers.results` is an in-memory `List[Tuple[...]]`, all completed worker arrays remain fully resident in memory while destination arrays are allocated. For 500 million edges ($\approx 6\text{ GB}$ across three `int32` arrays), pre-allocation still duplicates memory ($\approx 12\text{ GB}$ total peak).
-   - *Refined Understanding*: Eliminating peak duplication requires genuine incremental consumption, streaming generator yields, or bounded chunked aggregation where worker outputs are dereferenced and garbage-collected as they are processed.
-
-2. **Sparse Matrix Construction and Typing**:
-   - *Criticism Validity*: Highly credible. Proposing unconditional `int32` casting based solely on matrix dimension $n < 2^{31} - 1$ is technically incomplete. SciPy's CSR index format requires 64-bit integer indexing whenever either the dimension $n$ OR the cumulative count of stored non-zero entries ($nnz$) exceeds $2^{31} - 1$, because the `indptr` array indexes into `indices` and `data`. Furthermore, using `mat.setdiag(1.0)` must be safeguarded to ensure duplicate off-diagonal coordinates are handled identically to the reference implementation and diagonal entries are non-zero.
-   - *Refined Understanding*: Sparse index typing must check both $\max(n, nnz) < 2^{31} - 1$. When satisfied, coordinate arrays should use `np.int32` directly, eliminating intermediate `np.int64` upcasting and redundant explicit diagonal concatenation arrays.
-
-3. **BLAST-TAB TSV Parsing Throughput and Allocation**:
-   - *Criticism Validity*: Highly credible. The claim that Python's `str.split('\t')` causes a 2-hour bottleneck at 200,000 lines/sec was an unverified assumption. Empirical benchmarking shows pure Python `line.split('\t')` processes $\approx 320,000\text{ lines/sec}$, while `csv.reader` processes $\approx 285,000\text{ lines/sec}$ (slightly slower due to generic delimiter parsing). In contrast, vectorized chunked parsing via `pandas.read_csv(chunksize=100_000)` achieves over $2,100,000\text{ lines/sec}$ (a $\approx 6.5\times$ speedup) while remaining strictly within bounded memory.
-   - *Refined Understanding*: The audit should avoid inaccurate assertions about `csv.reader`. For massive multi-gigabyte TSVs where line parsing is a bottleneck, the validated solution is vectorized chunked parsing with typed NumPy column extraction.
-
-4. **Worker Batch Dispatch and Scheduling**:
-   - *Criticism Validity*: Credible. Enforcing an unconditional floor of `target_batch_size = 1` avoids idle cores on small sequence counts ($n \le 35$), but on workloads with hundreds of thousands of sequences and minimal per-target hits, batch size 1 introduces severe IPC serialization, process queuing, and synchronization overhead.
-   - *Refined Understanding*: Batch sizing must scale dynamically: small sequence sets ($n < \text{cpu} \times 4$) should distribute 1-sequence batches to ensure all cores receive tasks, while large sequence sets should scale batch sizes between 10 and 250 to amortize IPC overhead.
-
-5. **Point-Specific Halo Filtering Consistency**:
-   - *Criticism Validity*: Partially credible. While Stage 2 and Stage 5 operate on different biological entities (query alignment spans vs global domain families), both rely on Density Peak Clustering (DPC). In Stage 2, query alignment spans often exhibit ragged, non-uniform coverage. Cluster-wide halo filtering using the maximum border density ($\rho_b$) can decapitate authentic multi-copy RNA domains.
-   - *Refined Understanding*: Rather than hardcoding behavior, `point_specific` should be consistently exposed across both Stage 2 (`domain_instances_on_query`) and Stage 5 (`family_finder`), enabling uniform biological parameter propagation from pipeline configuration and CLI arguments while preserving regression invariants.
-
----
-
 ## Memory Accumulation in Stage 4 Target Overlap Collection
 
 - **Evidence**:
@@ -60,7 +32,7 @@ A rigorous evaluation of proposed optimizations and external criticisms demonstr
   $$\text{Memory}_{\text{workers}} = 5 \times 10^8 \times 3 \times 4\text{ bytes} \approx 6.0\text{ GB}$$
   Because `target_workers.results` holds all completed worker arrays simultaneously in memory, executing `np.concatenate` (or naive two-pass pre-allocation) allocates an additional $6.0\text{ GB}$ before the original arrays are dereferenced, doubling peak memory consumption to $12.0\text{ GB}$. On massive multi-gigabyte TSVs, this memory spike threatens the 200 GB RAM budget.
 - **Proposed Fix**:
-  Consume worker outputs incrementally in bounded chunks or pop worker result references as they are processed so that intermediate memory is immediately reclaimed. When total size is known or streaming, write triplets directly into pre-allocated memory or disk-backed structures and eagerly delete worker result references.
+  Eliminating peak duplication requires genuine incremental consumption, streaming generator yields, or bounded chunked aggregation where worker outputs are dereferenced and garbage-collected as they are processed. Consume worker outputs incrementally in bounded chunks or pop worker result references as they are processed so that intermediate memory is immediately reclaimed. When total size is known or streaming, write triplets directly into pre-allocated memory or disk-backed structures and eagerly delete worker result references.
 
 ```python
 # FAULTY (domain_finder.py:695-714 - List accumulation retaining worker results before concatenation):
@@ -127,7 +99,7 @@ del target_workers.results
   2. For $n = 10^7$ nodes, explicit diagonal vectors allocate $3 \times 10^7$ unnecessary elements.
   3. Conversely, casting coordinates unconditionally to `np.int32` without validating non-zero count ($nnz$) risks integer overflow in SciPy's CSR `indptr` when $nnz \ge 2^{31} - 1$.
 - **Proposed Fix**:
-  Select index dtype dynamically based on both matrix dimensions and stored entry count:
+  Sparse index typing must check both $\max(n, nnz) < 2^{31} - 1$. When satisfied, coordinate arrays should use `np.int32` directly, eliminating intermediate `np.int64` upcasting and redundant explicit diagonal concatenation arrays. Select index dtype dynamically based on both matrix dimensions and stored entry count:
   $$\text{dtype} = \begin{cases} \text{np.int32} & \text{if } n < 2^{31}-1 \text{ and } (u_r.\text{size} + n) < 2^{31}-1 \\ \text{np.int64} & \text{otherwise} \end{cases}$$
   Construct the CSR matrix directly from non-zero edge entries without auxiliary diagonal coordinate arrays, and set self-similarities via `mat.setdiag(1.0)` with canonical index sorting.
 
@@ -238,7 +210,7 @@ for chunk in pd.read_csv(tsv_file,
   For datasets with few target sequences (e.g. $n_{\text{target\_seqs}} = 35$ on a 32-core machine), integer division yields $35 // (32 \times 4) = 0$, giving `target_batch_size = max(10, 0) = 10`. This partitions the work into only $\lceil 35 / 10 \rceil = 4$ batches, leaving 28 worker threads completely idle.
   Conversely, setting a flat batch size of 1 on large sequence sets ($n_{\text{target\_seqs}} = 100,000$) creates 100,000 separate IPC tasks, causing severe queue contention and context switching in MPIRE.
 - **Proposed Fix**:
-  Scale `target_batch_size` adaptively: for small target counts ($n_{\text{target\_seqs}} \le \text{cpu} \times 4$), reduce batch size down to 1 to guarantee full multi-core saturation. For larger target counts, scale dynamically between 10 and 250 sequences per batch to minimize IPC overhead.
+  Batch sizing must scale dynamically: small sequence sets ($n < \text{cpu} \times 4$) should distribute 1-sequence batches to ensure all cores receive tasks, while large sequence sets should scale batch sizes to amortize IPC overhead. Scale `target_batch_size` adaptively: for small target counts ($n_{\text{target\_seqs}} \le \text{cpu} \times 4$), reduce batch size down to 1 to guarantee full multi-core saturation. For larger target counts, scale dynamically between 10 and 1000 queries  per batch to minimize IPC overhead.
 
 ```python
 # FAULTY (domain_finder.py:657 - Hard floor of 10 starves workers when sequence count <= 40):
@@ -273,7 +245,7 @@ else:
 - **Impact**:
   In Stage 2, DPC defaults to `point_specific=False` (traditional cluster-wide halo filtering). Under traditional halo filtering, if a single ragged border span exhibits elevated local density, the entire cluster threshold $\rho_b$ is elevated, inappropriately purging valid, lower-density biological RNA domain variants into noise (-1). Stage 5 permits `point_specific=True` to preserve sparse domain families, leading to inconsistent halo filtering behavior across stages.
 - **Proposed Fix**:
-  Expose `point_specific: bool = False` in `domain_instances_on_query` and pass `point_specific_val` through `query_kwargs` from `find_domains`. This permits users and pipelines to configure consistent border filtering behavior across both query instance identification and family clustering while retaining default backwards compatibility.
+  Rather than hardcoding behavior, `point_specific` should be consistently exposed across both Stage 2 (`domain_instances_on_query`) and Stage 5 (`family_finder`), enabling uniform biological parameter propagation from pipeline configuration and CLI arguments while preserving regression invariants. Expose `point_specific: bool = False` in `domain_instances_on_query` and pass `point_specific_val` through `query_kwargs` from `find_domains`. This permits users and pipelines to configure consistent border filtering behavior across both query instance identification and family clustering while retaining default backwards compatibility.
 
 ```python
 # FAULTY (domain_finder.py:208-218 - Stage 2 omits point_specific parameter):
