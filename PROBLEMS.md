@@ -111,49 +111,6 @@ else:
 
 # Scientific, Mathematical, and Algorithmic Vulnerabilities
 
-## Strict Inequality Mismatch in Density Peak Filtering
-
-- **Evidence**:
-  In `clustering.py:538`:
-  ```python
-  is_candidate_peak = (densities > min_dens) & ((s_max_higher < min_sim) | (nearest_higher == -1))
-  ```
-  Candidate peaks require `densities > min_dens` (strict inequality).
-  However, in `clustering.py:515` (empty graph path):
-  ```python
-  qualifying = np.flatnonzero(densities >= min_dens)
-  ```
-  In `domain_finder.py:386` (`family_finder` empty edge path):
-  ```python
-  qualifying = np.flatnonzero(np.ones(n_domains, dtype=np.float64) >= min_fam_dens)
-  ```
-  In `domain_finder.py:150` and `156` (`domain_instances_on_query`):
-  ```python
-  if weights[0] >= min_dom_dens: ...
-  qualifying = np.flatnonzero(weights >= min_dom_dens).astype(np.int32)
-  ```
-- **Impact**:
-  For an isolated point or a point with density exactly equal to `min_dens` (such as default `min_dom_dens = 1.0` with 1 hit):
-  - In a graph with no edges, it qualifies as a domain peak because $1.0 \ge 1.0$.
-  - In a connected graph where edges fail `min_sim`, `densities == 1.0`. The condition `1.0 > 1.0` evaluates to `False`, classifying the point as noise (-1).
-  This causes inconsistent biological classifications depending solely on graph sparsity.
-- **Proposed Fix**:
-  Harmonize inequality semantics to `densities >= min_dens` across all code paths.
-
-```python
-# FAULTY (clustering.py:538 - Strict inequality drops points exactly meeting threshold):
-is_candidate_peak = (densities > min_dens) & ((s_max_higher < min_sim) | (nearest_higher == -1))
-
-# REVISED (clustering.py - Consistent inclusive inequality):
-is_candidate_peak = (densities >= min_dens) & ((s_max_higher < min_sim) | (nearest_higher == -1))
-```
-
-- **Validation**:
-  1. Test single-hit query spans with `min_dom_dens = 1.0` across empty graphs, weakly connected graphs, and dense graphs.
-  2. Confirm peak selection decisions remain invariant across graph representations.
-
----
-
 ## Arbitrary Nearest-Higher Tie-Breaking in Sparse Matrix Traversal
 
 - **Evidence**:
@@ -415,7 +372,6 @@ This implementation plan provides direct, step-by-step instructions for future e
 1. **Target File:** `clustering.py`
    - **Target Functions:** `dpc` and `_nearest_higher_sparse`
    - **Specific Instructions:**
-     - In `dpc`, change `(densities > min_dens)` to `(densities >= min_dens)` to match the inclusive semantics in `rows.size == 0` and `domain_finder.py`.
      - In `_nearest_higher_sparse`, introduce density rank as a secondary tie-breaker when higher-density neighbors have identical similarity scores.
      - In `jaccard_index` and `max_containment`, eliminate the `.data` access on NumPy arrays.
    - **Anti-Patterns & Risks to Avoid:**
