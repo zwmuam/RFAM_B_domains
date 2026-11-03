@@ -13,9 +13,9 @@ The pipeline extracts conserved structural RNA domain instances from pairwise al
 Two claims from `PREVIOUS_UPDATE.md` were incompletely implemented or introduced subsequent complications:
 
 **Disjoint Graph Density Thresholding in family_finder Was Partially Bypassed**
-- **Audit Finding:** In `domain_finder.py:family_finder`, when candidate domain instances share zero pairwise target overlaps across sequences (`u_r.size == 0`), the code checks whether domains meet $\text{min\_fam\_dens}$ by assuming every domain has a fixed self-density of $1.0$ (`np.ones(n_domains, dtype=np.float64)`). In biological datasets, solitary domain instances possess real alignment support proportional to their number of target occurrences $N_{\text{targets}}$. Forcing solitary density to $1.0$ causes two distinct failures:
-  1. If a user sets $\text{min\_fam\_dens} > 1.0$ (e.g. requiring at least 3 supporting hits), all solitary domains are discarded as noise—even highly conserved domains supported by hundreds of hits across genomes.
-  2. If $\text{min\_fam\_dens} \le 1.0$, single-hit spurious noise artifacts are accepted as valid domain family peaks.
+- **Audit Finding:** In `domain_finder.py:family_finder`, when candidate domain instances share zero pairwise target overlaps across sequences (`u_r.size == 0`), the code checks whether domains meet `min_fam_dens` by assuming every domain has a fixed self-density of $1.0$ (`np.ones(n_domains, dtype=np.float64)`). In biological datasets, solitary domain instances possess real alignment support proportional to their number of target occurrences $N_{\text{targets}}$. Forcing solitary density to $1.0$ causes two distinct failures:
+  1. If a user sets `min_fam_dens > 1.0` (e.g. requiring at least 3 supporting hits), all solitary domains are discarded as noise—even highly conserved domains supported by hundreds of hits across genomes.
+  2. If `min_fam_dens <= 1.0`, single-hit spurious noise artifacts are accepted as valid domain family peaks.
 - **Subsequent Problem:** In `clustering.py:dpc`, an empty edge check (`rows.size == 0`) evaluates `densities >= min_dens`. However, when `family_finder` calls `dpc`, it does not pass domain weights (`weights=None`). Consequently, `dpc` calculates density solely from edge similarities plus diagonal $1.0$, completely losing track of underlying alignment hit counts. If candidate domains share no target overlaps, or form disconnected graph components with zero mutual edges, their real biological support is ignored.
 
 ```python
