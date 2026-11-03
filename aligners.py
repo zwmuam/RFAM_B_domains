@@ -396,7 +396,7 @@ def mmseq_easy_search(fasta_file: Path,
     result_file = result_dir.joinpath(name_string)
 
     if not result_file.exists():
-        run_tmp_dir = tmp_dir.joinpath(f"{fasta_file.stem}.riboseek.tmp")
+        run_tmp_dir = tmp_dir.joinpath(f"{fasta_file.stem}.mmseqs.tmp")
         run_tmp_dir.mkdir(parents=True, exist_ok=True)
         tmp_subdir = tmp_dir.joinpath("mmseqs_tmp")
         tmp_subdir.mkdir(parents=True, exist_ok=True)
