@@ -264,12 +264,11 @@ This implementation plan provides direct, step-by-step instructions for future e
 
 ## Phase: Correcting Inconsistencies and Ties in Clustering
 1. **Target File:** `clustering.py`
-   - **Target Functions:** `dpc` and `_nearest_higher_sparse`
+   - **Target Functions:**  `_nearest_higher_sparse`, `jaccard_index` and `max_containment`
    - **Specific Instructions:**
      - In `_nearest_higher_sparse`, introduce density rank as a secondary tie-breaker when higher-density neighbors have identical similarity scores.
      - In `jaccard_index` and `max_containment`, eliminate the `.data` access on NumPy arrays.
    - **Anti-Patterns & Risks to Avoid:**
-     - Do not break backward compatibility with unit tests where `min_sim` is strictly within $(0, 1)$.
      - Ensure sparse matrix indexing remains `np.int32` unless total entries exceed $2^{31} - 1$.
 
 ## Phase: Streaming Target Overlap Results in Stage 4
@@ -281,16 +280,6 @@ This implementation plan provides direct, step-by-step instructions for future e
    - **Anti-Patterns & Risks to Avoid:**
      - Do not use `np.concatenate` on large worker result lists, as it forces concurrent duplicate memory allocation.
      - Ensure `dom_lens_dict` updates to `global_dom_lengths` remain numerically identical.
-
-## Phase: Aligners Ingestion Acceleration and Temp File Sanitization
-1. **Target File:** `aligners.py`
-   - **Target Functions:** `parse_mmseqs_tsv`, `riboseek_easy_search`, `mmseq_easy_search`
-   - **Specific Instructions:**
-     - Accelerate TSV parsing using chunked tabular reading (`pd.read_csv` with C engine) and vectorized NumPy coordinate validation.
-     - Fix directory naming in `mmseq_easy_search` where temporary directories are mistakenly labeled `.riboseek.tmp`.
-   - **Anti-Patterns & Risks to Avoid:**
-     - Do not alter the 0-based half-open $[s-1, e)$ coordinate output contract expected by `domain_finder.py`.
-     - Enforce error raising on malformed TSV inputs without silent skipping.
 
 ## Phase: Multi-Core Saturation and Process Lifecycle Optimization
 1. **Target Files:** `domain_finder.py` and `executor.py`
