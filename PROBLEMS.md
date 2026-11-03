@@ -1,4 +1,5 @@
 # Abstract
+
 The pipeline extracts conserved structural RNA domain instances from pairwise alignments (MMseqs2 or RiboSeek) and clusters them into global domain families via Density Peak Clustering (DPC). Processing large hundreds-gigabyte alignment datasets imposes strict operational requirements:
 
 1. Peak system memory must stay bounded strictly below 200 GB.
@@ -8,12 +9,11 @@ The pipeline extracts conserved structural RNA domain instances from pairwise al
 
 ---
 
-# Evaluation of Previous Update Claims
+# Evaluation of Pipeline Architecture and Memory Bottlenecks
 
 ## Worker Result Memory Retained Prior to Pre-allocation in Stage 4
 
 - **Evidence**:
-  `PREVIOUS_UPDATE.md` claimed to eliminate duplicate peak memory in Stage 4 by summing edge counts, pre-allocating contiguous coordinate arrays (`all_rows`, `all_cols`, `all_inters`), and popping items via `results_list.pop(0)`.
   In `domain_finder.py:627-646`:
   ```python
   results_list = target_workers.results
@@ -32,13 +32,16 @@ The pipeline extracts conserved structural RNA domain instances from pairwise al
       ...
   ```
 - **Impact**:
-  In `executor.py:301`, `target_workers` collects all completed worker returns in `pool.map(...)` into `self.result` (and `self.results`). When `find_domains` accesses `target_workers.results`, all worker arrays are already resident in memory simultaneously.
-  Pre-allocating `all_rows`, `all_cols`, and `all_inters` before popping duplicates the memory footprint ($2 \times 6.0\text{ GB} = 12.0\text{ GB}$ for $5 \times 10^8$ overlaps) at the moment of allocation. True peak memory mitigation requires either streaming worker returns or writing directly into shared or disk-backed buffers during worker execution.
+  In `executor.py:301`, `Parallel` gathers all completed worker returns via `pool.map(...)` into `self.results`. When `find_domains` accesses `target_workers.results`, all worker coordinate arrays are already resident in master heap memory simultaneously.
+  For $5 \times 10^8$ overlaps, the coordinate arrays (`r`, `c`, `inter`) consume:
+  $$\text{Memory}_{\text{workers}} = 5 \times 10^8 \times 3 \times 4\text{ bytes} \approx 6.0\text{ GB}$$
+  Pre-allocating contiguous destination arrays (`all_rows`, `all_cols`, `all_inters`) sized for all returned edges before popping duplicates memory consumption to $12.0\text{ GB}$ at the moment of allocation. Popping via `results_list.pop(0)` only releases references progressively after peak allocation has already occurred, while incurring $O(K^2)$ list pointer-shifting overhead across $K$ batches.
+  Furthermore, naive streaming that appends worker arrays to Python lists (`all_rows_list.append(r)`) still retains all arrays concurrently. True bounded memory requires either streaming chunk consumption with backpressure or having workers write array shards directly to disk, returning lightweight metadata so the master allocates destination memory exactly once and fills it shard-by-shard.
 - **Proposed Fix**:
-  Stream worker outputs lazily or yield results chunk-by-chunk using `pool.imap_unordered` rather than eager `pool.map`. If using list popping, write coordinates incrementally into memory-mapped or dynamically grown buffers without retaining the full completed worker result list.
+  Refactor `target_batch_processor` to write coordinate arrays to temporary binary shards on disk and return only metadata `(chunk_id, n_edges, dom_lens_dict)` through IPC channels. The master process calculates exact edge counts from metadata, allocates contiguous destination arrays once, loads each shard via memory-mapping (`mmap_mode="r"`), copies slices into the pre-allocated destination buffer, and immediately deletes the shard file.
 
 ```python
-# FAULTY (domain_finder.py:627-635 - Pre-allocates destination buffers while holding full worker results list):
+# FAULTY (domain_finder.py:627-635 - Retains all worker arrays concurrently while pre-allocating destination buffers):
 results_list = target_workers.results
 total_edges = 0
 for r, _, _, _ in results_list:
@@ -48,35 +51,97 @@ all_rows = np.empty(total_edges, dtype=np.int32)
 all_cols = np.empty(total_edges, dtype=np.int32)
 all_inters = np.empty(total_edges, dtype=np.int32)
 
-# REVISED (domain_finder.py - Stream worker outputs to avoid holding both collections simultaneously):
-all_rows_list = []
-all_cols_list = []
-all_inters_list = []
+# REVISED (domain_finder.py - Disk-sharded worker outputs ensuring bounded memory):
+meta, total_edges = [], 0
 global_dom_lengths = np.zeros(n_total_domains, dtype=np.int64)
 
-for r, c, inter, dom_lens_dict in target_workers.imap_unordered():
-    if r.size > 0:
-        all_rows_list.append(r)
-        all_cols_list.append(c)
-        all_inters_list.append(inter)
-    for d_id, d_len in dom_lens_dict.items():
+# Worker writes {chunk_id}_{r,c,i}.npy to shard_dir and returns (chunk_id, n_edges, dom_lens_dict)
+for cid, n, dom_lens in target_workers.results:
+    meta.append((cid, n))
+    total_edges += n
+    for d_id, d_len in dom_lens.items():
         if d_id < n_total_domains:
             global_dom_lengths[d_id] += d_len
+
+meta.sort(key=lambda x: x[0])  # Deterministic chunk ordering
+all_rows = np.empty(total_edges, dtype=np.int32)
+all_cols = np.empty(total_edges, dtype=np.int32)
+all_inters = np.empty(total_edges, dtype=np.int32)
+
+pos = 0
+for cid, n in meta:
+    if n > 0:
+        for dest, tag in ((all_rows, "r"), (all_cols, "c"), (all_inters, "i")):
+            p = shard_dir / f"{cid}_{tag}.npy"
+            dest[pos:pos + n] = np.load(p, mmap_mode="r")
+            p.unlink(missing_ok=True)
+        pos += n
 ```
 
 - **Validation**:
-  1. Profile memory during Stage 4 aggregation under synthetic 100M edge loads.
-  2. Confirm peak resident set size (RSS) does not exhibit a $2\times$ memory step during pre-allocation.
+  1. Profile master memory footprint during Stage 4 aggregation under synthetic $10^8$ edge loads.
+  2. Verify peak Resident Set Size (RSS) remains bounded strictly to final buffer size plus single-shard resident page size, eliminating the $2\times$ memory duplication step.
+  3. Validate that coordinate arrays and `global_dom_lengths` are numerically and bitwise identical to unoptimized outputs.
+
+---
+
+## Memory Expansion During Geometric Target Buffer Reallocation
+
+- **Evidence**:
+  In `domain_finder.py:537-567`:
+  ```python
+  est_capacity = max(100_000, int(tsv_file.stat().st_size // 75))
+  target_buffer = np.empty(est_capacity, dtype=target_dtype)
+  ...
+  if write_offset + n_hits > target_buffer.shape[0]:
+      new_size = max(target_buffer.shape[0] * 2, write_offset + n_hits + 100_000)
+      new_buffer = np.empty(new_size, dtype=target_dtype)
+      new_buffer[:write_offset] = target_buffer[:write_offset]
+      target_buffer = new_buffer
+  ```
+- **Impact**:
+  Geometric reallocation (`2x`) creates a severe virtual allocation footprint. If `target_buffer` reaches 20 GB ($1.25 \times 10^9$ hits) and requires expansion, allocating a replacement 40 GB buffer causes a transient 60 GB allocation capacity peak while copying live data across buffers.
+  Furthermore, the static 75 bytes/line heuristic produces inaccurate initial capacity estimates. In real-world alignment datasets featuring long accession strings or FASTA headers, mean line length frequently exceeds 120 bytes, causing substantial over-allocation. Conversely, short headers underestimate capacity, triggering repetitive reallocation copies.
+- **Proposed Fix**:
+  Estimate initial buffer capacity accurately by sampling the first 10,000 lines of the pre-computed TSV to derive the empirical mean line length. During expansion, grow `target_buffer` in-place using `ndarray.resize(new_size, refcheck=False)` (which utilizes OS-level memory remapping via `mremap` on Linux without intermediate duplicate allocations) with a modest growth factor (e.g., $1.25\times$). Alternatively, if external references to buffer slices exist, store slices across a list of fixed-size pre-allocated NumPy blocks (`target_blocks`).
+
+```python
+# FAULTY (domain_finder.py:537, 560-565 - Static 75-byte heuristic and 2x copy-doubling):
+est_capacity = max(100_000, int(tsv_file.stat().st_size // 75))
+...
+new_size = max(target_buffer.shape[0] * 2, write_offset + n_hits + 100_000)
+new_buffer = np.empty(new_size, dtype=target_dtype)
+new_buffer[:write_offset] = target_buffer[:write_offset]
+target_buffer = new_buffer
+
+# REVISED (domain_finder.py - Empirical line sampling and in-place buffer resizing):
+with tsv_file.open("rb") as fh:
+    sample_lines = [len(fh.readline()) for _ in range(10_000)]
+mean_line_len = max(1.0, sum(sample_lines) / max(1, len(sample_lines)))
+est_capacity = max(100_000, int(tsv_file.stat().st_size / mean_line_len))
+target_buffer = np.empty(est_capacity, dtype=target_dtype)
+
+# In-place growth avoiding transient duplicate buffer allocation
+if write_offset + n_hits > target_buffer.shape[0]:
+    new_size = int((write_offset + n_hits) * 1.25) + 100_000
+    target_buffer.resize(new_size, refcheck=False)
+```
+
+- **Validation**:
+  1. Measure peak RSS under multi-gigabyte TSVs, confirming memory growth remains bounded within $1.25\times$ of active resident data.
+  2. Confirm initial sampled capacity is within $5\%$ of total hits, drastically reducing buffer reallocation events.
 
 ---
 
 # Scientific, Mathematical, and Algorithmic Vulnerabilities
 
-## Arbitrary Nearest-Higher Tie-Breaking in Sparse Matrix Traversal
+## Arbitrary Nearest-Higher Tie-Breaking in Sparse and Dense DPC
 
 - **Evidence**:
   In `clustering.py:270-279` (`_nearest_higher_sparse`):
   ```python
+  candidate = np.where((rank[indices] < rank[row_of]) & (data > 0.0), data, -1.0)
+  ...
   hit = (candidate > 0.0) & (candidate == best_val[row_of])
   if np.any(hit):
       hit_pos = np.flatnonzero(hit)
@@ -87,67 +152,101 @@ for r, c, inter, dom_lens_dict in target_workers.imap_unordered():
       chosen = hit_pos[first]
       target = hit_row[first]
       nearest_higher[target] = indices[chosen]
-      s_max_higher[target] = data[chosen]
+  ```
+  In `clustering.py:299-317` (`_nearest_higher_dense`):
+  ```python
+  mask = rank[np.newaxis, :] < rank[:, np.newaxis]
+  block = mat * mask
+  best = block.argmax(axis=1)
   ```
 - **Impact**:
-  When multiple higher-density neighbors have identical maximal similarity values with node $i$, `chosen` selects the first matching entry in CSR column order (`indices`), which corresponds to the smallest node ID.
-  Under standard DPC (Rodriguez & Laio 2014), ties should be broken by higher density rank (highest $\rho$), or deterministically by density rank rather than arbitrary CSR storage order. In dense evaluation (`_nearest_higher_dense`), `argmax(axis=1)` similarly selects the lowest column index. This creates subtle topological divergence between sparse and dense backends if matrix columns are reordered.
+  When a node has multiple higher-density neighbors with identical maximal similarity, both sparse and dense backends break ties arbitrarily based on matrix column indexing order. In CSR sparse matrices, `chosen = hit_pos[first]` selects the first candidate in CSR `indices` order. In dense matrices, `argmax(axis=1)` selects the lowest column index.
+  Under standard DPC (Rodriguez & Laio 2014), ties among candidate higher-density neighbors must be resolved deterministically according to density rank ($\rho$) rather than internal matrix coordinate storage.
+  Attempting to break ties using fractional floating-point perturbations (e.g. `candidate + (n - rank) / 1e9`) is mathematically fragile: floating-point rounding erases small perturbations for large similarity magnitudes, alters the ordering of genuinely distinct similarities, and depends on an arbitrary scale factor ($10^9$).
 - **Proposed Fix**:
-  Encode density rank as a tie-breaker when selecting the best higher-density neighbor.
+  Enforce a strict, explicit lexicographic tie-breaking policy implemented identically across both sparse and dense backends:
+  1. Primary key: Maximal similarity $s(i, j)$ (descending).
+  2. Secondary key: Maximal density rank (highest $\rho$ / lowest `rank` index).
+  3. Deterministic tertiary tie-breaker: Smallest node index $j$ (ascending).
 
 ```python
 # FAULTY (clustering.py:270 - Arbitrary first match in CSR column order):
 hit = (candidate > 0.0) & (candidate == best_val[row_of])
 
-# REVISED (clustering.py - Tie-break by highest density / lowest rank index):
-# Composite priority score: similarity as primary, (n - rank) as fractional tie-breaker
-priority = np.where(candidate > 0.0, candidate + (n - rank[indices]) / (n * 1e9), -1.0)
-best_prio = np.full(n, -1.0, dtype=np.float64)
-if np.any(nonempty):
-    best_prio[nonempty] = np.maximum.reduceat(priority, indptr[:-1][nonempty])
-hit = (priority > 0.0) & (priority == best_prio[row_of])
+# REVISED (clustering.py - Robust lexicographic tie-breaking for sparse DPC):
+# Filter non-zero candidate edges pointing to strictly higher-density neighbors
+valid_edge = (data > 0.0) & (rank[indices] < rank[row_of])
+if np.any(valid_edge):
+    cand_rows = row_of[valid_edge]
+    cand_cols = indices[valid_edge]
+    cand_sims = data[valid_edge]
+    cand_ranks = rank[cand_cols]
+
+    # Lexicographic sort: primary -sim (desc), secondary rank (asc), tertiary col (asc)
+    order = np.lexsort((cand_cols, cand_ranks, -cand_sims, cand_rows))
+    s_rows = cand_rows[order]
+    s_cols = cand_cols[order]
+    s_sims = cand_sims[order]
+
+    # Pick first entry for each unique row
+    first_mask = np.empty(s_rows.size, dtype=bool)
+    first_mask[0] = True
+    first_mask[1:] = s_rows[1:] != s_rows[:-1]
+
+    targets = s_rows[first_mask]
+    nearest_higher[targets] = s_cols[first_mask]
+    s_max_higher[targets] = s_sims[first_mask]
 ```
 
 - **Validation**:
-  1. Construct a triangular similarity graph where node 0 has identical similarity (0.8) to node 1 ($\rho=5$) and node 2 ($\rho=10$).
-  2. Verify node 0 deterministically selects node 2 ($\rho=10$) under both sparse and dense backends.
+  1. Construct a triangular test graph where node 0 has identical similarity ($0.8$) to node 1 ($\rho = 5.0$, `rank` = 2) and node 2 ($\rho = 10.0$, `rank` = 1).
+  2. Verify that node 0 deterministically chooses node 2 under both sparse and dense backends regardless of matrix row/column permutations.
+  3. Ensure zero-similarity pairs ($s(i, j) = 0.0$) are never selected as valid nearest-higher neighbors.
 
 ---
 
-## Legacy Memoryview Buffer Extraction in Array Arithmetic
+## Ambiguous Input Type Handling in Sparse Array Arithmetic
 
 - **Evidence**:
-  In `clustering.py:48-50` and `70-71`:
+  In `clustering.py:48-50` and `68-71`:
   ```python
   unions = row_lengths + column_lengths - intersections.data
   ji = intersections.data / unions
   ...
+  smaller = np.minimum(row_lengths, column_lengths)
   containment = intersections.data / smaller
   ```
 - **Impact**:
-  In `domain_finder.py:164` and `filter_spurious_domains`, `intersections` is a 1D contiguous NumPy array (`np.ndarray`), not a SciPy sparse matrix. Accessing `.data` on a NumPy array returns a Python `memoryview` object.
-  While NumPy overloads memoryview operations in simple 1D expressions, passing non-contiguous array slices, custom subclasses, or memoryviews into downstream routines creates subtle typing bugs, unpicklable references, and bypasses NumPy array dispatching.
+  In `domain_finder.py:164` and `filter_spurious_domains`, `intersections` is passed as a 1D NumPy array (`np.ndarray`), whereas in other routines it may be passed as a SciPy sparse matrix. Accessing `.data` on a standard NumPy array returns a Python `memoryview` object, not a NumPy array.
+  While simple 1D binary operations in NumPy can coerce memoryviews, passing memoryviews into downstream array slicing, multiprocessing pickles, or C-extensions triggers subtle typing failures and bypasses NumPy ufunc acceleration. Furthermore, SciPy is actively transitioning from sparse matrices (`spmatrix`) to sparse arrays (`sparray`).
 - **Proposed Fix**:
-  Accept array-like inputs and extract `.data` only if `isinstance(intersections, sp.spmatrix)`, or operate directly on the NumPy array.
+  Implement a robust helper `extract_values` that transparently handles SciPy sparse matrices, SciPy sparse arrays, and standard NumPy arrays without accessing `.data` on NumPy arrays.
 
 ```python
-# FAULTY (clustering.py:48 - Accesses .data memoryview on 1D NumPy arrays):
+# FAULTY (clustering.py:48, 68 - Accesses .data indiscriminately, yielding memoryview on ndarray):
 unions = row_lengths + column_lengths - intersections.data
 ji = intersections.data / unions
 
-# REVISED (clustering.py - Robust array-like handling):
-inter_data = intersections.data if hasattr(intersections, "data") and not isinstance(intersections, np.ndarray) else np.asarray(intersections)
-unions = row_lengths + column_lengths - inter_data
-ji = inter_data / unions
+# REVISED (clustering.py - Type-safe value extraction supporting SciPy sparse and NumPy arrays):
+from scipy import sparse
+
+def _extract_values(intersections: Union[np.ndarray, sparse.spmatrix, Any]) -> np.ndarray:
+    if sparse.issparse(intersections):
+        return intersections.data
+    return np.asarray(intersections)
+
+inter_vals = _extract_values(intersections)
+unions = row_lengths + column_lengths - inter_vals
+ji = inter_vals / unions
 ```
 
 - **Validation**:
-  1. Test `jaccard_index` and `max_containment` with standard NumPy arrays, array slices, and SciPy CSR matrices.
-  2. Verify identical numerical output and lack of memoryview objects.
+  1. Pass 1D NumPy arrays, array slices, SciPy CSR matrices, and SciPy CSR 2D arrays to `jaccard_index` and `max_containment`.
+  2. Verify that return values are native NumPy ndarrays and that no Python `memoryview` objects are emitted.
 
 ---
 
-# Performance Bottlenecks and Avoidable Bloat
+# Performance Bottlenecks and Concurrency Lifecycle
 
 ## Process Pool Re-spawning in Stage 2 Query Streaming
 
@@ -169,92 +268,93 @@ ji = inter_data / unions
           del query_workers
   ```
 - **Impact**:
-  For an alignment dataset with 5,000 batches (5,000,000 queries), `stream_query_batches` loops 100 times (`chunk_window = 50`). In each iteration, `Parallel` instantiates a brand new `mpire.WorkerPool`, spawning and terminating `cpu` (e.g. 32) worker processes 100 consecutive times (3,200 process spawns and IPC teardowns).
-  Process initialization in Python (especially under `forkserver` or `spawn`) incurs substantial CPU and wall-clock overhead, causing worker launch latency and memory churn.
+  For an alignment dataset with 5,000 batches (5,000,000 queries), `stream_query_batches` loops 100 times (`chunk_window = 50`). In each window, `Parallel` creates a new `mpire.WorkerPool`, spawning `cpu` (e.g. 32) worker processes and terminating them at the end of the window (3,200 process spawns and terminations).
+  Under `spawn` and `forkserver`, process creation requires starting fresh Python interpreter instances and re-serializing `query_kwargs`. Moreover, each 50-task window acts as an execution barrier where fast workers sit idle waiting for the slowest task in the window to finish, capping CPU utilization at approximately 75–80% on 32 cores.
 - **Proposed Fix**:
-  Instantiate a single persistent `WorkerPool` outside the loop, streaming batches through the long-lived pool.
+  Instantiate a single persistent `WorkerPool` using the repository's fork-safe start context (`_safe_ctx_name`). Stream the generator `batch_gen` through the pool with a bounded in-flight task window (`max_tasks_active = cpu * 2`) to eliminate prefetching while maintaining continuous multi-core saturation. Periodically recycle workers via `worker_lifespan` to enforce the strict 500 MB per-worker memory ceiling.
 
 ```python
 # FAULTY (domain_finder.py:546-552 - Spawns and destroys WorkerPool every 50 batches):
 for batch_window in stream_query_batches(batch_gen, chunk_window=50):
     query_workers = Parallel(...)
 
-# REVISED (domain_finder.py - Persistent worker pool streaming all batches):
-with WorkerPool(n_jobs=cpu, start_method='forkserver') as pool:
-    for batch_res in pool.imap_unordered(batch_query_processor, batch_gen):
-        ...
+# REVISED (domain_finder.py - Persistent worker pool streaming queries with bounded active queue):
+with WorkerPool(n_jobs=cpu,
+                start_method=_safe_ctx_name,
+                shared_objects=query_kwargs,
+                worker_lifespan=200) as pool:
+    for batch_res in pool.imap(batch_query_processor, batch_gen, max_tasks_active=cpu * 2):
+        for local_domains, all_targets in batch_res:
+            ...
 ```
 
 - **Validation**:
-  1. Benchmark total runtime on a 500k-hit TSV dataset with 32 worker threads.
-  2. Measure execution time reduction from eliminating repeated worker pool re-initializations.
+  1. Benchmark execution on a 500k-hit alignment dataset with 32 worker threads.
+  2. Confirm CPU utilization remains above 95% throughout Stage 2 without barrier stalls, and worker memory remains bounded below 500 MB.
 
 ---
 
-## Memory Expansion During Geometric Target Buffer Reallocation
+## Worker Starvation and IPC Queue Overhead in Stage 4 Batching
 
 - **Evidence**:
-  In `domain_finder.py:558-566`:
+  In `domain_finder.py:586-590`:
   ```python
-  if write_offset + n_hits > target_buffer.shape[0]:
-      new_size = max(target_buffer.shape[0] * 2, write_offset + n_hits + 100_000)
-      new_buffer = np.empty(new_size, dtype=target_dtype)
-      new_buffer[:write_offset] = target_buffer[:write_offset]
-      target_buffer = new_buffer
+  if n_target_seqs <= cpu * 4:
+      target_batch_size = max(1, int(np.ceil(n_target_seqs / max(1, cpu))))
+  else:
+      target_batch_size = max(10, min(1000, n_target_seqs // (cpu * 4)))
   ```
 - **Impact**:
-  When `target_buffer` reaches 20 GB ($1.25 \times 10^9$ hits), expanding it geometrically requires allocating a new 40 GB buffer while the 20 GB buffer is still retained, causing a 60 GB instantaneous memory peak.
-  Furthermore, `est_capacity = max(100_000, int(tsv_file.stat().st_size // 75))` uses a hardcoded 75 bytes/line estimate. When TSV formatting includes long sequence IDs, lines exceed 120 bytes, causing `est_capacity` to overestimate or underestimate significantly.
+  For small sequence sets where $n_{\text{target\_seqs}} \le \text{cpu} \times 4$, the current formula can compute batch sizes that leave cores under-utilized. Conversely, proposing a rigid batch size of 1 for small datasets ($n \le \text{cpu} \times 2$) increases scheduling, IPC pipe serialization, and Python function call overhead if sequences contain very few hits.
+  Task granularity must balance worker load distribution against IPC communication costs.
 - **Proposed Fix**:
-  Accurately sample the first 10,000 lines to determine the true mean line length, and allocate memory-mapped storage or chunked pre-allocated blocks to eliminate reallocation copy spikes.
+  Retain adaptive batch sizing that scales smoothly between 1 and 1,000 sequences per batch based on both available CPU cores and total sequence count, ensuring `target_batch_size` allows all workers to receive at least 2–4 tasks while preventing fine-grained IPC task flooding.
 
 ```python
-# FAULTY (domain_finder.py:560-565 - Monolithic doubling creates 3x transient memory footprint):
-new_buffer = np.empty(new_size, dtype=target_dtype)
-new_buffer[:write_offset] = target_buffer[:write_offset]
-target_buffer = new_buffer
+# FAULTY (Arbitrary fixed batch sizes causing core starvation or IPC flooding):
+# target_batch_size = 1  # Causes IPC serialization flooding on high-depth datasets
+# target_batch_size = 10 # Starves cores when sequence count is small
 
-# REVISED (domain_finder.py - Block-list allocation avoiding reallocation spikes):
-target_blocks = [np.empty(block_size, dtype=target_dtype)]
-# Store slices across fixed-size blocks, avoiding duplicate memory copies
+# REVISED (domain_finder.py - Adaptive batch sizing balancing IPC and worker saturation):
+if n_target_seqs <= cpu * 4:
+    target_batch_size = max(1, int(np.ceil(n_target_seqs / max(1, cpu * 2))))
+else:
+    target_batch_size = max(10, min(1000, n_target_seqs // (cpu * 4)))
 ```
 
 - **Validation**:
-  1. Track peak memory under synthetic multi-gigabyte inputs.
-  2. Verify total RAM usage never exceeds $1.1\times$ final buffer size.
+  1. Test scaling across thread counts ($4, 16, 32$) with small ($n = 35$) and large ($n = 100,000$) target sequence sets.
+  2. Verify that all worker processes remain active and IPC overhead is minimized.
 
 ---
 
-# Data Integrity, Concurrency, and Programming Practices
-
-## Deprecated Fork Start Method Deadlock Vulnerability
+## Global Multiprocessing State Mutation and Start Method Safety
 
 - **Evidence**:
-  In `executor.py:35-46`:
+  In `executor.py:38-40`:
   ```python
   _avail_start_methods = mp.get_all_start_methods()
   _safe_ctx_name = 'forkserver' if 'forkserver' in _avail_start_methods else 'spawn'
   _safe_ctx = mp.get_context(_safe_ctx_name)
   ```
-  `Parallel` attempts to default to `'forkserver'` or `'spawn'`.
-  However, in multi-threaded environments or nested worker loops where workers call external compiled libraries (e.g. OpenBLAS, MKL, or SciPy), starting child processes via unmanaged contexts can hang or trigger deadlocks.
+  Calling `mp.set_start_method(..., force=True)` globally alters process-wide runtime behavior across imported libraries and test runners, triggering silent crashes or conflicts with tools that configure custom multiprocessing contexts.
 - **Impact**:
-  When running under interactive scripts or without proper module-level pickling guards (`if __name__ == '__main__':`), `forkserver` or `spawn` crashes with unpicklable target functions or hangs indefinitely waiting on IPC sockets.
+  On Linux under Python 3.12+, unmanaged `fork` triggers deprecation warnings and deadlocks in multi-threaded runtimes (e.g. OpenBLAS, MKL). However, forcibly overriding the global start method via `force=True` violates library encapsulation.
 - **Proposed Fix**:
-  Enforce explicit multiprocessing start-method validation, ensuring worker target callables are module-level functions with clear fallback error messages.
+  Pass explicit multiprocessing contexts (`ctx=_safe_ctx` or `start_method=_safe_ctx_name`) directly to `WorkerPool` and `SyncManager` instances without mutating global multiprocessing state via `mp.set_start_method(force=True)`.
 
 ```python
-# REVISED (executor.py - Robust start method initialization with explicit validation):
-if mp.get_start_method(allow_none=True) != _safe_ctx_name:
-    try:
-        mp.set_start_method(_safe_ctx_name, force=True)
-    except RuntimeError:
-        pass
+# FAULTY (executor.py - Forcible global start method mutation):
+# mp.set_start_method(_safe_ctx_name, force=True)
+
+# REVISED (executor.py - Encapsulated context passing without global state mutation):
+with WorkerPool(n_jobs=n_jobs, start_method=_safe_ctx_name, **worker_kwargs) as pool:
+    ...
 ```
 
 - **Validation**:
-  1. Run unit test suite under Python 3.12+ with `-W error::DeprecationWarning`.
-  2. Confirm zero deprecation warnings and zero deadlocks.
+  1. Run unit tests under Python 3.12+ with `-W error::DeprecationWarning`.
+  2. Confirm zero deprecation warnings and zero deadlocks during test runs.
 
 ---
 
@@ -264,29 +364,35 @@ This implementation plan provides direct, step-by-step instructions for future e
 
 ## Phase: Correcting Inconsistencies and Ties in Clustering
 1. **Target File:** `clustering.py`
-   - **Target Functions:**  `_nearest_higher_sparse`, `jaccard_index` and `max_containment`
+   - **Target Functions:** `_nearest_higher_sparse`, `_nearest_higher_dense`, `jaccard_index`, and `max_containment`
    - **Specific Instructions:**
-     - In `_nearest_higher_sparse`, introduce density rank as a secondary tie-breaker when higher-density neighbors have identical similarity scores.
-     - In `jaccard_index` and `max_containment`, eliminate the `.data` access on NumPy arrays.
+     - In `_nearest_higher_sparse` and `_nearest_higher_dense`, implement strict lexicographic tie-breaking: primary key is maximal similarity (descending), secondary key is highest density rank (lowest `rank` index), tertiary key is lowest candidate node ID.
+     - Never use float-epsilon perturbations (e.g. `sim + rank / 1e9`) due to floating-point precision loss.
+     - Implement `_extract_values` to handle SciPy sparse matrices (`spmatrix`), SciPy sparse arrays (`sparray`), and standard NumPy arrays cleanly without accessing `.data` on `np.ndarray`.
    - **Anti-Patterns & Risks to Avoid:**
-     - Ensure sparse matrix indexing remains `np.int32` unless total entries exceed $2^{31} - 1$.
+     - Ensure sparse matrix indexing remains `np.int32` unless total entries or dimensions exceed $2^{31} - 1$.
+     - Verify that zero-similarity edges ($s(i, j) = 0.0$) never form valid connections.
 
-## Phase: Streaming Target Overlap Results in Stage 4
+## Phase: Disk-Sharded and Bounded Aggregation in Stage 4
 1. **Target File:** `domain_finder.py`
-   - **Target Function:** `find_domains`
+   - **Target Functions:** `target_batch_processor` and `find_domains`
    - **Specific Instructions:**
-     - Refactor `target_workers` aggregation to consume worker results incrementally or stream them directly into destination structures.
-     - Eliminate the simultaneous retention of `results_list` and pre-allocated destination arrays.
+     - In `target_batch_processor`, write generated `(rows, cols, intersections)` coordinate arrays directly to binary `.npy` files in a designated temporary shard directory. Return only metadata `(chunk_id, n_edges, dom_lens_dict)` to the parent process.
+     - In `find_domains`, stream or iterate metadata to compute the exact total edge count and update `global_dom_lengths`.
+     - Allocate contiguous destination coordinate arrays (`all_rows`, `all_cols`, `all_inters`) sized exactly to `total_edges`.
+     - Load and copy shards into destination arrays shard-by-shard using `np.load(..., mmap_mode="r")`, deleting each shard file immediately upon copying.
    - **Anti-Patterns & Risks to Avoid:**
-     - Do not use `np.concatenate` on large worker result lists, as it forces concurrent duplicate memory allocation.
-     - Ensure `dom_lens_dict` updates to `global_dom_lengths` remain numerically identical.
+     - Do not collect worker coordinate arrays in Python lists in the parent process.
+     - Do not pre-allocate destination arrays while simultaneously holding in-memory worker array returns.
 
-## Phase: Multi-Core Saturation and Process Lifecycle Optimization
+## Phase: Persistent Worker Pool and In-Place Buffer Expansion in Stage 2
 1. **Target Files:** `domain_finder.py` and `executor.py`
    - **Target Functions:** `find_domains` and `Parallel`
    - **Specific Instructions:**
-     - Adjust `target_batch_size` in Stage 4 to set `target_batch_size = 1` when $n_{\text{target\_seqs}} \le \text{cpu} \times 2$, ensuring all worker threads receive tasks.
-     - Move `WorkerPool` creation in Stage 2 outside the batch streaming loop to avoid spawning and killing worker processes every 50 batches.
-     - Decouple `point_specific` configuration into `point_specific_spans` and `point_specific_families`.
+     - In `find_domains` Stage 2, estimate initial `target_buffer` capacity by reading a 10,000-line sample of the TSV to calculate empirical mean line length.
+     - Replace repeated `Parallel` instantiation inside `stream_query_batches` with a single persistent `WorkerPool` using `start_method=_safe_ctx_name` outside the loop.
+     - Stream `batch_gen` into the persistent pool using `pool.imap` with `max_tasks_active = cpu * 2` and `worker_lifespan = 200`.
+     - Replace buffer copy-doubling with in-place resizing via `target_buffer.resize(new_size, refcheck=False)` using a growth factor of $1.25\times$.
    - **Anti-Patterns & Risks to Avoid:**
-     - Avoid using `os.fork` directly on Linux under Python 3.12+ to prevent deadlocks with compiled threading runtimes.
+     - Never mutate global multiprocessing start methods via `set_start_method(force=True)`.
+     - Ensure no active array views of `target_buffer` are retained during `resize`.
