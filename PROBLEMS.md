@@ -8,7 +8,7 @@ The pipeline extracts conserved structural RNA domain instances from pairwise al
 
 ---
 
-# Re-Assessment and Audit of PREVIOUS_UPDATE.md Claims
+# Audit
 
 Two claims from `PREVIOUS_UPDATE.md` were incompletely implemented or introduced subsequent complications:
 
@@ -28,10 +28,6 @@ mat = csr_matrix((all_s, (all_r, all_c)), shape=(n, n))
 mat = csr_matrix((max_s, (u_r.astype(np.int32), u_c.astype(np.int32))), shape=(n, n))
 mat.setdiag(1.0)
 ```
-
----
-
-## Critical Algorithmic, Mathematical, and Biological Problems
 
 **Problem A: Halo Filtering Border Contamination Treats Noise Points as Foreign Cluster Neighbors**
 - **Module / Component:** `clustering.py` (`_foreign_mask`, `halo_filter`)
