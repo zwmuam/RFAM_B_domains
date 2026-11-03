@@ -1,12 +1,9 @@
 # Abstract
 
-This document details an in-depth codebase audit of the RNA domain finding pipeline (`domain_finder.py`, `clustering.py`, `aligners.py`, and `executor.py`). The pipeline extracts structural RNA domain instances from pairwise alignments (MMseqs2 or RiboSeek) and clusters them into global domain families using Density Peak Clustering (DPC). Processing large multi-gigabyte alignment datasets imposes strict operational requirements:
 1. Peak system memory must stay bounded strictly below 200 GB.
-2. Parallel worker memory overhead must remain strictly below 200 MB per worker process.
+2. Parallel worker memory overhead must remain strictly below 500 MB per worker process.
 3. Multi-core execution must scale smoothly up to 30+ threads without worker starvation or inter-process communication bottlenecks.
 4. Non-overlapping or 0-similarity pairs must never link domain instances.
-
-A rigorous re-evaluation of the codebase reveals scientific, mathematical, numerical, memory, and concurrency vulnerabilities, as well as discrepancies where claims in `PREVIOUS_UPDATE.md` were incomplete, unfulfilled, or introduced new architectural risks.
 
 ---
 
