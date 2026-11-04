@@ -38,8 +38,6 @@ if write_offset + n_hits > target_buffer.shape[0]:
 
 ---
 
-# Evaluation of Target Span Replication and Memory Optimization
-
 ## Redundancy in Target Spans and Feasibility of Compression
 
 - **Evidence**:
@@ -131,41 +129,6 @@ def merge_overlapping_spans(targets_on_sequence: np.ndarray) -> np.ndarray:
 
 ---
 
-# Memory Bottlenecks and Performance Inefficiencies
-
-## Dense Nucleotide-Level Array Allocation in Evaluation Module
-
-- **Evidence**:
-  In `evaluation.py:133-134`:
-  ```python
-  label_matrix_dtype = [('seq_id', 'U25'), ('ref', 'U25'), ('pred', 'U25')]
-  label_matrix = np.full((general_stats['input']['total_nt']), fill_value=np.nan, dtype=label_matrix_dtype)
-  ```
-- **Impact**:
-  In NumPy, a `U25` string field allocates 100 bytes (4 bytes per UTF-32 character). A 3-field structured record allocates 300 bytes per nucleotide. For genomic datasets:
-  - For $10^8\text{ nt}$ (a moderate eukaryotic genome), `label_matrix` consumes:
-    $$\text{RAM} = 10^8 \times 300\text{ bytes} \approx 30.0\text{ GB}$$
-  - For $10^9\text{ nt}$ (large mammalian genomes or meta-transcriptomes), `label_matrix` requires $300.0\text{ GB}$, causing immediate process crashes due to `MemoryError`.
-- **Proposed Fix**:
-  Replace nucleotide-level character arrays with interval arithmetic. Overlaps between reference annotations and predicted clusters should be calculated using coordinate interval overlap routines (`compare_sorted_spans` or interval tree queries) rather than instantiating 300-byte-per-base physical matrices. Alternatively, if nucleotide encoding is required, represent labels using 32-bit integer IDs (`int32`, 4 bytes) mapped via an integer dictionary, reducing memory consumption by $96\%$.
-
-```python
-# FAULTY (evaluation.py:133-134 - 300 bytes per nucleotide across entire input sequence volume):
-label_matrix_dtype = [('seq_id', 'U25'), ('ref', 'U25'), ('pred', 'U25')]
-label_matrix = np.full((general_stats['input']['total_nt']), fill_value=np.nan, dtype=label_matrix_dtype)
-
-# REVISED (evaluation.py - Efficient 32-bit integer indexing reducing footprint by 96%):
-# Map string labels to dense int32 IDs: 0 = unlabeled, 1..K = labeled features
-label_matrix_dtype = [('seq_id', np.int32), ('ref', np.int32), ('pred', np.int32)]
-label_matrix = np.zeros(general_stats['input']['total_nt'], dtype=label_matrix_dtype)
-```
-
-- **Validation**:
-  1. Run `evaluation.py` on a $50\text{ MB}$ FASTA dataset.
-  2. Confirm memory footprint drops from $15\text{ GB}$ to under $600\text{ MB}$ while preserving exact Adjusted Rand Index (ARI) and Normalized Mutual Information (NMI) metrics.
-
----
-
 ## Redundant Range-Slicing Overhead in Pairwise Span Comparison
 
 - **Evidence**:
@@ -220,94 +183,6 @@ for i in active_i:
 - **Validation**:
   1. Benchmark runtime on sequences containing $> 10,000$ overlapping spans.
   2. Confirm 2- to 3-fold speedup in `compare_sorted_spans` without altering coordinate output.
-
----
-
-# Data Integrity, Coding Standards, and Documentation Risks
-
-## Missing Top-Level Module Import in Evaluation Pipeline
-
-- **Evidence**:
-  In `evaluation.py:13`:
-  ```python
-  from annotations import NucleotideSeq
-  ```
-- **Impact**:
-  There is no module named `annotations.py` anywhere in the repository. Attempting to import or execute `evaluation.py` immediately crashes with `ModuleNotFoundError: No module named 'annotations'`. This renders the evaluation benchmarking module unusable in its current state.
-- **Proposed Fix**:
-  Replace the missing `annotations.NucleotideSeq` import with BioPython's `Bio.SeqIO` or the repository's native FASTA parsing logic in `aligners.py` or `gff_sequence_extractor.py`.
-
-```python
-# FAULTY (evaluation.py:13 - References non-existent annotations module):
-from annotations import NucleotideSeq
-
-# REVISED (evaluation.py - Uses standard BioPython SeqIO parser):
-from Bio import SeqIO
-
-def read_fasta(fasta_path: Path):
-    seq_offsets = {}
-    offset_start, offset_end, n = 0, 0, 0
-    for n, record in enumerate(SeqIO.parse(str(fasta_path), "fasta"), 1):
-        seq_len = len(record.seq)
-        offset_start, offset_end = offset_end, offset_end + seq_len
-        seq_offsets[record.id] = (offset_start, offset_end)
-    general_stats = {'input': {'total_seqs': n, 'total_nt': offset_end}}
-    return seq_offsets, general_stats
-```
-
-- **Validation**:
-  1. Execute `python3 -c "import evaluation"` in the Python environment.
-  2. Verify that the module imports cleanly and executes without missing dependency errors.
-
----
-
-## Non-Configurable CPU Thread Count in Precomputed Entry Point
-
-- **Evidence**:
-  In `domain_finder_precomputed.py:27-43`:
-  ```python
-  def find_domains(fasta_path: Path,
-                   aligner_name: str,
-                   tsv_val: Path,
-                   min_dom_sim: float,
-                   dom_halo: float,
-                   min_dom_dens: float,
-                   min_fam_sim: float,
-                   fam_halo: float,
-                   min_fam_dens: float,
-                   halo_method: Optional[str],
-                   reassign_targets: bool,
-                   min_containment: float,
-                   output_gff: Path,
-                   point_specific: bool = False,
-                   tmp_dir: Optional[Path] = None,
-                   result_dir: Optional[Path] = None) -> Path:
-  ```
-- **Impact**:
-  `domain_finder_precomputed.find_domains` omits the `cpu` parameter and calls `domain_finder.find_domains` without passing thread count, forcing execution to fall back to `default_threads` (all system cores minus 1). In shared high-performance computing (HPC) environments or containerized environments with strict cgroup CPU allocations, this can lead to core oversubscription, job eviction, or resource contention.
-- **Proposed Fix**:
-  Add an explicit `cpu: int = default_threads` argument to `domain_finder_precomputed.find_domains` and forward it directly to `domain_finder.find_domains`.
-
-```python
-# FAULTY (domain_finder_precomputed.py - Omits cpu argument):
-def find_domains(fasta_path: Path, ..., output_gff: Path, point_specific: bool = False,
-                 tmp_dir: Optional[Path] = None, result_dir: Optional[Path] = None) -> Path:
-    ...
-    return df_find_domains(fasta_path=fasta_path, attributes=attributes, output_gff=output_gff,
-                           tmp_dir=tmp_dir, result_dir=result_dir)
-
-# REVISED (domain_finder_precomputed.py - Exposes configurable cpu thread allocation):
-def find_domains(fasta_path: Path, ..., output_gff: Path, cpu: int = default_threads,
-                 point_specific: bool = False, tmp_dir: Optional[Path] = None,
-                 result_dir: Optional[Path] = None) -> Path:
-    ...
-    return df_find_domains(fasta_path=fasta_path, attributes=attributes, output_gff=output_gff,
-                           tmp_dir=tmp_dir, result_dir=result_dir, cpu=cpu)
-```
-
-- **Validation**:
-  1. Call `find_domains(..., cpu=2)` from `domain_finder_precomputed.py`.
-  2. Verify that worker pools in Stage 2 and Stage 4 instantiate exactly 2 worker processes.
 
 ---
 
