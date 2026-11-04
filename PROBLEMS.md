@@ -1,0 +1,527 @@
+# Executive Summary and Codebase Audit Scope
+
+This document provides a comprehensive audit of the conserved structural RNA domain finding pipeline and its dependencies (`domain_finder.py`, `clustering.py`, `aligners.py`, `executor.py`, and secondary evaluation modules). Each issue is analyzed using the Evidence $\to$ Impact $\to$ Proposed Fix $\to$ Validation framework. Header structures are restricted to at most two levels (`#` and `##`) without numbering. Mathematical expressions use escaped underscores inside text macros to prevent rendering errors. Valid past implementations from `PREVIOUS_UPDATE.md` are not repeated unless an audit revealed that a claimed optimization was unfulfilled, partially implemented, or inconsistent.
+
+---
+
+# Scientific, Mathematical, and Algorithmic Vulnerabilities
+
+## Incomplete Implementation of In-Place Target Buffer Growth in Stage 2
+
+- **Evidence**:
+  In `PREVIOUS_UPDATE.md`, under "Memory Expansion During Geometric Target Buffer Reallocation", it is claimed that the pipeline replaces duplicate buffer allocations with in-place buffer growth via `target_buffer.resize(new_size, refcheck=False)`.
+  However, in `domain_finder.py:526-532`:
+  ```python
+  if write_offset + n_hits > target_buffer.shape[0]:
+      ## mem_opt ## Safe 1.25x buffer expansion copying only active prefix without cyclic data duplication
+      new_size = int((write_offset + n_hits) * 1.25) + 100_000
+      new_buffer = np.empty(new_size, dtype=target_dtype)
+      new_buffer[:write_offset] = target_buffer[:write_offset]
+      target_buffer = new_buffer
+  ```
+- **Impact**:
+  The claim in `PREVIOUS_UPDATE.md` was not fulfilled in the actual codebase. Whenever `target_buffer` expands, allocating `new_buffer` while retaining `target_buffer` duplicates memory allocation in the parent heap. For a buffer holding $1.5 \times 10^8$ target hits ($2.4\text{ GB}$ of structured records), allocating a replacement $3.0\text{ GB}$ buffer incurs a transient peak of over $5.4\text{ GB}$ and triggers redundant array copying.
+- **Proposed Fix**:
+  Because no external views or slices of `target_buffer` are retained across loop iterations, `target_buffer.resize(new_size, refcheck=False)` can be called directly to reallocate memory in-place via operating system page remapping (`mremap` on Linux) without creating duplicate buffer allocations.
+
+```python
+# FAULTY (domain_finder.py:526-532 - Still allocates new_buffer and copies active prefix):
+if write_offset + n_hits > target_buffer.shape[0]:
+    new_size = int((write_offset + n_hits) * 1.25) + 100_000
+    new_buffer = np.empty(new_size, dtype=target_dtype)
+    new_buffer[:write_offset] = target_buffer[:write_offset]
+    target_buffer = new_buffer
+
+# REVISED (domain_finder.py - In-place buffer expansion without duplicate allocation):
+if write_offset + n_hits > target_buffer.shape[0]:
+    new_size = int((write_offset + n_hits) * 1.25) + 100_000
+    target_buffer.resize(new_size, refcheck=False)
+```
+
+- **Validation**:
+  1. Profile memory allocation during Stage 2 under high target hit counts ($> 5 \times 10^7$ hits).
+  2. Confirm that peak Resident Set Size (RSS) during buffer growth never exceeds the target buffer size by more than single-page allocations, eliminating duplicate buffer memory peaks.
+
+---
+
+## Discarding Self-Sequence Alignments Eliminates Tandem Duplications
+
+- **Evidence**:
+  In `aligners.py:135-136`:
+  ```python
+  if q_seq_str == t_seq_str:
+      continue
+  ```
+- **Impact**:
+  In MMseqs2 self-searches (`fasta_file` searched against itself), query and target sequence identifiers match whenever a sequence aligns against itself. Filtering strictly on `q_seq_str == t_seq_str` eliminates not only trivial self-hits ($[s_q, e_q) == [s_t, e_t)$) but also valid intra-sequence alignments where a sequence contains multiple non-overlapping copies of a domain (e.g., tandem riboswitches, repeated tRNA loci, or internal duplications on long transcriptomic sequences). Consequently, tandem domain copies residing on the same physical transcript or genomic contig are blinded from detection and can never be clustered.
+- **Proposed Fix**:
+  Only filter trivial self-alignments where the query span and target span overlap substantially or are identical ($q\_start == t\_start$ and $q\_end == t\_end$). Allow non-overlapping or distinct tandem hits on the same sequence to pass into downstream clustering.
+
+```python
+# FAULTY (aligners.py:135-136 - Discards all hits between the same sequence):
+if q_seq_str == t_seq_str:
+    continue
+
+# REVISED (aligners.py - Discards only identical self-coordinates, preserving tandem duplications):
+if q_seq_str == t_seq_str and raw_qs == raw_ts and raw_qe == raw_te:
+    continue
+```
+
+- **Validation**:
+  1. Run a test dataset with an artificial sequence containing two copies of a known structural domain separated by a spacer.
+  2. Verify that both domain copies are parsed into query hits and grouped into the appropriate domain family.
+
+---
+
+## Unweighted Density in Domain Family Clustering Disregards Hit Support
+
+- **Evidence**:
+  In `domain_finder.py:384-394`:
+  ```python
+  peak_to_cluster, n_halo = dpc(rows=final_r,
+                                cols=final_c,
+                                sims=similarities,
+                                n=n_domains,
+                                min_sim=min_fam_sim,
+                                backend="scipy",
+                                filter_transparency=halo_stringency,
+                                halo_method=halo_method,
+                                min_dens=min_fam_dens,
+                                point_specific=point_specific)
+  ```
+- **Impact**:
+  In Stage 2 (`domain_instances_on_query`), query spans are weighted by alignment counts (`weights=weights`) when computing local density $\rho$. However, in Stage 5 (`family_finder`), `dpc` is called without sample weights (`weights=None`). Consequently, every domain instance contributes identically ($s(i, j)$) to family density regardless of whether it represents a solitary hit or a domain instance supported by hundreds of homologous alignments across genomes. An isolated singleton domain with zero overlaps has $\rho = 1.0$ (from diagonal self-similarity), identical to any other domain having zero overlaps. This prevents the pipeline from prioritizing high-support domain seeds during family center selection ($\gamma = \rho \cdot (1 - s_{\text{max\_higher}})$).
+- **Proposed Fix**:
+  Pass domain hit support (the count of target hits associated with each domain instance) or total target length as sample weights to `dpc` in `family_finder`.
+
+```python
+# FAULTY (domain_finder.py:384-394 - Calls DPC with unweighted domain instances):
+peak_to_cluster, n_halo = dpc(rows=final_r,
+                              cols=final_c,
+                              sims=similarities,
+                              n=n_domains,
+                              min_sim=min_fam_sim,
+                              backend="scipy",
+                              filter_transparency=halo_stringency,
+                              halo_method=halo_method,
+                              min_dens=min_fam_dens,
+                              point_specific=point_specific)
+
+# REVISED (domain_finder.py - Weights domain instances by alignment support):
+domain_weights = np.bincount(all_targets_arr['dom_id'], minlength=n_total_domains).astype(np.float64)
+# Ensure solitary domains retain minimum weight 1.0
+domain_weights = np.maximum(1.0, domain_weights)
+
+peak_to_cluster, n_halo = dpc(rows=final_r,
+                              cols=final_c,
+                              sims=similarities,
+                              n=n_domains,
+                              min_sim=min_fam_sim,
+                              weights=domain_weights,
+                              backend="scipy",
+                              filter_transparency=halo_stringency,
+                              halo_method=halo_method,
+                              min_dens=min_fam_dens,
+                              point_specific=point_specific)
+```
+
+- **Validation**:
+  1. Verify that family centers preferentially coincide with domain instances exhibiting robust multi-species alignment support.
+  2. Confirm deterministic tie-breaking preserves consistent cluster assignments across runs.
+
+---
+
+## Traditional Halo Filtering Prunes Authentic Clusters via Cluster-Wide Decapitation
+
+- **Evidence**:
+  In `domain_finder.py:480-488`:
+  ```python
+  point_specific_val = bool(attributes.get("point_specific", False))
+  ```
+  And in `clustering.py:454-463`:
+  ```python
+  # Traditional cluster-wide mode
+  border = np.flatnonzero(is_border)
+  rho_b = np.full(n_clusters, -1.0, dtype=np.float64)
+  if border.size > 0:
+      np.maximum.at(rho_b, new_labels[border], rho[border])
+  rho_b[sizes < halo_min_cluster_size] = -1.0
+  cut = valid_mask & (rho < rho_b[new_labels.clip(min=0)])
+  new_labels[cut] = -1
+  ```
+- **Impact**:
+  By default, `point_specific` is `False`. When `halo_method` is active (e.g., `'similarity_weighted'`), the pipeline defaults to traditional Rodriguez-Laio cluster-wide halo cutoffs. In biological RNA sequence alignments, coverage is non-uniform and sequence boundaries are ragged. If a single high-density member of cluster $C$ borders another family or a chimeric alignment, its border score triggers $\rho_b(C) = \rho_{\text{border}}$. Every other member of cluster $C$ whose density falls strictly below this value ($\rho_i < \rho_b$) is reassigned to noise ($-1$). In multi-copy RNA domains, this purges valid biological variants and can decapitate entire authentic clusters.
+- **Proposed Fix**:
+  Default `point_specific` to `True` for RNA domain discovery, or default `halo_method` to `None` for ncRNA domain finding unless explicitly configured by the user. Ensure that individual border points are evaluated based on their own foreign similarity ratio relative to cluster median density rather than applying a cluster-wide maximum density guillotine.
+
+```python
+# FAULTY (domain_finder.py:480 - Defaults point_specific to False, exposing clusters to decapitation):
+point_specific_val = bool(attributes.get("point_specific", False))
+
+# REVISED (domain_finder.py - Defaults point_specific to True for biologically robust border filtering):
+point_specific_val = bool(attributes.get("point_specific", True))
+```
+
+- **Validation**:
+  1. Test on overlapping homologous RNA families with variable alignment depths.
+  2. Verify that low-density peripheral members of high-density clusters are not erroneously eliminated when adjacent to neighboring families.
+
+---
+
+## SequenceRegistry Freezing Triggers Fatal KeyError on External Target Databases
+
+- **Evidence**:
+  In `domain_finder.py:465`:
+  ```python
+  sequence_registry = populate_registry_from_fasta(fasta_path)
+  ```
+  In `aligners.py:72`:
+  ```python
+  if registry is not None:
+      registry.freeze()
+  ```
+  And in `aligners.py:32-34`:
+  ```python
+  if self.frozen:
+      raise KeyError(
+          f"🛑 Sequence ID '{seq_id}' not found in pre-populated SequenceRegistry."
+      )
+  ```
+- **Impact**:
+  `populate_registry_from_fasta` reads `fasta_path` (the query FASTA) and immediately freezes the registry. If the user provides a pre-computed TSV generated by searching queries against a comprehensive target genome database (where target sequences are not present in `fasta_path`), `registry.get_id(t_seq_str)` raises a fatal `KeyError`. The pipeline implicitly assumes that target sequences are strictly identical to query sequences ($Q == T$), preventing the ingestion of alignments against external sequence databases.
+- **Proposed Fix**:
+  Allow `SequenceRegistry` to register target sequences dynamically if an external alignment TSV is supplied, or provide an optional `target_fasta` parameter in `find_domains`. If the registry is pre-populated from `fasta_path`, keep it unfrozen during TSV parsing or populate target IDs dynamically upon first encounter.
+
+```python
+# FAULTY (aligners.py:72 - Freezes registry prematurely based solely on query FASTA):
+if registry is not None:
+    registry.freeze()
+
+# REVISED (aligners.py - Freezes only when explicitly requested, allowing dynamic target registration):
+# Retain unfrozen registry during TSV streaming so novel target IDs from external databases are registered:
+def populate_registry_from_fasta(fasta_path: Path,
+                                 registry: Optional[SequenceRegistry] = None,
+                                 freeze: bool = False) -> SequenceRegistry:
+    if registry is None:
+        registry = SequenceRegistry()
+    count_fasta(fasta_path=fasta_path, registry=registry)
+    if freeze:
+        registry.freeze()
+    return registry
+```
+
+- **Validation**:
+  1. Provide a mock alignment TSV containing target accessions not found in the query FASTA.
+  2. Verify that target accessions are safely registered with integer IDs and do not raise `KeyError`.
+
+---
+
+# Evaluation of Target Span Replication and Memory Optimization
+
+## Redundancy in Target Spans and Feasibility of Compression
+
+- **Evidence**:
+  In `domain_finder.py:535-545`:
+  ```python
+  dest = target_buffer[write_offset:write_offset + n_hits]
+  dest['t_seq'] = all_targets[:, 0]
+  dest['start'] = all_targets[:, 1]
+  dest['end'] = all_targets[:, 2]
+  dest['dom_id'] = all_targets[:, 3] + global_offset
+  write_offset += n_hits
+  ```
+  In Stage 4 (`target_batch_processor`):
+  ```python
+  for d_group, sp_group in zip(dom_splits, span_splits):
+      d_id = int(d_group[0])
+      m_spans = merge_overlapping_spans(sp_group)
+      for sp in m_spans:
+          merged_spans_list.append(sp)
+          aligned_domains_list.append(d_id)
+          batch_dom_lengths[d_id] += int(sp[1] - sp[0])
+  ```
+- **Impact Analysis**:
+  In large homology datasets, many domain instances hit identical target sequence regions with identical coordinates $[start, end)$. Two distinct replication scenarios occur:
+  1. **Intra-domain duplicate hits**: Multiple query alignments mapped to the same domain instance produce identical target hits on sequence $T$. Retaining duplicates in `target_buffer` wastes heap memory and incurs sorting overhead.
+  2. **Inter-domain identical spans**: Multiple distinct domain instances $D_1, D_2, \dots, D_K$ align to the exact same physical coordinates $[start, end)$ on target sequence $T$.
+
+  *Downstream Dependency Consideration*:
+  If $K$ domains hit the exact same target interval $[s, e)$ on sequence $T$, the pipeline requires pairwise overlaps between all pairs $(D_i, D_j)$ to compute Jaccard similarities in Stage 5:
+  $$J(D_i, D_j) = \frac{\sum \text{overlap}}{\text{Length}(D_i) + \text{Length}(D_j) - \sum \text{overlap}}$$
+  If identical spans are compressed into an inverted index (e.g., coordinates mapping to a list of domain IDs), generating the $K(K-1)/2$ pairwise overlap entries cannot be avoided without restructuring Stage 5 DPC. Storing ragged domain lists in `target_buffer` breaks the contiguous structured 1D NumPy array representation, increasing Python object allocation overhead and complicating disk sharding.
+- **Proposed Fix**:
+  Apply targeted, low-overhead deduplication where it yields immediate memory savings without corrupting downstream parallel operations:
+  1. **Stage 2 Target Deduplication**: Deduplicate target hits within each query domain instance before writing to `target_buffer`.
+  2. **Fast Path in `merge_overlapping_spans`**: Add an $O(1)$ fast path for single-span groups (`len == 1`) to eliminate unnecessary sorting, accumulation, and slice allocations.
+  3. **Preserve Contiguous 1D Array Structure**: Retain the structured NumPy array `target_dtype = [('t_seq', int32), ('start', int32), ('end', int32), ('dom_id', int32)]` for Stage 4 worker distribution, avoiding complex inverted index structures that degrade IPC serialization speed.
+
+```python
+# FAULTY (domain_finder.py:220-225 - Emits raw un-deduplicated target spans per query domain):
+if valid_mask.any():
+    partner_targets = np.column_stack((t_seqs, t_starts, t_ends, t_doms))
+    all_targets = np.vstack((partner_targets, self_targets))
+else:
+    all_targets = self_targets
+
+# REVISED (domain_finder.py - Deduplicates identical target hits per domain instance in Stage 2):
+if valid_mask.any():
+    partner_targets = np.column_stack((t_seqs, t_starts, t_ends, t_doms))
+    # Deduplicate identical (t_seq, start, end, dom_id) rows before buffer insertion
+    partner_targets = np.unique(partner_targets, axis=0)
+    all_targets = np.vstack((partner_targets, self_targets))
+else:
+    all_targets = self_targets
+```
+
+```python
+# FAULTY (domain_finder.py:240-255 - Redundant lexsort and accumulate on single-interval spans):
+def merge_overlapping_spans(targets_on_sequence: np.ndarray) -> np.ndarray:
+    if len(targets_on_sequence) == 0:
+        return targets_on_sequence.copy()
+    s = np.ascontiguousarray(targets_on_sequence[:, 0])
+    e = np.ascontiguousarray(targets_on_sequence[:, 1])
+    order = np.lexsort((e, s))
+    ...
+
+# REVISED (domain_finder.py - O(1) early exit for solitary intervals):
+def merge_overlapping_spans(targets_on_sequence: np.ndarray) -> np.ndarray:
+    n = len(targets_on_sequence)
+    if n <= 1:
+        return targets_on_sequence.copy()
+    s = np.ascontiguousarray(targets_on_sequence[:, 0])
+    e = np.ascontiguousarray(targets_on_sequence[:, 1])
+    order = np.lexsort((e, s))
+    s = s[order]
+    e = e[order]
+    e_cum = np.maximum.accumulate(e)
+    brk = np.flatnonzero(s[1:] > e_cum[:-1])
+    out = np.empty((len(brk) + 1, 2), dtype=targets_on_sequence.dtype)
+    out[0, 0] = s[0]
+    out[1:, 0] = s[brk + 1]
+    out[:-1, 1] = e_cum[brk]
+    out[-1, 1] = e_cum[-1]
+    return out
+```
+
+- **Validation**:
+  1. Benchmark Stage 2 and Stage 4 on simulated repetitive hits with $50\%$ redundant target coordinates.
+  2. Confirm memory consumption in `target_buffer` drops proportionally without altering downstream cluster assignments.
+
+---
+
+# Memory Bottlenecks and Performance Inefficiencies
+
+## Dense Nucleotide-Level Array Allocation in Evaluation Module
+
+- **Evidence**:
+  In `evaluation.py:133-134`:
+  ```python
+  label_matrix_dtype = [('seq_id', 'U25'), ('ref', 'U25'), ('pred', 'U25')]
+  label_matrix = np.full((general_stats['input']['total_nt']), fill_value=np.nan, dtype=label_matrix_dtype)
+  ```
+- **Impact**:
+  In NumPy, a `U25` string field allocates 100 bytes (4 bytes per UTF-32 character). A 3-field structured record allocates 300 bytes per nucleotide. For genomic datasets:
+  - For $10^8\text{ nt}$ (a moderate eukaryotic genome), `label_matrix` consumes:
+    $$\text{RAM} = 10^8 \times 300\text{ bytes} \approx 30.0\text{ GB}$$
+  - For $10^9\text{ nt}$ (large mammalian genomes or meta-transcriptomes), `label_matrix` requires $300.0\text{ GB}$, causing immediate process crashes due to `MemoryError`.
+- **Proposed Fix**:
+  Replace nucleotide-level character arrays with interval arithmetic. Overlaps between reference annotations and predicted clusters should be calculated using coordinate interval overlap routines (`compare_sorted_spans` or interval tree queries) rather than instantiating 300-byte-per-base physical matrices. Alternatively, if nucleotide encoding is required, represent labels using 32-bit integer IDs (`int32`, 4 bytes) mapped via an integer dictionary, reducing memory consumption by $96\%$.
+
+```python
+# FAULTY (evaluation.py:133-134 - 300 bytes per nucleotide across entire input sequence volume):
+label_matrix_dtype = [('seq_id', 'U25'), ('ref', 'U25'), ('pred', 'U25')]
+label_matrix = np.full((general_stats['input']['total_nt']), fill_value=np.nan, dtype=label_matrix_dtype)
+
+# REVISED (evaluation.py - Efficient 32-bit integer indexing reducing footprint by 96%):
+# Map string labels to dense int32 IDs: 0 = unlabeled, 1..K = labeled features
+label_matrix_dtype = [('seq_id', np.int32), ('ref', np.int32), ('pred', np.int32)]
+label_matrix = np.zeros(general_stats['input']['total_nt'], dtype=label_matrix_dtype)
+```
+
+- **Validation**:
+  1. Run `evaluation.py` on a $50\text{ MB}$ FASTA dataset.
+  2. Confirm memory footprint drops from $15\text{ GB}$ to under $600\text{ MB}$ while preserving exact Adjusted Rand Index (ARI) and Normalized Mutual Information (NMI) metrics.
+
+---
+
+## Redundant Range-Slicing Overhead in Pairwise Span Comparison
+
+- **Evidence**:
+  In `clustering.py:27-37`:
+  ```python
+  for i in range(n):
+      end_i = ends[i]
+      r = max(i + 1, int(np.searchsorted(starts, end_i, side="left")))
+      if r > i + 1:
+          st_js = starts[i + 1:r]
+          en_js = ends[i + 1:r]
+          overlap = np.minimum(end_i, en_js) - st_js
+          valid = overlap > 0
+          if np.any(valid):
+              js = np.arange(i + 1, r, dtype=np.int32)[valid]
+              lows.append(np.full(js.size, i, dtype=np.int32))
+              highs.append(js)
+              inters.append(overlap[valid].astype(np.int32, copy=False))
+  ```
+- **Impact**:
+  For sequence loci containing thousands of alignment spans, iterating row-by-row in Python executes thousands of individual `np.searchsorted`, `np.minimum`, `np.arange`, and `np.full` calls. Each iteration allocates ephemeral sub-arrays that stress Python's small object allocator.
+- **Proposed Fix**:
+  Vectorize the overlap discovery using two-pointer cumulative indices or sweep-line event points when $N > 1,000$, or pre-allocate flat coordinate index buffers to eliminate repeated list appending and concatenation.
+
+```python
+# FAULTY (clustering.py:27-37 - Per-span Python loop creating ephemeral slice allocations):
+for i in range(n):
+    end_i = ends[i]
+    r = max(i + 1, int(np.searchsorted(starts, end_i, side="left")))
+    ...
+    lows.append(np.full(js.size, i, dtype=np.int32))
+
+# REVISED (clustering.py - Vectorized span comparison reducing per-iteration allocation overhead):
+# Pre-filter search boundaries to active spans with r > i + 1
+r_indices = np.maximum(np.arange(1, n + 1), np.searchsorted(starts, ends, side="left"))
+active_i = np.flatnonzero(r_indices > np.arange(1, n + 1))
+
+lows, highs, inters = [], [], []
+for i in active_i:
+    r = r_indices[i]
+    st_js = starts[i + 1:r]
+    en_js = ends[i + 1:r]
+    overlap = np.minimum(ends[i], en_js) - st_js
+    valid = overlap > 0
+    if np.any(valid):
+        js = np.arange(i + 1, r, dtype=np.int32)[valid]
+        lows.append(np.full(js.size, i, dtype=np.int32))
+        highs.append(js)
+        inters.append(overlap[valid])
+```
+
+- **Validation**:
+  1. Benchmark runtime on sequences containing $> 10,000$ overlapping spans.
+  2. Confirm 2- to 3-fold speedup in `compare_sorted_spans` without altering coordinate output.
+
+---
+
+# Data Integrity, Coding Standards, and Documentation Risks
+
+## Missing Top-Level Module Import in Evaluation Pipeline
+
+- **Evidence**:
+  In `evaluation.py:13`:
+  ```python
+  from annotations import NucleotideSeq
+  ```
+- **Impact**:
+  There is no module named `annotations.py` anywhere in the repository. Attempting to import or execute `evaluation.py` immediately crashes with `ModuleNotFoundError: No module named 'annotations'`. This renders the evaluation benchmarking module unusable in its current state.
+- **Proposed Fix**:
+  Replace the missing `annotations.NucleotideSeq` import with BioPython's `Bio.SeqIO` or the repository's native FASTA parsing logic in `aligners.py` or `gff_sequence_extractor.py`.
+
+```python
+# FAULTY (evaluation.py:13 - References non-existent annotations module):
+from annotations import NucleotideSeq
+
+# REVISED (evaluation.py - Uses standard BioPython SeqIO parser):
+from Bio import SeqIO
+
+def read_fasta(fasta_path: Path):
+    seq_offsets = {}
+    offset_start, offset_end, n = 0, 0, 0
+    for n, record in enumerate(SeqIO.parse(str(fasta_path), "fasta"), 1):
+        seq_len = len(record.seq)
+        offset_start, offset_end = offset_end, offset_end + seq_len
+        seq_offsets[record.id] = (offset_start, offset_end)
+    general_stats = {'input': {'total_seqs': n, 'total_nt': offset_end}}
+    return seq_offsets, general_stats
+```
+
+- **Validation**:
+  1. Execute `python3 -c "import evaluation"` in the Python environment.
+  2. Verify that the module imports cleanly and executes without missing dependency errors.
+
+---
+
+## Non-Configurable CPU Thread Count in Precomputed Entry Point
+
+- **Evidence**:
+  In `domain_finder_precomputed.py:27-43`:
+  ```python
+  def find_domains(fasta_path: Path,
+                   aligner_name: str,
+                   tsv_val: Path,
+                   min_dom_sim: float,
+                   dom_halo: float,
+                   min_dom_dens: float,
+                   min_fam_sim: float,
+                   fam_halo: float,
+                   min_fam_dens: float,
+                   halo_method: Optional[str],
+                   reassign_targets: bool,
+                   min_containment: float,
+                   output_gff: Path,
+                   point_specific: bool = False,
+                   tmp_dir: Optional[Path] = None,
+                   result_dir: Optional[Path] = None) -> Path:
+  ```
+- **Impact**:
+  `domain_finder_precomputed.find_domains` omits the `cpu` parameter and calls `domain_finder.find_domains` without passing thread count, forcing execution to fall back to `default_threads` (all system cores minus 1). In shared high-performance computing (HPC) environments or containerized environments with strict cgroup CPU allocations, this can lead to core oversubscription, job eviction, or resource contention.
+- **Proposed Fix**:
+  Add an explicit `cpu: int = default_threads` argument to `domain_finder_precomputed.find_domains` and forward it directly to `domain_finder.find_domains`.
+
+```python
+# FAULTY (domain_finder_precomputed.py - Omits cpu argument):
+def find_domains(fasta_path: Path, ..., output_gff: Path, point_specific: bool = False,
+                 tmp_dir: Optional[Path] = None, result_dir: Optional[Path] = None) -> Path:
+    ...
+    return df_find_domains(fasta_path=fasta_path, attributes=attributes, output_gff=output_gff,
+                           tmp_dir=tmp_dir, result_dir=result_dir)
+
+# REVISED (domain_finder_precomputed.py - Exposes configurable cpu thread allocation):
+def find_domains(fasta_path: Path, ..., output_gff: Path, cpu: int = default_threads,
+                 point_specific: bool = False, tmp_dir: Optional[Path] = None,
+                 result_dir: Optional[Path] = None) -> Path:
+    ...
+    return df_find_domains(fasta_path=fasta_path, attributes=attributes, output_gff=output_gff,
+                           tmp_dir=tmp_dir, result_dir=result_dir, cpu=cpu)
+```
+
+- **Validation**:
+  1. Call `find_domains(..., cpu=2)` from `domain_finder_precomputed.py`.
+  2. Verify that worker pools in Stage 2 and Stage 4 instantiate exactly 2 worker processes.
+
+---
+
+# Phased Implementation Plan for Future Revisions
+
+This phased plan outlines precise instructions for future engineering agents to implement and validate the audited solutions.
+
+## Phase: Memory and Deduplication Optimizations
+1. **Target File:** `domain_finder.py`
+   - **Target Functions:** `domain_instances_on_query`, `merge_overlapping_spans`, and `find_domains`
+   - **Specific Instructions:**
+     - In `domain_instances_on_query`, deduplicate `partner_targets` rows via `np.unique` before stacking with `self_targets`.
+     - In `merge_overlapping_spans`, add an $O(1)$ fast path returning immediately when input span length is $\le 1$.
+     - In `find_domains`, fulfill the in-place reallocation optimization by using `target_buffer.resize(new_size, refcheck=False)` during Stage 2 expansion.
+   - **Anti-Patterns & Risks to Avoid:**
+     - Do not create intermediate array views or slices of `target_buffer` prior to calling `resize`.
+     - Do not convert structured NumPy target arrays into nested Python lists or dictionaries.
+
+## Phase: Algorithmic Integrity and Tandem Alignment Preservation
+1. **Target Files:** `aligners.py` and `domain_finder.py`
+   - **Target Functions:** `parse_mmseqs_tsv`, `family_finder`, and `populate_registry_from_fasta`
+   - **Specific Instructions:**
+     - In `parse_mmseqs_tsv`, filter only identical coordinates on the same sequence (`q_seq_str == t_seq_str and raw_qs == raw_ts and raw_qe == raw_te`), allowing valid tandem domain duplications to be parsed.
+     - In `family_finder`, calculate domain instance alignment support (`domain_weights`) and pass them to `dpc` as sample weights.
+     - In `domain_finder.py`, default `point_specific` to `True` to prevent cluster-wide halo decapitation.
+   - **Anti-Patterns & Risks to Avoid:**
+     - Do not freeze `SequenceRegistry` prematurely when reading pre-computed alignment files against external target databases.
+     - Ensure sample weights in `dpc` remain non-negative floats with minimum weight $\ge 1.0$.
+
+## Phase: Secondary Module Hygiene and Thread Management
+1. **Target Files:** `evaluation.py` and `domain_finder_precomputed.py`
+   - **Target Functions:** `evaluation.read_fasta` and `domain_finder_precomputed.find_domains`
+   - **Specific Instructions:**
+     - In `evaluation.py`, replace the non-existent `annotations.NucleotideSeq` import with `Bio.SeqIO` or repository-native FASTA parsing.
+     - Replace the 300-byte-per-nucleotide character matrix with 32-bit integer arrays or coordinate interval queries.
+     - In `domain_finder_precomputed.py`, expose the `cpu` argument and pass it to `df_find_domains`.
+   - **Anti-Patterns & Risks to Avoid:**
+     - Never allocate full-genome nucleotide string arrays in evaluation routines.
+     - Avoid omitting core thread controls in public orchestration wrappers.
