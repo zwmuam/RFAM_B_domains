@@ -21,6 +21,7 @@ __email__ = "jakub.barylski@gmail.com"
 from collections import defaultdict
 from itertools import count
 from pathlib import Path
+import tempfile
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 # standard libraries
@@ -34,7 +35,8 @@ from aligners import (SequenceRegistry,
 from clustering import (compare_sorted_spans,
                         jaccard_index, max_containment,
                         dpc)
-from executor import Parallel, default_threads, logger
+from mpire import WorkerPool
+from executor import Parallel, default_threads, logger, _safe_ctx_name
 
 
 def determine_strand(strands: np.ndarray) -> str:
@@ -252,6 +254,15 @@ def domain_instances_on_query(query_id: int,
     return local_domains, all_targets
 
 
+def _query_worker_dispatch(shared_kwargs: Dict[str, Any],
+                           batch: List[Tuple[int, np.ndarray, np.ndarray]]) \
+        -> List[Tuple[List[Tuple[int, int, int, str]], np.ndarray]]:
+    """
+    Worker dispatch function receiving shared query_kwargs and query batch.
+    """
+    return batch_query_processor(batch=batch, **shared_kwargs)
+
+
 def batch_query_processor(batch: List[Tuple[int, np.ndarray, np.ndarray]],
                           min_dom_sim: float,
                           min_containment: float,
@@ -340,15 +351,23 @@ def overlaps_on_target(sorted_target_spans: np.ndarray,
     return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
 
 
-def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray]]) \
-        -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[int, int]]:
+def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray]],
+                           chunk_id: Optional[int] = None,
+                           shard_dir_path: Optional[str] = None) \
+        -> Union[Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[int, int]],
+                 Tuple[int, int, Dict[int, int]]]:
     """
     Process a batch of target sequences to merge same-domain intervals, compute
     per-domain target lengths, and calculate pairwise target overlaps.
     Maintains 32-bit integers for all physical genomic coordinate operations.
 
+    If shard_dir_path is provided, writes coordinate arrays directly to binary `.npy` shards
+    and returns (chunk_id, n_edges, domain_lengths_dict) to avoid duplicating memory in the parent process.
+
     :param batch_targets: List of (target_id, target_spans, domain_pointers).
-    :return: Tuple of (rows, cols, intersections, domain_lengths_dict).
+    :param chunk_id: Optional chunk identifier for disk sharding.
+    :param shard_dir_path: Optional directory string where .npy shards are written.
+    :return: Either (rows, cols, intersections, domain_lengths_dict) or (chunk_id, n_edges, domain_lengths_dict).
     """
     batch_rows, batch_cols, batch_data = [], [], []
     batch_dom_lengths: Dict[int, int] = defaultdict(int)
@@ -393,16 +412,32 @@ def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray
             batch_cols.append(cols)
             batch_data.append(intersections.astype(np.int32, copy=False))
 
-    if batch_rows:
-        return (np.concatenate(batch_rows),
-                np.concatenate(batch_cols),
-                np.concatenate(batch_data),
-                dict(batch_dom_lengths))
+    r_arr = np.concatenate(batch_rows) if batch_rows else np.empty(0, dtype=np.int32)
+    c_arr = np.concatenate(batch_cols) if batch_cols else np.empty(0, dtype=np.int32)
+    i_arr = np.concatenate(batch_data) if batch_data else np.empty(0, dtype=np.int32)
 
-    return (np.empty(0, dtype=np.int32),
-            np.empty(0, dtype=np.int32),
-            np.empty(0, dtype=np.int32),
-            dict(batch_dom_lengths))
+    if shard_dir_path is not None and chunk_id is not None:
+        shard_dir = Path(shard_dir_path)
+        n_edges = r_arr.size
+        if n_edges > 0:
+            np.save(shard_dir / f"{chunk_id}_r.npy", r_arr)
+            np.save(shard_dir / f"{chunk_id}_c.npy", c_arr)
+            np.save(shard_dir / f"{chunk_id}_i.npy", i_arr)
+        return chunk_id, n_edges, dict(batch_dom_lengths)
+
+    return r_arr, c_arr, i_arr, dict(batch_dom_lengths)
+
+
+def _target_sharded_worker_dispatch(shared_shard_dir: str,
+                                    task_pkg: Tuple[int, List[Tuple[int, np.ndarray, np.ndarray]]]) \
+        -> Tuple[int, int, Dict[int, int]]:
+    """
+    Worker dispatch function for disk-sharded Stage 4 target batch processing.
+    """
+    chunk_id, batch_targets = task_pkg
+    return target_batch_processor(batch_targets=batch_targets,
+                                  chunk_id=chunk_id,
+                                  shard_dir_path=shared_shard_dir)
 
 
 # =============================================================================
@@ -618,34 +653,35 @@ def find_domains(fasta_path: Path,
     global_domains: List[Tuple[int, int, int, str]] = []
     global_offset = 0
 
-    # Estimate capacity from TSV byte size (~75 bytes per BLAST line) to prevent reallocations
-    est_capacity = max(100_000, int(tsv_file.stat().st_size // 75))
+    ## mem_opt ## Empirical line sampling to accurately estimate initial capacity and avoid reallocation
+    sample_lines_len = 0
+    sample_lines_count = 0
+    with tsv_file.open("rb") as fh:
+        for _ in range(10_000):
+            line = fh.readline()
+            if not line:
+                break
+            sample_lines_len += len(line)
+            sample_lines_count += 1
+    mean_line_len = (sample_lines_len / sample_lines_count) if sample_lines_count > 0 else 75.0
+    est_capacity = max(100_000, int(tsv_file.stat().st_size / max(1.0, mean_line_len)))
     target_buffer = np.empty(est_capacity, dtype=target_dtype)
     write_offset = 0
 
-    ## mem_opt ## Stream worker pool results chunk-by-chunk to prevent accumulating >200GB in a monolithic Python list
-    # Process queries in streaming chunks through WorkerPool rather than gathering entire TSV in memory
-    def stream_query_batches(batch_generator: Generator[List[Tuple[int, np.ndarray, np.ndarray]], None, None],
-                             chunk_window: int = 50) -> Generator[List[List[Tuple[int, np.ndarray, np.ndarray]]], None, None]:
-        window: List[List[Tuple[int, np.ndarray, np.ndarray]]] = []
-        for b in batch_generator:
-            window.append(b)
-            if len(window) >= chunk_window:
-                yield window
-                window = []
-        if window:
-            yield window
+    ## mem_opt ## Persistent WorkerPool streaming queries with bounded active queue to prevent repeated process spawning
+    def _batch_tuple_generator() -> Generator[Tuple[List[Tuple[int, np.ndarray, np.ndarray]]], None, None]:
+        for b in batch_gen:
+            yield (b,)
 
-    with tqdm(desc="Finding domain instances", unit="batch") as pbar:
-        for batch_window in stream_query_batches(batch_gen, chunk_window=50):
-            query_workers = Parallel(function=batch_query_processor,
-                                     input_collection=batch_window,
-                                     kwargs=query_kwargs,
-                                     n_jobs=cpu,
-                                     bar=False,
-                                     chunk_size=1)
-
-            for batch_res in query_workers.results:
+    with WorkerPool(n_jobs=cpu,
+                    start_method=_safe_ctx_name,
+                    shared_objects=query_kwargs) as pool:
+        with tqdm(desc="Finding domain instances", unit="batch") as pbar:
+            for batch_res in pool.imap(_query_worker_dispatch,
+                                       _batch_tuple_generator(),
+                                       worker_lifespan=200,
+                                       chunk_size=1,
+                                       max_tasks_active=max(1, cpu * 2)):
                 for local_domains, all_targets in batch_res:
                     n_doms = len(local_domains)
                     if n_doms == 0:
@@ -654,8 +690,8 @@ def find_domains(fasta_path: Path,
                     n_hits = all_targets.shape[0] if all_targets.size > 0 else 0
                     if n_hits > 0:
                         if write_offset + n_hits > target_buffer.shape[0]:
-                            ## mem_opt ## Safe geometric reallocation copying only active prefix without cyclic data duplication
-                            new_size = max(target_buffer.shape[0] * 2, write_offset + n_hits + 100_000)
+                            ## mem_opt ## Safe 1.25x buffer expansion copying only active prefix without cyclic data duplication
+                            new_size = int((write_offset + n_hits) * 1.25) + 100_000
                             new_buffer = np.empty(new_size, dtype=target_dtype)
                             new_buffer[:write_offset] = target_buffer[:write_offset]
                             target_buffer = new_buffer
@@ -667,8 +703,7 @@ def find_domains(fasta_path: Path,
                         dest['dom_id'] = all_targets[:, 3] + global_offset
                         write_offset += n_hits
                     global_offset += n_doms
-            pbar.update(len(batch_window))
-            del query_workers
+                pbar.update(1)
 
     n_total_domains = len(global_domains)
 
@@ -692,12 +727,13 @@ def find_domains(fasta_path: Path,
     # 3. Stage 4: Parallel target sequence overlap calculation
     ## mem_opt ## Adaptive workstation batch sizing ensuring uniform multi-core utilization without thread starvation
     if n_target_seqs <= cpu * 4:
-        target_batch_size = max(1, int(np.ceil(n_target_seqs / max(1, cpu))))
+        target_batch_size = max(1, int(np.ceil(n_target_seqs / max(1, cpu * 2))))
     else:
         target_batch_size = max(10, min(1000, n_target_seqs // (cpu * 4)))
 
-    def target_batch_generator() -> Generator[List[Tuple[int, np.ndarray, np.ndarray]], None, None]:
+    def target_batch_generator() -> Generator[Tuple[int, List[Tuple[int, np.ndarray, np.ndarray]]], None, None]:
         batch_pkg: List[Tuple[int, np.ndarray, np.ndarray]] = []
+        chunk_idx = 0
         for st, en in zip(seq_starts, seq_ends):
             grp = all_targets_arr[st:en]
             t_seq = int(grp['t_seq'][0])
@@ -705,44 +741,72 @@ def find_domains(fasta_path: Path,
             dom_ptrs = grp['dom_id']
             batch_pkg.append((t_seq, spans, dom_ptrs))
             if len(batch_pkg) >= target_batch_size:
-                yield batch_pkg
+                yield (chunk_idx, batch_pkg)
+                chunk_idx += 1
                 batch_pkg = []
         if batch_pkg:
-            yield batch_pkg
+            yield (chunk_idx, batch_pkg)
 
-    logger.info("Executing Stage 4: Calculating target overlaps across sequences")
-    target_workers = Parallel(function=target_batch_processor,
-                              input_collection=target_batch_generator(),
-                              n_jobs=cpu,
-                              bar=True,
-                              description="Calculating target overlaps",
-                              chunk_size=1)
+    # Establish dedicated shard directory under tmp_dir or system temp
+    if tmp_dir is not None:
+        stage4_tmp_dir = Path(tmp_dir) / "stage4_shards"
+        stage4_tmp_dir.mkdir(parents=True, exist_ok=True)
+        shard_cleanup_needed = False
+    else:
+        temp_dir_obj = tempfile.TemporaryDirectory(prefix="domain_finder_stage4_")
+        stage4_tmp_dir = Path(temp_dir_obj.name)
+        shard_cleanup_needed = True
 
-    ## mem_opt ## Eager popping/consumption of worker results with bounded memory
-    results_list = target_workers.results
-    total_edges = 0
-    for r, _, _, _ in results_list:
-        total_edges += r.size
+    try:
+        logger.info("Executing Stage 4: Calculating target overlaps across sequences")
+        meta_results: List[Tuple[int, int]] = []
+        global_dom_lengths = np.zeros(n_total_domains, dtype=np.int64)
+        total_edges = 0
 
-    all_rows = np.empty(total_edges, dtype=np.int32)
-    all_cols = np.empty(total_edges, dtype=np.int32)
-    all_inters = np.empty(total_edges, dtype=np.int32)
-    global_dom_lengths = np.zeros(n_total_domains, dtype=np.int64)
+        def _target_task_feeder() -> Generator[Tuple[Tuple[int, List[Tuple[int, np.ndarray, np.ndarray]]]], None, None]:
+            for pkg in target_batch_generator():
+                yield (pkg,)
 
-    write_pos = 0
-    while results_list:
-        r, c, inter, dom_lens_dict = results_list.pop(0)
-        k = r.size
-        if k > 0:
-            all_rows[write_pos:write_pos + k] = r
-            all_cols[write_pos:write_pos + k] = c
-            all_inters[write_pos:write_pos + k] = inter
-            write_pos += k
-        del r, c, inter
-        for d_id, d_len in dom_lens_dict.items():
-            if d_id < n_total_domains:
-                global_dom_lengths[d_id] += d_len
-    del target_workers.results
+        with WorkerPool(n_jobs=cpu,
+                        start_method=_safe_ctx_name,
+                        shared_objects=str(stage4_tmp_dir)) as pool:
+            with tqdm(desc="Calculating target overlaps", unit="batch") as pbar:
+                for chunk_id, n_edges, dom_lens_dict in pool.imap(_target_sharded_worker_dispatch,
+                                                                  _target_task_feeder(),
+                                                                  worker_lifespan=200,
+                                                                  chunk_size=1,
+                                                                  max_tasks_active=max(1, cpu * 2)):
+                    meta_results.append((chunk_id, n_edges))
+                    total_edges += n_edges
+                    for d_id, d_len in dom_lens_dict.items():
+                        if d_id < n_total_domains:
+                            global_dom_lengths[d_id] += d_len
+                    pbar.update(1)
+
+        ## mem_opt ## Pre-allocate destination coordinate arrays once and memory-map copy shards
+        meta_results.sort(key=lambda x: x[0])
+        all_rows = np.empty(total_edges, dtype=np.int32)
+        all_cols = np.empty(total_edges, dtype=np.int32)
+        all_inters = np.empty(total_edges, dtype=np.int32)
+
+        write_pos = 0
+        for cid, n in meta_results:
+            if n > 0:
+                for dest, tag in ((all_rows, "r"), (all_cols, "c"), (all_inters, "i")):
+                    shard_file = stage4_tmp_dir / f"{cid}_{tag}.npy"
+                    dest[write_pos:write_pos + n] = np.load(shard_file, mmap_mode="r")
+                    shard_file.unlink(missing_ok=True)
+                write_pos += n
+    finally:
+        if shard_cleanup_needed:
+            temp_dir_obj.cleanup()
+        elif stage4_tmp_dir.exists():
+            for f in stage4_tmp_dir.glob("*.npy"):
+                f.unlink(missing_ok=True)
+            try:
+                stage4_tmp_dir.rmdir()
+            except OSError:
+                pass
 
     # 4. Stage 5: Family finding with DPC
     logger.info("Executing Stage 5: Finding domain families")

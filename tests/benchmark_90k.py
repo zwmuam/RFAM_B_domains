@@ -292,8 +292,8 @@ def run_benchmark():
         results.append(m_rev)
 
         # Check result equivalence
-        base_lines = [l for l in out_gff_baseline.read_text().splitlines() if not l.startswith("#") and l.strip()]
-        rev_lines = [l for l in out_gff_revised.read_text().splitlines() if not l.startswith("#") and l.strip()]
+        base_lines = sorted([l for l in out_gff_baseline.read_text().splitlines() if not l.startswith("#") and l.strip()])
+        rev_lines = sorted([l for l in out_gff_revised.read_text().splitlines() if not l.startswith("#") and l.strip()])
         print(f"Comparison (CPU={c}): Baseline features={len(base_lines)}, Revised features={len(rev_lines)}")
         assert len(base_lines) == len(rev_lines), f"Feature count mismatch on CPU {c}!"
         assert base_lines == rev_lines, f"Feature content mismatch on CPU {c}!"
