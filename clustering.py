@@ -3,9 +3,10 @@
 """
 Density Peak Clustering (DPC) methods
 """
-from typing import Dict, Tuple, Optional, Union
+from typing import Any, Dict, Tuple, Optional, Union
 
 import numpy as np
+from scipy import sparse
 from scipy.sparse import csr_matrix
 
 
@@ -46,19 +47,33 @@ def compare_sorted_spans(spans: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.
     return np.concatenate(lows), np.concatenate(highs), np.concatenate(inters)
 
 
-def jaccard_index(intersections: np.ndarray,
+def _extract_values(intersections: Union[np.ndarray, sparse.spmatrix, Any]) -> np.ndarray:
+    """
+    Safely extract 1D data values from SciPy sparse matrices/arrays or NumPy ndarrays.
+    Avoids returning a Python memoryview when called on standard NumPy ndarrays.
+
+    :param intersections: Sparse matrix/array or NumPy ndarray.
+    :return: 1D NumPy array of values.
+    """
+    if sparse.issparse(intersections):
+        return intersections.data
+    return np.asarray(intersections)
+
+
+def jaccard_index(intersections: Union[np.ndarray, sparse.spmatrix, Any],
                   row_lengths: np.ndarray,
                   column_lengths: np.ndarray) -> np.ndarray:
     """
     Compute Jaccard similarity from union and intersection arrays.
     Returns only sparse non-zero values aligned with original intersection coordinates
-    :param intersections: sparse matrix of intersection lengths
+    :param intersections: sparse matrix or array of intersection lengths
     :param row_lengths: array of lengths for the first set of elements (to calculate union)
     :param column_lengths: array of lengths for the second set of elements (to calculate union)
-    :return: sparse matrix of Jaccard similarities
+    :return: 1D NumPy array of Jaccard similarities
     """
-    unions = row_lengths + column_lengths - intersections.data
-    ji = intersections.data / unions
+    inter_vals = _extract_values(intersections)
+    unions = row_lengths + column_lengths - inter_vals
+    ji = inter_vals / unions
     # check for indices outside the valid range  >1 and <0, which can occur due to numerical issues or incorrect input data
     if np.any((ji < 0) | (ji > 1)):
         raise ValueError(f'Jaccard similarity values out of bounds\n'
@@ -66,19 +81,20 @@ def jaccard_index(intersections: np.ndarray,
     return ji
 
 
-def max_containment(intersections: np.ndarray,
+def max_containment(intersections: Union[np.ndarray, sparse.spmatrix, Any],
                     row_lengths: np.ndarray,
-                    column_lengths: np.ndarray):
+                    column_lengths: np.ndarray) -> np.ndarray:
     """
     Compute maximal containment from intersection array and min(A, B)
     Returns only sparse non-zero values aligned with original intersection coordinates
-    :param intersections: sparse matrix of intersection lengths
+    :param intersections: sparse matrix or array of intersection lengths
     :param row_lengths: array of lengths for the first set of elements (to calculate union)
     :param column_lengths: array of lengths for the second set of elements (to calculate union)
-    :return: sparse matrix of Jaccard similarities
+    :return: 1D NumPy array of containment values
     """
+    inter_vals = _extract_values(intersections)
     smaller = np.minimum(row_lengths, column_lengths)
-    containment = intersections.data / smaller
+    containment = inter_vals / smaller
     # check for indices outside the valid range  >1 and <0, which can occur due to numerical issues or incorrect input data
     if np.any((containment < 0) | (containment > 1)):
         raise ValueError(f'Jaccard similarity values out of bounds\n'
@@ -274,40 +290,48 @@ def _nearest_higher_sparse(mat: csr_matrix, rank: np.ndarray, n: int) -> Tuple[n
     """
     Find the most similar higher-density neighbour for each row in a sparse CSR matrix.
 
-    Scans non-zero matrix entries to locate the candidate neighbour with higher density rank
-    that maximizes the pairwise similarity value.
+    Resolves ties using deterministic lexicographic ordering:
+    1. Maximal similarity s(i, j) (descending)
+    2. Maximal density rank (highest rho / lowest rank index)
+    3. Smallest candidate node index j (ascending)
 
     :param mat: n x n sparse similarity matrix in CSR format.
     :param rank: 1D array of density ranks (0 = highest density).
     :param n: Total number of points.
     :return: Tuple of (nearest higher-density indices, maximum higher similarity values).
     """
+    nearest_higher = np.full(n, -1, dtype=np.int64)
+    s_max_higher = np.zeros(n, dtype=np.float64)
+
     indptr, indices, data = mat.indptr, mat.indices, mat.data
     lengths = indptr[1:] - indptr[:-1]
     row_of = np.repeat(np.arange(n, dtype=indices.dtype), lengths)
 
-    # Identify neighbours that have strictly higher density rank and non-zero similarity.
-    candidate = np.where((rank[indices] < rank[row_of]) & (data > 0.0), data, -1.0)
+    valid_edge = (data > 0.0) & (rank[indices] < rank[row_of])
+    if np.any(valid_edge):
+        cand_rows = row_of[valid_edge]
+        cand_cols = indices[valid_edge]
+        cand_sims = data[valid_edge]
+        cand_ranks = rank[cand_cols]
 
-    nonempty = lengths > 0
-    best_val = np.full(n, -1.0, dtype=np.float64)
-    if np.any(nonempty):
-        best_val[nonempty] = np.maximum.reduceat(candidate, indptr[:-1][nonempty])
+        # Lexicographic sort:
+        # primary: -cand_sims (descending similarity)
+        # secondary: cand_ranks (ascending rank / higher density)
+        # tertiary: cand_cols (ascending column index)
+        # stable grouping by cand_rows
+        order = np.lexsort((cand_cols, cand_ranks, -cand_sims, cand_rows))
+        s_rows = cand_rows[order]
+        s_cols = cand_cols[order]
+        s_sims = cand_sims[order]
 
-    nearest_higher = np.full(n, -1, dtype=np.int64)
-    s_max_higher = np.zeros(n, dtype=np.float64)
+        # Pick first entry for each unique row
+        first_mask = np.empty(s_rows.size, dtype=bool)
+        first_mask[0] = True
+        first_mask[1:] = s_rows[1:] != s_rows[:-1]
 
-    hit = (candidate > 0.0) & (candidate == best_val[row_of])
-    if np.any(hit):
-        hit_pos = np.flatnonzero(hit)
-        hit_row = row_of[hit_pos]
-        first = np.empty(hit_row.size, dtype=bool)
-        first[0] = True
-        np.not_equal(hit_row[1:], hit_row[:-1], out=first[1:])
-        chosen = hit_pos[first]
-        target = hit_row[first]
-        nearest_higher[target] = indices[chosen]
-        s_max_higher[target] = data[chosen]
+        targets = s_rows[first_mask]
+        nearest_higher[targets] = s_cols[first_mask]
+        s_max_higher[targets] = s_sims[first_mask]
 
     return nearest_higher, s_max_higher
 
@@ -316,7 +340,10 @@ def _nearest_higher_dense(mat: np.ndarray, rank: np.ndarray, n: int) -> Tuple[np
     """
     Find the most similar higher-density neighbour for each row in a dense matrix.
 
-    Processes the matrix in row chunks to optimize memory usage and cache locality.
+    Processes the matrix to enforce deterministic lexicographic tie-breaking matching sparse DPC:
+    1. Maximal similarity s(i, j) (descending)
+    2. Maximal density rank (highest rho / lowest rank index)
+    3. Smallest candidate node index j (ascending)
 
     :param mat: n x n dense similarity matrix.
     :param rank: 1D array of density ranks (0 = highest density).
@@ -326,28 +353,36 @@ def _nearest_higher_dense(mat: np.ndarray, rank: np.ndarray, n: int) -> Tuple[np
     nearest_higher = np.full(n, -1, dtype=np.int64)
     s_max_higher = np.zeros(n, dtype=np.float64)
 
-    if n <= 2000:
-        mask = rank[np.newaxis, :] < rank[:, np.newaxis]
-        block = mat * mask
-        best = block.argmax(axis=1)
-        best_val = block[np.arange(n), best]
-        found = np.flatnonzero(best_val > 0.0)
-        nearest_higher[found] = best[found]
-        s_max_higher[found] = best_val[found]
-        return nearest_higher, s_max_higher
+    # Process in row chunks to respect memory ceilings
+    step = _row_chunks(n) if n > 2000 else n
+    all_cols = np.arange(n, dtype=np.int64)
 
-    step = _row_chunks(n)
-    scratch = np.empty((step, n), dtype=np.float64)
     for start in range(0, n, step):
         stop = min(n, start + step)
         height = stop - start
-        block = scratch[:height]
-        np.multiply(mat[start:stop], rank[np.newaxis, :] < rank[start:stop, np.newaxis], out=block)
-        best = block.argmax(axis=1)
-        best_val = block[np.arange(height), best]
-        found = np.flatnonzero(best_val > 0.0)
-        nearest_higher[found + start] = best[found]
-        s_max_higher[found + start] = best_val[found]
+        sub_mat = mat[start:stop]
+        higher_mask = rank[np.newaxis, :] < rank[start:stop, np.newaxis]
+        valid = (sub_mat > 0.0) & higher_mask
+
+        if np.any(valid):
+            local_rows, cols = np.nonzero(valid)
+            sims = sub_mat[local_rows, cols]
+            ranks = rank[cols]
+            global_rows = local_rows + start
+
+            # Lexicographic sort: primary -sims, secondary ranks, tertiary cols
+            order = np.lexsort((cols, ranks, -sims, global_rows))
+            s_rows = global_rows[order]
+            s_cols = cols[order]
+            s_sims = sims[order]
+
+            first_mask = np.empty(s_rows.size, dtype=bool)
+            first_mask[0] = True
+            first_mask[1:] = s_rows[1:] != s_rows[:-1]
+
+            targets = s_rows[first_mask]
+            nearest_higher[targets] = s_cols[first_mask]
+            s_max_higher[targets] = s_sims[first_mask]
 
     return nearest_higher, s_max_higher
 
