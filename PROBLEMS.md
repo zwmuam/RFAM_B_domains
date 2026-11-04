@@ -220,101 +220,6 @@ if write_offset > 0:
 
 ---
 
-## Target-Span De-Replication Trade-offs and Quadratic Pair Scaling
-
-- **Evidence**:
-  In `domain_finder.py:375-410` (`target_batch_processor`):
-  ```python
-  dom_boundaries = np.flatnonzero(np.diff(s_doms)) + 1
-  dom_splits = np.split(s_doms, dom_boundaries)
-  span_splits = np.split(s_spans, dom_boundaries)
-
-  for d_group, sp_group in zip(dom_splits, span_splits):
-      d_id = int(d_group[0])
-      m_spans = merge_overlapping_spans(sp_group)
-      for sp in m_spans:
-          merged_spans_list.append(sp)
-          aligned_domains_list.append(d_id)
-          batch_dom_lengths[d_id] += int(sp[1] - sp[0])
-  ```
-  And in `overlaps_on_target` (`domain_finder.py:340-350`):
-  ```python
-  local_rows, local_cols, intersections = compare_sorted_spans(sorted_target_spans)
-  if local_rows.size > 0:
-      mask = aligned_domain_pointers[local_rows] != aligned_domain_pointers[local_cols]
-      if np.any(mask):
-          global_rows = aligned_domain_pointers[local_rows][mask]
-          global_cols = aligned_domain_pointers[local_cols][mask]
-          return global_rows, global_cols, intersections[mask]
-  ```
-- **Impact Analysis**:
-  1. **Post-Merge Interval Invariant**: Stage 4 partitions alignment hits per target sequence and domain ID, running `merge_overlapping_spans` independently for each domain. This merges all overlapping and abutting hits into a non-overlapping interval union. Consequently, merged intervals belonging to the same domain on a given target sequence are strictly disjoint and cannot have positive overlap. The domain inequality filter `aligned_domain_pointers[local_rows] != aligned_domain_pointers[local_cols]` in `overlaps_on_target` serves as a defensive check; it does not discard substantial same-domain overlap calculations during normal operation.
-  2. **Mathematical Validity of Exact-Coordinate Grouping**: Multiple distinct domains $D\_{1}, D\_{2}, \dots, D\_{K}$ often hit the exact same target interval $[start, end)$ on a conserved target sequence. If intervals are grouped into unique coordinate spans with associated domain ID sets, the geometric intersection between two overlapping coordinate groups can be evaluated once and shared across domain pairs:
-     - For identical coordinate groups sharing $K$ domains, the internal intersection length equals $(end - start)$ for all $\binom{K}{2}$ domain pairs.
-     - For two overlapping coordinate groups with $K\_1$ and $K\_2$ domains, the cross-intersection length equals $\min(end\_1, end\_2) - \max(start\_1, start\_2)$ for all $K\_1 \times K\_2$ domain pairs.
-  3. **The Pair Emission Bottleneck**: Grouping coordinates saves coordinate storage and reduces interval arithmetic, but it **does not eliminate pair emissions**. DPC similarity graph construction in Stage 5 requires explicit pairwise Jaccard similarities:
-     $$J(D\_{i}, D\_{j}) = \frac{\sum \text{overlap}}{\text{Length}(D\_{i}) + \text{Length}(D\_{j}) - \sum \text{overlap}}$$
-     Every pair among the $K$ domains sharing an interval must still emit an intersection contribution. For $K = 10,000$ domains on a conserved target sequence, this requires:
-     $$Q = \binom{K}{2} = \frac{K(K - 1)}{2} = 49,995,000 \text{ pairwise contributions}$$
-     Three `int32` arrays (`row`, `col`, `intersection`) require ~600 MB for those contributions alone. Thus, coordinate grouping reduces geometric evaluation from $O(M \log M + Q)$ to $O(M \log M + P + Q)$ (where $P$ is the number of overlapping coordinate groups and $Q$ is the emitted pair contributions), but leaves the quadratic $Q$ term intact.
-  4. **Strand Voting Integrity**: Alignment hits cannot be deduplicated prior to Stage 2 domain instance discovery and `determine_strand()`, as hit frequency across strands determines strand consensus. Deduplication can only be applied after domain discovery and per-domain interval merging.
-- **Proposed Fix**:
-  1. **Formalize Redundancy Metrics**: Replace arbitrary percentage thresholds with precise tracked metrics per target sequence:
-     - $M$: Number of merged intervals on the target sequence.
-     - $G$: Number of unique $(start, end)$ coordinate groups.
-     - $\text{duplicate\_fraction} = 1 - \frac{G}{M}$ (defined as 0 when $M = 0$).
-     - $Q$: Total emitted interval-pair contributions.
-     - $E$: Total unique canonical domain pairs in Stage 5.
-     - $\frac{Q}{E}$: Average number of contributions per final canonical domain pair.
-  2. **Singleton Merge Fast Path**: In `merge_overlapping_spans`, add an immediate early exit for solitary intervals (`if targets_on_sequence.shape[0] <= 1: return targets_on_sequence.copy()`). This eliminates `lexsort`, cumulative operations, and slicing for non-overlapping single-span domains.
-  3. **Controlled Coordinate Grouping Experiment**: Treat exact-coordinate grouping as an optional, benchmark-driven optimization within Stage 4. Grouping must only occur *after* per-domain union merging, must retain all domain IDs in flat integer index arrays, and must accumulate intersection lengths into 64-bit integers.
-
-```python
-# FAULTY (domain_finder.py - Executes full lexsort and accumulate even for solitary intervals):
-def merge_overlapping_spans(targets_on_sequence: np.ndarray) -> np.ndarray:
-    if len(targets_on_sequence) == 0:
-        return targets_on_sequence.copy()
-    s = np.ascontiguousarray(targets_on_sequence[:, 0])
-    e = np.ascontiguousarray(targets_on_sequence[:, 1])
-    order = np.lexsort((e, s))
-    s = s[order]
-    e = e[order]
-    e_cum = np.maximum.accumulate(e)
-    brk = np.flatnonzero(s[1:] > e_cum[:-1])
-    out = np.empty((len(brk) + 1, 2), dtype=targets_on_sequence.dtype)
-    out[0, 0] = s[0]
-    out[1:, 0] = s[brk + 1]
-    out[:-1, 1] = e_cum[brk]
-    out[-1, 1] = e_cum[-1]
-    return out
-
-# REVISED (domain_finder.py - Early exit for solitary intervals preserving exact coordinates):
-def merge_overlapping_spans(targets_on_sequence: np.ndarray) -> np.ndarray:
-    n = targets_on_sequence.shape[0]
-    if n <= 1:
-        return targets_on_sequence.copy()
-    s = np.ascontiguousarray(targets_on_sequence[:, 0])
-    e = np.ascontiguousarray(targets_on_sequence[:, 1])
-    order = np.lexsort((e, s))
-    s = s[order]
-    e = e[order]
-    e_cum = np.maximum.accumulate(e)
-    brk = np.flatnonzero(s[1:] > e_cum[:-1])
-    out = np.empty((len(brk) + 1, 2), dtype=targets_on_sequence.dtype)
-    out[0, 0] = s[0]
-    out[1:, 0] = s[brk + 1]
-    out[:-1, 1] = e_cum[brk]
-    out[-1, 1] = e_cum[-1]
-    return out
-```
-
-- **Validation**:
-  1. Test `merge_overlapping_spans` on empty, single-span, and multi-span inputs to verify coordinate equivalence.
-  2. In experimental coordinate grouping, assert that no domain ID appears twice in any coordinate group and that accumulated pairwise intersections match ungrouped outputs exactly.
-  3. Measure runtime and peak memory on datasets with varying $\text{duplicate\_fraction}$ to assess whether coordinate compression yields net benefits over pair output overhead.
-
----
-
 ## Domain Integrity, Sequence Filtering, and DPC Graph Semantics
 
 - **Evidence**:
@@ -338,6 +243,7 @@ def merge_overlapping_spans(targets_on_sequence: np.ndarray) -> np.ndarray:
 - **Proposed Fix**:
   1. Retain the same-sequence filter in `aligners.py` as a deliberate biological policy. Any future relaxation (e.g., admitting non-identical tandem duplicates) adds unnecessary redundancy and analysis overhead.
   2. Maintain comprehensive regression suites covering singletons, empty edge lists, zero-similarity boundaries, and multi-component graphs in `clustering.py` and `domain_finder.py`.
+  3. **Singleton Merge Fast Path**: In `merge_overlapping_spans`, add an immediate early exit for solitary intervals (`if targets_on_sequence.shape[0] <= 1: return targets_on_sequence.copy()`). This eliminates `lexsort`, cumulative operations, and slicing for non-overlapping single-span domains.
 
 - **Validation**:
   1. Execute unit tests verifying that edge-free datasets evaluate solitary points against `min_fam_dens` and return correct noise counts.
@@ -390,9 +296,9 @@ This phased plan provides concise, mathematically sound, step-by-step guidance f
      - Do not sum Jaccard values directly across batches; raw integer intersection lengths must be summed before computing final Jaccard similarities.
      - Do not use 32-bit integers for global pairwise intersection sums; enforce 64-bit integer accumulators.
 
-## Phase: Interval Geometry Micro Optimizations and Coordinate Grouping Experiments
-1. **Target Files:** `domain_finder.py`, `clustering.py`
-   - **Target Functions:** `merge_overlapping_spans`, `compare_sorted_spans`
+## Phase: Interval Geometry Micro Optimizations
+1. **Target Files:** `domain_finder.py`
+   - **Target Functions:** `merge_overlapping_spans`
    - **Specific Instructions:**
      - In `merge_overlapping_spans`, add an immediate fast path for single-span targets (`if targets_on_sequence.shape[0] <= 1: return targets_on_sequence.copy()`).
      - Benchmark exact-coordinate grouping strictly after per-domain interval merging, logging metrics $M$, $G$, $Q$, and $E$.
