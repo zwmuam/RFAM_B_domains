@@ -318,14 +318,6 @@ def merge_overlapping_spans(targets_on_sequence: np.ndarray) -> np.ndarray:
 ## Domain Integrity, Sequence Filtering, and DPC Graph Semantics
 
 - **Evidence**:
-  In `aligners.py:145-152`:
-  ```python
-  q_seq_str = fields[0]
-  t_seq_str = fields[1]
-
-  if q_seq_str == t_seq_str:
-      continue
-  ```
   In `domain_finder.py:480-495` (`family_finder`), disconnected graphs ($u\_r.\text{size} == 0$) evaluate density against `min_fam_dens`:
   ```python
   if u_r.size == 0:
@@ -340,11 +332,11 @@ def merge_overlapping_spans(targets_on_sequence: np.ndarray) -> np.ndarray:
   valid_parents = (parent_nodes != np.arange(n)) & (s_max_higher > 0.0)
   ```
 - **Impact Analysis**:
-  1. **Same-Sequence Alignment Filtering**: The MMseqs2 parser currently skips all alignment hits where $q\_\text{seq} == t\_\text{seq}$. In the biological context of ncRNA domain discovery, filtering same-sequence hits is an intentional scientific choice: self-sequence duplications do not constitute independent comparative evidence of a conserved domain family across sequences. While recovering tandem duplications is biologically relevant in some contexts, doing so alters domain lengths, background density, and family clustering. It should not be modified as an incidental performance change.
+  1. **Same-Sequence Alignment Filtering**: The MMseqs2 parser currently skips all alignment hits where $q\_\text{seq} == t\_\text{seq}$. In the biological context of ncRNA domain discovery, filtering same-sequence hits is an intentional scientific choice: self-sequence duplications do not constitute independent comparative evidence of a conserved domain family across sequences. While recovering tandem duplications is biologically relevant in some contexts, doing so alters domain lengths, background density, and family clustering. It should not be modified.
   2. **DPC Singleton Handling**: When a similarity graph has no edges, points rely solely on self-similarity ($\rho\_i = 1.0$). If `min_fam_dens` exceeds 1.0, all points are classified as noise (-1). This logic is correctly implemented in `family_finder` and `dpc`, but requires ongoing regression testing to ensure disconnected subgraphs remain noise-safe.
   3. **Strict Lineage Propagation**: Points must only inherit cluster labels along edges with non-zero similarity ($s\_\text{max\_higher} > 0.0$). Unconnected components or points that fail to reach a valid density peak must resolve to noise (-1) rather than forming arbitrary clusters.
 - **Proposed Fix**:
-  1. Retain the same-sequence filter in `aligners.py` as a deliberate biological policy. Any future relaxation (e.g., admitting non-identical tandem duplicates) must be isolated as an explicit biological feature flag with dedicated regression tests.
+  1. Retain the same-sequence filter in `aligners.py` as a deliberate biological policy. Any future relaxation (e.g., admitting non-identical tandem duplicates) adds unnecessary redundancy and analysis overhead.
   2. Maintain comprehensive regression suites covering singletons, empty edge lists, zero-similarity boundaries, and multi-component graphs in `clustering.py` and `domain_finder.py`.
 
 - **Validation**:
