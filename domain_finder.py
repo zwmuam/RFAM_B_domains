@@ -312,7 +312,8 @@ def merge_overlapping_spans(targets_on_sequence: np.ndarray) -> np.ndarray:
     :param targets_on_sequence: 2D NumPy array of target spans (start, end).
     :return: 2D NumPy array of merged non-overlapping target spans.
     """
-    if len(targets_on_sequence) == 0:
+    ## mem_opt ## O(1) fast path for single-span or empty inputs avoiding sorting and memory allocations
+    if targets_on_sequence.shape[0] <= 1:
         return targets_on_sequence.copy()
     s = np.ascontiguousarray(targets_on_sequence[:, 0])
     e = np.ascontiguousarray(targets_on_sequence[:, 1])
@@ -351,26 +352,81 @@ def overlaps_on_target(sorted_target_spans: np.ndarray,
     return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
 
 
+class ShardedEdgeWriter:
+    """
+    In-loop bounded pair streaming writer to limit worker RSS during Stage 4.
+    Flushes coordinate chunks to disk when accumulated edges exceed max_buffer_edges.
+    """
+    def __init__(self, shard_dir: Path, chunk_id: int, max_buffer_edges: int = 250_000):
+        self.shard_dir = shard_dir
+        self.chunk_id = chunk_id
+        self.max_buffer_edges = max_buffer_edges
+        self.part_idx = 0
+        self.buf_r: List[np.ndarray] = []
+        self.buf_c: List[np.ndarray] = []
+        self.buf_i: List[np.ndarray] = []
+        self.buf_size = 0
+        self.total_edges = 0
+        self.part_counts: List[int] = []
+
+    def add(self, r: np.ndarray, c: np.ndarray, inter: np.ndarray) -> None:
+        if r.size == 0:
+            return
+        self.buf_r.append(r)
+        self.buf_c.append(c)
+        self.buf_i.append(inter)
+        self.buf_size += r.size
+        self.total_edges += r.size
+        if self.buf_size >= self.max_buffer_edges:
+            self.flush()
+
+    def flush(self) -> None:
+        if self.buf_size == 0:
+            return
+        r_cat = np.concatenate(self.buf_r)
+        c_cat = np.concatenate(self.buf_c)
+        i_cat = np.concatenate(self.buf_i)
+        part_name = f"{self.chunk_id}_part{self.part_idx}"
+        np.save(self.shard_dir / f"{part_name}_r.npy", r_cat)
+        np.save(self.shard_dir / f"{part_name}_c.npy", c_cat)
+        np.save(self.shard_dir / f"{part_name}_i.npy", i_cat)
+        self.part_counts.append(self.buf_size)
+        self.part_idx += 1
+        self.buf_r.clear()
+        self.buf_c.clear()
+        self.buf_i.clear()
+        self.buf_size = 0
+
+    def close(self) -> Tuple[int, int, List[int]]:
+        self.flush()
+        return self.chunk_id, self.total_edges, self.part_counts
+
+
 def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray]],
                            chunk_id: Optional[int] = None,
                            shard_dir_path: Optional[str] = None) \
         -> Union[Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[int, int]],
-                 Tuple[int, int, Dict[int, int]]]:
+                 Tuple[int, int, List[int], Dict[int, int]]]:
     """
     Process a batch of target sequences to merge same-domain intervals, compute
     per-domain target lengths, and calculate pairwise target overlaps.
     Maintains 32-bit integers for all physical genomic coordinate operations.
 
-    If shard_dir_path is provided, writes coordinate arrays directly to binary `.npy` shards
-    and returns (chunk_id, n_edges, domain_lengths_dict) to avoid duplicating memory in the parent process.
+    If shard_dir_path is provided, streams coordinate arrays directly to binary `.npy` shards
+    and returns (chunk_id, total_edges, part_counts, domain_lengths_dict) to bound worker memory.
 
     :param batch_targets: List of (target_id, target_spans, domain_pointers).
     :param chunk_id: Optional chunk identifier for disk sharding.
     :param shard_dir_path: Optional directory string where .npy shards are written.
-    :return: Either (rows, cols, intersections, domain_lengths_dict) or (chunk_id, n_edges, domain_lengths_dict).
+    :return: Either (rows, cols, intersections, domain_lengths_dict) or (chunk_id, total_edges, part_counts, domain_lengths_dict).
     """
-    batch_rows, batch_cols, batch_data = [], [], []
     batch_dom_lengths: Dict[int, int] = defaultdict(int)
+    use_shards = (shard_dir_path is not None and chunk_id is not None)
+
+    if use_shards:
+        writer = ShardedEdgeWriter(shard_dir=Path(shard_dir_path), chunk_id=chunk_id)
+    else:
+        batch_rows, batch_cols, batch_data = [], [], []
 
     for target_id, target_spans, domain_pointers in batch_targets:
         if domain_pointers.size == 0:
@@ -408,29 +464,26 @@ def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray
 
         rows, cols, intersections = overlaps_on_target(sorted_spans, aligned_sorted_domains)
         if rows.size > 0:
-            batch_rows.append(rows)
-            batch_cols.append(cols)
-            batch_data.append(intersections.astype(np.int32, copy=False))
+            if use_shards:
+                writer.add(rows, cols, intersections.astype(np.int32, copy=False))
+            else:
+                batch_rows.append(rows)
+                batch_cols.append(cols)
+                batch_data.append(intersections.astype(np.int32, copy=False))
+
+    if use_shards:
+        cid, total_edges, part_counts = writer.close()
+        return cid, total_edges, part_counts, dict(batch_dom_lengths)
 
     r_arr = np.concatenate(batch_rows) if batch_rows else np.empty(0, dtype=np.int32)
     c_arr = np.concatenate(batch_cols) if batch_cols else np.empty(0, dtype=np.int32)
     i_arr = np.concatenate(batch_data) if batch_data else np.empty(0, dtype=np.int32)
-
-    if shard_dir_path is not None and chunk_id is not None:
-        shard_dir = Path(shard_dir_path)
-        n_edges = r_arr.size
-        if n_edges > 0:
-            np.save(shard_dir / f"{chunk_id}_r.npy", r_arr)
-            np.save(shard_dir / f"{chunk_id}_c.npy", c_arr)
-            np.save(shard_dir / f"{chunk_id}_i.npy", i_arr)
-        return chunk_id, n_edges, dict(batch_dom_lengths)
-
     return r_arr, c_arr, i_arr, dict(batch_dom_lengths)
 
 
 def _target_sharded_worker_dispatch(shared_shard_dir: str,
                                     task_pkg: Tuple[int, List[Tuple[int, np.ndarray, np.ndarray]]]) \
-        -> Tuple[int, int, Dict[int, int]]:
+        -> Tuple[int, int, List[int], Dict[int, int]]:
     """
     Worker dispatch function for disk-sharded Stage 4 target batch processing.
     """
@@ -682,7 +735,8 @@ def find_domains(fasta_path: Path,
                                        worker_lifespan=200,
                                        chunk_size=1,
                                        max_tasks_active=max(1, cpu * 2)):
-                for local_domains, all_targets in batch_res:
+                while batch_res:
+                    local_domains, all_targets = batch_res.pop(0)
                     n_doms = len(local_domains)
                     if n_doms == 0:
                         continue
@@ -708,7 +762,11 @@ def find_domains(fasta_path: Path,
     n_total_domains = len(global_domains)
 
     if write_offset > 0:
-        all_targets_arr = target_buffer[:write_offset]
+        ## mem_opt ## Detach active prefix to release unused capacity from oversized pre-allocated target_buffer
+        if write_offset < target_buffer.shape[0]:
+            all_targets_arr = target_buffer[:write_offset].copy()
+        else:
+            all_targets_arr = target_buffer[:write_offset]
         del target_buffer
         all_targets_arr.sort(order=['t_seq', 'start'])
         ## mem_opt ## Index target sequence groups directly via boundary offsets instead of creating intermediate Python list slices with np.split
@@ -747,19 +805,14 @@ def find_domains(fasta_path: Path,
         if batch_pkg:
             yield (chunk_idx, batch_pkg)
 
-    # Establish dedicated shard directory under tmp_dir or system temp
-    if tmp_dir is not None:
-        stage4_tmp_dir = Path(tmp_dir) / "stage4_shards"
-        stage4_tmp_dir.mkdir(parents=True, exist_ok=True)
-        shard_cleanup_needed = False
-    else:
-        temp_dir_obj = tempfile.TemporaryDirectory(prefix="domain_finder_stage4_")
-        stage4_tmp_dir = Path(temp_dir_obj.name)
-        shard_cleanup_needed = True
+    # Establish isolated, process-safe unique shard directory under tmp_dir or system temp
+    base_tmp = Path(tmp_dir) if tmp_dir is not None else None
+    temp_dir_obj = tempfile.TemporaryDirectory(prefix="domain_finder_stage4_", dir=base_tmp)
+    stage4_tmp_dir = Path(temp_dir_obj.name)
 
     try:
         logger.info("Executing Stage 4: Calculating target overlaps across sequences")
-        meta_results: List[Tuple[int, int]] = []
+        meta_results: List[Tuple[int, int, List[int]]] = []
         global_dom_lengths = np.zeros(n_total_domains, dtype=np.int64)
         total_edges = 0
 
@@ -771,12 +824,12 @@ def find_domains(fasta_path: Path,
                         start_method=_safe_ctx_name,
                         shared_objects=str(stage4_tmp_dir)) as pool:
             with tqdm(desc="Calculating target overlaps", unit="batch") as pbar:
-                for chunk_id, n_edges, dom_lens_dict in pool.imap(_target_sharded_worker_dispatch,
-                                                                  _target_task_feeder(),
-                                                                  worker_lifespan=200,
-                                                                  chunk_size=1,
-                                                                  max_tasks_active=max(1, cpu * 2)):
-                    meta_results.append((chunk_id, n_edges))
+                for chunk_id, n_edges, part_counts, dom_lens_dict in pool.imap(_target_sharded_worker_dispatch,
+                                                                               _target_task_feeder(),
+                                                                               worker_lifespan=200,
+                                                                               chunk_size=1,
+                                                                               max_tasks_active=max(1, cpu * 2)):
+                    meta_results.append((chunk_id, n_edges, part_counts))
                     total_edges += n_edges
                     for d_id, d_len in dom_lens_dict.items():
                         if d_id < n_total_domains:
@@ -790,23 +843,18 @@ def find_domains(fasta_path: Path,
         all_inters = np.empty(total_edges, dtype=np.int32)
 
         write_pos = 0
-        for cid, n in meta_results:
-            if n > 0:
-                for dest, tag in ((all_rows, "r"), (all_cols, "c"), (all_inters, "i")):
-                    shard_file = stage4_tmp_dir / f"{cid}_{tag}.npy"
-                    dest[write_pos:write_pos + n] = np.load(shard_file, mmap_mode="r")
-                    shard_file.unlink(missing_ok=True)
-                write_pos += n
+        for cid, total_n, part_counts in meta_results:
+            if total_n > 0:
+                for part_idx, part_n in enumerate(part_counts):
+                    if part_n > 0:
+                        part_name = f"{cid}_part{part_idx}"
+                        for dest, tag in ((all_rows, "r"), (all_cols, "c"), (all_inters, "i")):
+                            shard_file = stage4_tmp_dir / f"{part_name}_{tag}.npy"
+                            dest[write_pos:write_pos + part_n] = np.load(shard_file, mmap_mode="r")
+                            shard_file.unlink(missing_ok=True)
+                        write_pos += part_n
     finally:
-        if shard_cleanup_needed:
-            temp_dir_obj.cleanup()
-        elif stage4_tmp_dir.exists():
-            for f in stage4_tmp_dir.glob("*.npy"):
-                f.unlink(missing_ok=True)
-            try:
-                stage4_tmp_dir.rmdir()
-            except OSError:
-                pass
+        temp_dir_obj.cleanup()
 
     # 4. Stage 5: Family finding with DPC
     logger.info("Executing Stage 5: Finding domain families")
