@@ -1,8 +1,6 @@
 # Consolidated Scientific and Technical Audit of the RNA Domain-Finding Pipeline
 
-This document is the authoritative, self-contained audit and implementation guide for the non-coding RNA (ncRNA) domain-finding pipeline. It synthesizes and replaces the preliminary analyses and working drafts in the repository. Every architectural component, algorithmic mechanism, and proposed optimization across `domain_finder.py`, `clustering.py`, `aligners.py`, and `executor.py` has been re-evaluated directly against the working code, mathematical invariants, and reproducible experiments.
-
-A future engineering agent (Jules) must read this complete document before making any changes to the codebase, adhere strictly to the baseline invariants, and consult the specific implementation plan and open questions detailed below.
+Read this complete document before making any changes to the codebase, adhere strictly to the baseline invariants, and consult the specific implementation plan and open questions detailed below. Every architectural component, algorithmic mechanism, and proposed optimization across `domain_finder.py`, `clustering.py`, `aligners.py`, and `executor.py` has been re-evaluated directly against the working code, mathematical invariants, and reproducible experiments.
 
 ---
 
@@ -15,7 +13,6 @@ A future engineering agent (Jules) must read this complete document before makin
   - *Verified*: Formally confirmed through code inspection and reproducible automated execution.
   - *Plausible Risk / Hypothesis*: Mechanistically sound hypothesis consistent with the code structure, requiring validation on empirical biological datasets.
   - *Incorrect / Unsupported / Obsolete*: Prior claims shown to be mathematically invalid, factually inaccurate, or already resolved in the current codebase.
-- **Data Limitations**: Historical benchmark numbers reported in previous drafts (such as 105,441 and 121,265 hits across 2,338 and 9,999 sequences, claimed speedups, and biological duplication percentages) lack raw input data, seeds, or execution logs in the tracked repository. They are treated here as previously reported claims rather than verified empirical truths. Experiments conducted during this audit rely on reproducible synthetic tests and controlled mathematical fixtures.
 
 ---
 
@@ -41,10 +38,9 @@ A future engineering agent (Jules) must read this complete document before makin
 ## Target-Span Storage, Memory Bounds, and Dereplication
 
 - **Status**: The flat 16-byte structured array is verified and compact. Global coordinate dereplication is unviable and rejected. The claimed 500 MB worker memory bound is unsupported by the code.
-- **Physical Layout and Breakeven Reality**: At Stage 3, target hits are stored in a contiguous 1D structured array with dtype `[('t_seq', int32), ('start', int32), ('end', int32), ('dom_id', int32)]`, requiring exactly 16 bytes per hit. The proposed dereplication scheme would separate unique coordinates `(t_seq, start, end)` (12 bytes) from domain associations using an inverted index (4 bytes for domain ID plus 4 bytes for coordinate indptr). For `U` unique coordinates and `N` total hits with duplication rate `d = 1 - U/N`, the storage cost is `16 * (1 - d) * N + 4 * N = (20 - 16 * d) * N` bytes. The mathematical breakeven requires `d > 25.0%`. If coordinate duplication is below 25%, dereplication increases physical storage.
-- **Domain Graph Ingestion Reality**: Downstream Stage 5 requires a graph between domain instances, not coordinates. If a unique coordinate group contains `k` distinct domains, those domains induce `k * (k - 1) / 2` pairwise within-group edges. If two overlapping coordinate groups contain `k1` and `k2` domains, they induce `k1 * k2` pairwise cross-group edges. Expanding these Cartesian products in Python creates severe interpreter bottlenecks and memory bloat, slowing down overlap computation by 10-fold to 14-fold without reducing the number of edges delivered to Stage 5.
+- **Domain Graph Ingestion Reality**: Downstream Stage 5 requires a graph between domain instances, not coordinates. If a unique coordinate group contains `k` distinct domains, those domains induce `k * (k - 1) / 2` pairwise within-group edges. If two overlapping coordinate groups contain `k1` and `k2` domains, they induce `k1 * k2` pairwise cross-group edges.
 - **Worker Memory Reality**: `ShardedEdgeWriter` flushes edge buffers to disk when accumulated edges reach 250,000 records. However, `target_batch_processor` calls `writer.add(...)` only after `overlaps_on_target` has completely materialized all edges for a target sequence. Furthermore, `writer.add` appends incoming arrays before checking the threshold. In a direct test, supplying 5 edges to a writer with a threshold of 2 produced a single shard of 5 edges. If a single target sequence generates millions of overlaps, worker memory spikes quadratically before any shard flush occurs. The claim in `README.md` that worker memory is strictly capped below 500 MB is unsupported.
-- **Recommendation**: Retain the flat 16-byte representation. Do not implement cross-domain coordinate dereplication. To prevent worker memory spikes on pathological dense targets, implement chunked overlap generation that streams bounded pair arrays directly to `ShardedEdgeWriter`.
+- **Recommendation**: Retain the flat 16-byte representation. Do not implement cross-domain coordinate dereplication. To prevent worker memory spikes on pathological dense targets, implement chunked overlap generation that streams bounded pair arrays directly to `ShardedEdgeWriter`. Ensure that only explicit non-zero edges are actually captured and saved.
 
 ## Scaling Bottlenecks Across Pipeline Stages
 
@@ -53,42 +49,6 @@ A future engineering agent (Jules) must read this complete document before makin
 - **Stage 5 Memory Scaling**: In `family_finder`, the parent process reconstructs all edge shards into three contiguous `int32` arrays (`all_rows`, `all_cols`, `all_inters`), allocates 64-bit composite keys `(u_r << 32) | u_c`, sorts them with `np.argsort`, and reduces duplicate edges. The total memory consumed during this step scales with the number of raw edges `Q` (approximately 70 bytes per raw edge across temporary arrays), not the unique graph size `E`. For large datasets with hundreds of millions of pairwise overlaps, Stage 5 parent memory will become the primary memory ceiling of the entire pipeline.
 - **Intra-Target Pair Collapse**: Collapsing duplicate domain pairs within individual target sequences before writing shards helps only when the same two domains overlap at multiple disjoint loci on that sequence (such as repeated motifs or tandem exons). On a single shared locus, each pair occurs only once per target, so intra-target deduplication does not reduce `Q / E = F`.
 - **Recommendation**: Maintain exact integer summation of intersection lengths throughout Stage 4 and Stage 5. If profiling on large biological datasets reveals that Stage 5 parent memory dominates, prototype an external sorted-run merge or chunked key reduction that aggregates identical domain pairs incrementally before allocating the full CSR similarity matrix.
-
-## Density Peak Clustering Backends and Numerical Behavior
-
-- **Status**: Current call-site backend choices (NumPy dense in Stage 2, SciPy CSR in Stage 5) are appropriate. Claims of guaranteed cross-backend numerical equivalence are disproved by a reproducible counterexample. Automatic backend switching without a defined tie-breaking policy is rejected.
-- **The Counterexample**: A 10-node undirected graph with edge similarities:
-  ```text
-  (0, 1, 0.4), (0, 7, 0.6), (0, 8, 0.2), (0, 9, 0.6), (2, 9, 0.2),
-  (3, 9, 0.4), (4, 6, 0.8), (5, 6, 0.4), (6, 9, 0.6)
-  ```
-  Evaluated with `halo_method=None`, `min_sim=0.35`, `min_dens=1.0`:
-  - Dense NumPy DPC returns two multi-node clusters `{0, 1, 3, 7, 9}` and `{4, 5, 6}`, with `{2}` and `{8}` as singletons.
-  - Sparse SciPy DPC returns a single merged cluster `{0, 1, 3, 4, 5, 6, 7, 9}`, with `{2}` and `{8}` as singletons.
-- **Root Cause**: Nodes 0, 6, and 9 have identical theoretical local density (2.8). In dense summation, all three nodes evaluate to 2.8000000000000003. In sparse CSR summation, nodes 0 and 6 evaluate to 2.8 while node 9 evaluates to 2.8000000000000003 (a difference of 4.4e-16). Because DPC ranks points by density with index tie-breaking to determine which node is higher, this sub-epsilon numerical divergence flips the nearest-higher assignment: dense DPC treats node 0 as the higher peak, whereas sparse DPC treats node 9 as the peak and links node 6 directly to it via their 0.6 edge.
-- **Crossover Reality**: Previous documentation contained contradictory crossover thresholds (claiming SciPy is faster starting at N=150–200, while nearby benchmark tables showed NumPy faster at N=200 and 1% density). Furthermore, `build_similarity_matrix` dense initialization is not an O(1) operation; it allocates an N x N buffer and executes indexed updates.
-- **Recommendation**: Preserve the existing static backend choices: `backend="numpy"` in Stage 2 (where query spans average 10–15 intervals) and `backend="scipy"` in Stage 5 (where global domain instances number in the tens of thousands and graph density is below 0.5%). Do not implement dynamic backend dispatch or `backend="auto"` until an explicit numerical tolerance policy for density ties is established and evaluated.
-
-## Chaining, Halo Filtering, and Similarity Metrics
-
-- **Status**: Transitive assignment along positive edges is standard DPC behavior. Proposed direct-to-peak lineage validation changes the clustering model and is rejected. Traditional cluster-wide halo filtering can cause excessive member pruning, but defaults should remain intact pending labeled biological benchmarks.
-- **DPC Pointer Doubling**: In `clustering.py:dpc`, non-peak points inherit cluster labels from their nearest higher-density neighbor via pointer doubling. This allows chaining: domain A connects to B (similarity 0.40), and B connects to C (similarity 0.40), while A and C share zero similarity. If C is the peak, both A and B are assigned to C. This is an intended property of density-based clustering that accommodates continuous evolutionary divergence. Requiring direct similarity between every member and the cluster peak would alter the fundamental clustering objective and reject legitimate members of heterogeneous families.
-- **Lineage Validation Flaw**: The pseudo-code patch proposed in earlier drafts called `.toarray()` on dense NumPy arrays (raising AttributeError) and used index -1 for unassigned points, triggering silent wrap-around to the last column. It is mathematically and syntactically defective.
-- **Halo Filtering Mechanics**: In traditional cluster-wide halo mode (`point_specific=False`), the boundary density cutoff is set to the maximum density among all border points of a cluster. If a large, authentic family contains a single high-density border point sharing a weak hit with an adjacent locus, that single point elevates the cluster threshold, causing legitimate internal members with lower density to be pruned as noise (-1). In `point_specific=True` mode, border points are pruned only if their individual density falls strictly below the cluster median. However, claims that traditional halo universally prunes 50% to 90% of biological members lack traceable provenance.
-- **Global Jaccard vs Containment**: In Stage 5, Jaccard similarity is computed as `summed_inters / (length_a + length_b - summed_inters)`, where lengths are accumulated across all target sequences. For an asymmetric pair where domain A covers 5,000 nt across 50 targets and domain B covers 100 nt on 1 target, full overlap yields Jaccard 0.02. This is an accurate calculation of total footprint overlap, not an arithmetic error. Replacing Jaccard with global containment `summed_inters / min(length_a, length_b)` would assign similarity 1.0 to any single accidental alignment between a large multi-copy element and an unrelated single-copy sequence, merging distinct families.
-- **Recommendation**: Retain current DPC pointer doubling, halo filtering defaults, and global Jaccard similarity. Evaluate point-specific halo filtering and co-occurrence normalized similarities only as configurable, opt-in experimental modes on curated benchmark datasets.
-
-## Same-Sequence Alignment Policy
-
-- **Status**: Skipping same-sequence hits is an intentional comparative genomics filter. Relaxing it introduces non-tandem self-matches and changes biological family interpretation.
-- **Code Fact**: In `aligners.py:parse_mmseqs_tsv`, all records where query sequence ID equals target sequence ID are dropped immediately:
-  ```python
-  if q_seq_str == t_seq_str:
-      continue
-  ```
-- **Biological and Algorithmic Implications**: In comparative RNA domain discovery, families are defined by independent evolutionary conservation across distinct sequence contexts. While tandem duplications on the same sequence are biologically real, cross-sequence alignments to single-copy homologs often capture those tandem instances without requiring same-sequence hits.
-- **Consequences of Coordinate-Only Filtering**: A prior proposal recommended skipping only identical coordinates (`q_seq == t_seq and q_start == t_start and q_end == t_end`). When tested on synthetic sequences, this relaxed filter successfully recovered isolated tandem copies. However, it also admitted inverted-repeat self-alignments (stem-loops aligning to themselves in reverse orientation) and small shifted self-hits, turning them into spurious single-sequence families with negative strand assignments.
-- **Recommendation**: Retain the current same-sequence exclusion filter as the baseline policy. If recovery of single-sequence tandem duplications is desired in the future, it must be introduced as an explicit, opt-in mode with dedicated filtering for inverted repeats, self-overlaps, and reciprocal duplicates.
 
 ## Touching Intervals, Strand Consensus, and GFF3 Export
 
@@ -109,16 +69,6 @@ A future engineering agent (Jules) must read this complete document before makin
 ---
 
 # Proposals Deferred or Rejected
-
-To prevent future implementation runs from pursuing unproductive or harmful changes, the following proposals from earlier drafts are explicitly deferred or rejected:
-
-- **Cross-Domain Coordinate Dereplication**: Rejected. Coordinate duplication in representative RNA datasets is well below the 25% breakeven threshold. Reconstructing domain pairs via Cartesian product expansion slows down overlap computation by 10-fold to 14-fold and provides zero reduction in Stage 5 memory or edge count.
-- **Automatic DPC Backend Switching (`backend="auto"`)**: Deferred. Floating-point summation order in density calculations breaks numerical parity on tied and near-tied nodes, altering cluster assignments. Static allocation (`numpy` for Stage 2, `scipy` for Stage 5) is safe and optimal for the respective graph sizes.
-- **Lineage Validation / Direct-to-Peak DPC Constraint**: Rejected. Transitive pointer doubling along positive edges is standard DPC behavior that accommodates natural sequence divergence. The proposed patch is syntactically invalid and changes the biological clustering model without validation.
-- **Global `>` to `>=` Replacement in `merge_overlapping_spans`**: Rejected. Merging abutting intervals is correct for union-of-covered-bases arithmetic in Stage 4. Any separation of touching loci for annotation must be implemented exclusively at Stage 6 GFF export.
-- **Replacing Jaccard with Containment Metric**: Rejected. Global containment assigns a similarity of 1.0 to any single-target overlap between a broadly conserved RNA and an unrelated sequence, causing spurious cross-family collapse.
-- **Unconditional Relaxation of Same-Sequence Alignment Filter**: Rejected. Admitting all non-identical same-sequence hits captures inverted-repeat stem-loops and shifted alignments, generating spurious single-sequence clusters.
-- **Refactoring `executor.py` Signal Handlers**: Rejected. The signal and recursion helpers have no active call sites in the domain-finding pipeline.
 
 ---
 
@@ -174,25 +124,15 @@ The following implementation steps are justified by verified code behavior. Each
 - **Target File**: `README.md`
 - **Intended Modification**:
   - Correct the `find_domains` code example to reflect the actual function signature: `find_domains(fasta_path, attributes, output_gff, tmp_dir, result_dir, cpu)`.
-  - Correct the MMseqs2 `--format-output` column order in documentation to match the parser's expected standard BLAST-TAB field order (qstart, qend, tstart, tend at columns 6–9).
   - Clarify that `ShardedEdgeWriter` is an incremental flush mechanism rather than a strict 500 MB worker RSS ceiling.
-  - Document that the MMseqs2 parser excludes all same-sequence hits as a comparative genomics policy.
+  - Document that the MMseqs2 parser excludes all same-sequence because they provide little evidence for domain conservation and force unnecessary computations. 
   - Accurately describe DPC halo filtering defaults (`halo_method="similarity_weighted"`, `point_specific=False`).
-- **Invariants to Preserve**: All application code remains unchanged.
-- **Reason**: Eliminates discrepancies between documentation, examples, and the verified codebase.
-- **Required Tests and Measurements**:
-  - Execute all Python and shell code snippets from `README.md` in a clean environment to verify syntax and runtime validity.
 
 ---
 
 # Open Questions and Experimental Protocols
 
 For architectural proposals that remain uncertain, the following structured experiments must be conducted before any code changes are introduced:
-
-## Experiment: Edge Multiplicity (Q / E) and Memory Profiling on Real Datasets
-- **Objective**: Measure the empirical ratio of raw edge contributions `Q` to unique domain pairs `E`, and determine whether Stage 4 worker generation or Stage 5 parent reduction dominates peak memory on biological data.
-- **Protocol**: Instrument `domain_finder.py` to record: total target hits `N`, unique coordinates `U`, raw overlap edges `Q`, unique domain pairs `E`, total shard bytes written, parent process RSS, and per-worker peak RSS across Stages 2, 4, and 5. Run on representative biological datasets (e.g., bacterial transcriptomes, eukaryotic ncRNA pools).
-- **Decision Criterion**: If `Q / E` is small (< 2.0) and Stage 5 memory remains under 1 GB, retain the current in-memory reduction. If `Q / E` is large (> 10.0) and Stage 5 memory exceeds system limits, implement an external sorted-run merge or chunked key reduction.
 
 ## Experiment: Density Tie Policy and Cross-Backend Parity
 - **Objective**: Establish whether dense NumPy and sparse SciPy DPC can achieve reliable numerical parity on real RNA similarity graphs.
@@ -206,13 +146,3 @@ For architectural proposals that remain uncertain, the following structured expe
   - Traditional cluster-wide halo vs point-specific halo vs disabled halo (`halo_method=None`).
   Evaluate boundary accuracy (F1-score at 80% reciprocal overlap), family purity, fragmentation, and noise classification rates.
 - **Decision Criterion**: Adopt alternative halo or similarity metrics only if curated reference recall improves significantly without causing false merges between distinct structural families. Retain current defaults as baseline.
-
----
-
-# Stop and Report Directives for Future Implementation
-
-A future coding agent must stop execution and report to the user if any of the following conditions are encountered:
-1. The working tree diverges from the verified SHA-256 file hashes recorded in this document, or core function signatures in `domain_finder.py`, `clustering.py`, or `aligners.py` have changed.
-2. A proposed optimization produces any divergence in canonical domain pair-to-sum maps, per-domain coverage lengths, or exported GFF3 coordinates on regression test suites.
-3. Measurement noise or hardware variability prevents reliable verification of memory or runtime improvements across at least 5 benchmark repetitions.
-4. An instruction requires altering biological clustering defaults, coordinate conventions (0-based half-open), integer data types (`int32` coordinates/indices, `int64` keys/sums), or multiprocessing start methods (`forkserver`) without explicit user authorization.
