@@ -72,6 +72,7 @@ This toolkit solves these problems using **Density Peak Clustering (DPC)** over 
 The pipeline processes raw sequences through eight modular stages:
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 520}, "themeVariables": {"fontSize": "16px"}}}%%
 flowchart TD
     classDef bigBox padding:18px,stroke-width:1.5px;
     S1["<b>Stage 1: All-Against-All Homology Search (MMseqs2)</b><br/>• Pairwise alignment of unannotated RNA sequences<br/>• Coordinate standardization: 1-based closed &rarr; 0-based half-open"]
