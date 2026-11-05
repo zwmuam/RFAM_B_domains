@@ -71,59 +71,18 @@ This toolkit solves these problems using **Density Peak Clustering (DPC)** over 
 
 The pipeline processes raw sequences through eight modular stages:
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│  Stage 1: All-Against-All Homology Search (MMseqs2 / BLAST-TAB)        │
-│  - Pairwise alignment of unannotated RNA sequences                     │
-│  - Coordinate standardization: 1-based closed -> 0-based half-open     │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-┌───────────────────────────────────▼────────────────────────────────────┐
-│  Stage 2: Query-Level Local Domain Instance Discovery (DPC)            │
-│  - 1D linear span merging per query                                    │
-│  - Density Peak Clustering identifies local domain peaks               │
-│  - Border point filtering (halo filter) prunes noisy transitions       │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-┌───────────────────────────────────▼────────────────────────────────────┐
-│  Stage 3: Cross-Sequence Target Partitioning & Indexing               │
-│  - Target sequence hit collation across all discovered query domains   │
-│  - In-memory contiguous sorting without intermediate Python overhead   │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-┌───────────────────────────────────▼────────────────────────────────────┐
-│  Stage 4: Pairwise Target Overlap Calculation                          │
-│  - Workload-aware parallel batch processing (executor.Parallel)        │
-│  - Sharded streaming (ShardedEdgeWriter) bounds worker RAM (< 500 MB)  │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-┌───────────────────────────────────▼────────────────────────────────────┐
-│  Stage 5: Global Family Clustering & GFF3 Feature Generation          │
-│  - Inter-domain Jaccard similarity matrix construction                 │
-│  - Global Density Peak Clustering groups domains into families         │
-│  - Strand consensus voting & export to standard GFF3                   │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-┌───────────────────────────────────▼────────────────────────────────────┐
-│  Stage 6: Coordinate Extraction & RNA Sequence Standardization        │
-│  - Genomic FASTA slicing using GFF3 intervals                          │
-│  - IUPAC degenerate base filtering (> 5% density discarded)            │
-│  - T -> U conversion & soft-masking (lowercase) preservation           │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-┌───────────────────────────────────▼────────────────────────────────────┐
-│  Stage 7: Structure-Aware Multiple Sequence Alignment & Trimming      │
-│  - Pathways: Muscle5, MAFFT L-INS-i, MAFFT Q-INS-i, Profile CM        │
-│  - Trimming: CIAlign Crop-from-Ends, trimAl, RNAalifold Consensus Mask │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-┌───────────────────────────────────▼────────────────────────────────────┐
-│  Stage 8: Benchmark Quality Evaluation & Infernal CM Export            │
-│  - Calculate SCI, Transitive Consistency (TCS), MI-APC covariation     │
-│  - Export Stockholm 1.0 (.sto) with #=GC SS_cons WUSS markup           │
-│  - Construct and calibrate Covariance Model (cmbuild + cmcalibrate)   │
-│  - Statistical significance verification via R-scape (E < 0.05)        │
-└────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    S1["<b>Stage 1: All-Against-All Homology Search (MMseqs2 / BLAST-TAB)</b><br/>• Pairwise alignment of unannotated RNA sequences<br/>• Coordinate standardization: 1-based closed &rarr; 0-based half-open"]
+    S2["<b>Stage 2: Query-Level Local Domain Instance Discovery (DPC)</b><br/>• 1D linear span merging per query<br/>• Density Peak Clustering identifies local domain peaks<br/>• Border point filtering (halo filter) prunes noisy transitions"]
+    S3["<b>Stage 3: Cross-Sequence Target Partitioning & Indexing</b><br/>• Target sequence hit collation across all discovered query domains<br/>• In-memory contiguous sorting without intermediate Python overhead"]
+    S4["<b>Stage 4: Pairwise Target Overlap Calculation</b><br/>• Workload-aware parallel batch processing (executor.Parallel)<br/>• Sharded streaming (ShardedEdgeWriter) bounds worker RAM (&lt; 500 MB)"]
+    S5["<b>Stage 5: Global Family Clustering & GFF3 Feature Generation</b><br/>• Inter-domain Jaccard similarity matrix construction<br/>• Global Density Peak Clustering groups domains into families<br/>• Strand consensus voting & export to standard GFF3"]
+    S6["<b>Stage 6: Coordinate Extraction & RNA Sequence Standardization</b><br/>• Genomic FASTA slicing using GFF3 intervals<br/>• IUPAC degenerate base filtering (&gt; 5% density discarded)<br/>• T &rarr; U conversion & soft-masking (lowercase) preservation"]
+    S7["<b>Stage 7: Structure-Aware Multiple Sequence Alignment & Trimming</b><br/>• Pathways: Muscle5, MAFFT L-INS-i, MAFFT Q-INS-i, Profile CM<br/>• Trimming: CIAlign Crop-from-Ends, trimAl, RNAalifold Consensus Mask"]
+    S8["<b>Stage 8: Benchmark Quality Evaluation & Infernal CM Export</b><br/>• Calculate SCI, Transitive Consistency (TCS), MI-APC covariation<br/>• Export Stockholm 1.0 (.sto) with #=GC SS_cons WUSS markup<br/>• Construct and calibrate Covariance Model (cmbuild + cmcalibrate)<br/>• Statistical significance verification via R-scape (E &lt; 0.05)"]
+
+    S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7 --> S8
 ```
 
 ---
@@ -176,26 +135,14 @@ Here is the complete, runnable workflow taking raw unannotated RNA FASTA sequenc
 
 ### Workflow Schematic
 
-```
-[input_transcripts.fasta]
-       │
-       ▼ (MMseqs2 easy-search)
-[alignments.tsv] (BLAST-TAB: qseqid, tseqid, qstart, qend, tstart, tend, evalue)
-       │
-       ▼ (domain_finder.find_domains)
-[domains.gff3] (De novo RNA family clusters on genomic coordinates)
-       │
-       ▼ (gff_sequence_extractor.extract_and_annotate_sequences)
-[extracted_families/fam_001.fasta, fam_002.fasta, ...] (Strand-adjusted, T->U)
-       │
-       ▼ (msa.py: Pathway 2 or 3)
-[aligned_families/fam_001.trimmed.fasta]
-       │
-       ▼ (RNAalifold consensus structure calculation)
-[seed_alignments/fam_001.seed.sto] (Stockholm 1.0 with #=GC SS_cons)
-       │
-       ▼ (Infernal cmbuild + cmcalibrate & R-scape)
-[models/fam_001.cm] (Calibrated CM ready for Rfamseq genome annotation)
+```mermaid
+flowchart TD
+    A["input_transcripts.fasta"] -->|"MMseqs2 easy-search"| B["alignments.tsv<br/><i>(BLAST-TAB: qseqid, tseqid, qstart, qend, tstart, tend, evalue)</i>"]
+    B -->|"domain_finder.find_domains"| C["domains.gff3<br/><i>(De novo RNA family clusters on genomic coordinates)</i>"]
+    C -->|"gff_sequence_extractor.extract_and_annotate_sequences"| D["extracted_families/fam_001.fasta, fam_002.fasta, ...<br/><i>(Strand-adjusted, T &rarr; U)</i>"]
+    D -->|"msa.py (Pathway 2 or 3)"| E["aligned_families/fam_001.trimmed.fasta"]
+    E -->|"RNAalifold consensus structure calculation"| F["seed_alignments/fam_001.seed.sto<br/><i>(Stockholm 1.0 with #=GC SS_cons)</i>"]
+    F -->|"Infernal cmbuild + cmcalibrate & R-scape"| G["models/fam_001.cm<br/><i>(Calibrated CM ready for Rfamseq genome annotation)</i>"]
 ```
 
 ### Step-by-Step Walkthrough
@@ -406,30 +353,27 @@ Computes scientific quality metrics across alignments:
 
 The pipeline provides four specialized alignment pathways configured for distinct operational requirements:
 
-```
-====================================================================================================
-PATHWAY 0: Ultra-Fast MUSCLE5 Primary Sequence Pipeline
-[Raw FASTA] ──> [T->U Standardize] ──> [MUSCLE v5 Super5] ──> [CIAlign / trimAl Trimming]
-Runtime: ~0.01 - 0.05 sec/MSA | RAM: < 20 MB | Purpose: Ultra-fast screening > 100,000 datasets
-====================================================================================================
+```mermaid
+flowchart TD
+    subgraph P0["<b>PATHWAY 0: Ultra-Fast MUSCLE5 Primary Sequence Pipeline</b><br/><i>Runtime: ~0.01 - 0.05 sec/MSA | RAM: &lt; 20 MB | Purpose: Ultra-fast screening &gt; 100,000 datasets</i>"]
+        direction LR
+        P0_A["Raw FASTA"] --> P0_B["T &rarr; U Standardize"] --> P0_C["MUSCLE v5 Super5"] --> P0_D["CIAlign / trimAl Trimming"]
+    end
 
-====================================================================================================
-PATHWAY 1: High-Throughput Screening Pipeline
-[Raw FASTA] ──> [T->U Standardize] ──> [MAFFT L-INS-i (--ep 0.0)] ──> [CIAlign Crop-from-Ends]
-Runtime: ~0.1 - 0.5 sec/MSA | RAM: < 50 MB | Purpose: High-throughput screening > 50,000 datasets
-====================================================================================================
+    subgraph P1["<b>PATHWAY 1: High-Throughput Screening Pipeline</b><br/><i>Runtime: ~0.1 - 0.5 sec/MSA | RAM: &lt; 50 MB | Purpose: High-throughput screening &gt; 50,000 datasets</i>"]
+        direction LR
+        P1_A["Raw FASTA"] --> P1_B["T &rarr; U Standardize"] --> P1_C["MAFFT L-INS-i (--ep 0.0)"] --> P1_D["CIAlign Crop-from-Ends"]
+    end
 
-====================================================================================================
-PATHWAY 2: Balanced Structure-Aware Pipeline (RECOMMENDED FOR RFAM-B)
-[Raw FASTA] ──> [T->U Standardize] ──> [MAFFT Q-INS-i / L-INS-i] ──> [Consensus Structure Masking]
-Runtime: ~2.0 - 15.0 sec/MSA | RAM: < 500 MB | Purpose: High-confidence motif extraction
-====================================================================================================
+    subgraph P2["<b>PATHWAY 2: Balanced Structure-Aware Pipeline (RECOMMENDED FOR RFAM-B)</b><br/><i>Runtime: ~2.0 - 15.0 sec/MSA | RAM: &lt; 500 MB | Purpose: High-confidence motif extraction</i>"]
+        direction LR
+        P2_A["Raw FASTA"] --> P2_B["T &rarr; U Standardize"] --> P2_C["MAFFT Q-INS-i / L-INS-i"] --> P2_D["Consensus Structure Masking"]
+    end
 
-====================================================================================================
-PATHWAY 3: Speed-Optimized Gold-Standard Profile Covariance Model Pipeline
-[Initial L-INS-i] ──> [RNAalifold] ──> [cmbuild] ──> [cmalign --glocal] ──> [cmbuild Final CM]
-Runtime: ~10.0 - 45.0 sec/MSA | RAM: < 1 GB | Purpose: Publication-grade CM construction
-====================================================================================================
+    subgraph P3["<b>PATHWAY 3: Speed-Optimized Gold-Standard Profile Covariance Model Pipeline</b><br/><i>Runtime: ~10.0 - 45.0 sec/MSA | RAM: &lt; 1 GB | Purpose: Publication-grade CM construction</i>"]
+        direction LR
+        P3_A["Initial L-INS-i"] --> P3_B["RNAalifold"] --> P3_C["cmbuild"] --> P3_D["cmalign --glocal"] --> P3_E["cmbuild Final CM"]
+    end
 ```
 
 #### Detailed Pathway Specifications
