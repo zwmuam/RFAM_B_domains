@@ -19,6 +19,7 @@ __email__ = "jakub.barylski@gmail.com"
 
 # built-ins
 from collections import defaultdict
+import gc
 from itertools import count
 from pathlib import Path
 import tempfile
@@ -330,6 +331,72 @@ def merge_overlapping_spans(targets_on_sequence: np.ndarray) -> np.ndarray:
     return out
 
 
+def iter_overlaps_on_target(sorted_target_spans: np.ndarray,
+                            aligned_domain_pointers: np.ndarray,
+                            max_pairs_per_chunk: int = 250_000) \
+        -> Generator[Tuple[np.ndarray, np.ndarray, np.ndarray], None, None]:
+    """
+    Yield pairwise target overlaps in bounded chunks to prevent worker RSS spikes
+    on dense sequences with quadratic pair counts. Preserves exact pair order.
+
+    :param sorted_target_spans: Start-sorted 2D NumPy array shape (N, 2) [[start, end], ...].
+    :param aligned_domain_pointers: 1D NumPy array of domain pointers for each span.
+    :param max_pairs_per_chunk: Maximum number of candidate overlap pairs per yielded chunk.
+    :return: Generator yielding (global_rows, global_cols, intersections).
+    """
+    n = sorted_target_spans.shape[0]
+    if n < 2:
+        return
+
+    starts = sorted_target_spans[:, 0]
+    ends = sorted_target_spans[:, 1]
+
+    if np.any(starts[1:] < starts[:-1]):
+        raise ValueError("sorted_target_spans must be sorted by start coordinate")
+
+    buf_r, buf_c, buf_i = [], [], []
+    curr_count = 0
+
+    for i in range(n):
+        end_i = ends[i]
+        d_i = aligned_domain_pointers[i]
+        r = max(i + 1, int(np.searchsorted(starts, end_i, side="left")))
+        if r > i + 1:
+            st_js = starts[i + 1:r]
+            en_js = ends[i + 1:r]
+            dom_js = aligned_domain_pointers[i + 1:r]
+
+            diff_mask = dom_js != d_i
+            if not np.any(diff_mask):
+                continue
+
+            overlap = np.minimum(end_i, en_js) - st_js
+            valid = (overlap > 0) & diff_mask
+            if np.any(valid):
+                matching_doms = dom_js[valid]
+                matching_inters = overlap[valid].astype(np.int32, copy=False)
+                cnt = matching_doms.size
+
+                pos = 0
+                while pos < cnt:
+                    take = min(cnt - pos, max_pairs_per_chunk - curr_count)
+                    buf_r.append(np.full(take, d_i, dtype=np.int32))
+                    buf_c.append(matching_doms[pos:pos + take].astype(np.int32, copy=False))
+                    buf_i.append(matching_inters[pos:pos + take])
+                    curr_count += take
+                    pos += take
+
+                    if curr_count >= max_pairs_per_chunk:
+                        yield np.concatenate(buf_r), np.concatenate(buf_c), np.concatenate(buf_i)
+                        buf_r.clear()
+                        buf_c.clear()
+                        buf_i.clear()
+                        curr_count = 0
+
+    if curr_count > 0:
+        yield np.concatenate(buf_r), np.concatenate(buf_c), np.concatenate(buf_i)
+
+
 def overlaps_on_target(sorted_target_spans: np.ndarray,
                        aligned_domain_pointers: np.ndarray) \
         -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -340,16 +407,16 @@ def overlaps_on_target(sorted_target_spans: np.ndarray,
     :param aligned_domain_pointers: 1D NumPy array of domain pointers for each span.
     :return: Tuple of (global_rows, global_cols, intersections).
     """
-    n_targets = sorted_target_spans.shape[0]
-    if n_targets > 1:
-        local_rows, local_cols, intersections = compare_sorted_spans(sorted_target_spans)
-        if local_rows.size > 0:
-            mask = aligned_domain_pointers[local_rows] != aligned_domain_pointers[local_cols]
-            if np.any(mask):
-                global_rows = aligned_domain_pointers[local_rows][mask]
-                global_cols = aligned_domain_pointers[local_cols][mask]
-                return global_rows, global_cols, intersections[mask]
-    return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
+    chunks = list(iter_overlaps_on_target(sorted_target_spans, aligned_domain_pointers))
+    if not chunks:
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
+    if len(chunks) == 1:
+        return chunks[0]
+    return (
+        np.concatenate([c[0] for c in chunks]),
+        np.concatenate([c[1] for c in chunks]),
+        np.concatenate([c[2] for c in chunks])
+    )
 
 
 class ShardedEdgeWriter:
@@ -462,11 +529,13 @@ def target_batch_processor(batch_targets: List[Tuple[int, np.ndarray, np.ndarray
         sorted_spans = merged_spans[sort_order]
         aligned_sorted_domains = aligned_domains[sort_order]
 
-        rows, cols, intersections = overlaps_on_target(sorted_spans, aligned_sorted_domains)
-        if rows.size > 0:
-            if use_shards:
-                writer.add(rows, cols, intersections.astype(np.int32, copy=False))
-            else:
+        if use_shards:
+            for rows, cols, intersections in iter_overlaps_on_target(sorted_spans, aligned_sorted_domains):
+                if rows.size > 0:
+                    writer.add(rows, cols, intersections.astype(np.int32, copy=False))
+        else:
+            rows, cols, intersections = overlaps_on_target(sorted_spans, aligned_sorted_domains)
+            if rows.size > 0:
                 batch_rows.append(rows)
                 batch_cols.append(cols)
                 batch_data.append(intersections.astype(np.int32, copy=False))
@@ -806,7 +875,11 @@ def find_domains(fasta_path: Path,
             yield (chunk_idx, batch_pkg)
 
     # Establish isolated, process-safe unique shard directory under tmp_dir or system temp
-    base_tmp = Path(tmp_dir) if tmp_dir is not None else None
+    if tmp_dir is not None:
+        base_tmp = Path(tmp_dir)
+        base_tmp.mkdir(parents=True, exist_ok=True)
+    else:
+        base_tmp = None
     temp_dir_obj = tempfile.TemporaryDirectory(prefix="domain_finder_stage4_", dir=base_tmp)
     stage4_tmp_dir = Path(temp_dir_obj.name)
 
@@ -855,6 +928,11 @@ def find_domains(fasta_path: Path,
                         write_pos += part_n
     finally:
         temp_dir_obj.cleanup()
+
+    # Explicitly release Stage 3/4 intermediate structures before Stage 5 DPC
+    if "all_targets_arr" in locals():
+        del all_targets_arr
+    gc.collect()
 
     # 4. Stage 5: Family finding with DPC
     logger.info("Executing Stage 5: Finding domain families")

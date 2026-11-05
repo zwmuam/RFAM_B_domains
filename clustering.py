@@ -20,9 +20,12 @@ def compare_sorted_spans(spans: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.
     """
     n = spans.shape[0]
     if n < 2:
-        return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
     starts = spans[:, 0]
     ends = spans[:, 1]
+
+    if np.any(starts[1:] < starts[:-1]):
+        raise ValueError("spans input to compare_sorted_spans must be sorted by start coordinate")
 
     lows, highs, inters = [], [], []
 
@@ -42,7 +45,7 @@ def compare_sorted_spans(spans: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.
                 inters.append(overlap[valid].astype(np.int32, copy=False))
 
     if not lows:
-        return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
 
     return np.concatenate(lows), np.concatenate(highs), np.concatenate(inters)
 
