@@ -81,7 +81,7 @@ flowchart TD
     S6["<b>Stage 6: Coordinate Extraction & RNA Sequence Standardization</b><br/>• Genomic FASTA slicing using GFF3 intervals<br/>• IUPAC degenerate base filtering (&gt; 5% density discarded)<br/>• T &rarr; U conversion & soft-masking (lowercase) preservation"]
     S7["<b>Stage 7: Structure-Aware Multiple Sequence Alignment & Trimming</b><br/>• Pathways: Muscle5, MAFFT L-INS-i, MAFFT Q-INS-i, Profile CM<br/>• Trimming: CIAlign Crop-from-Ends, trimAl, RNAalifold Consensus Mask"]
     S8["<b>Stage 8: Benchmark Quality Evaluation & Infernal CM Export</b><br/>• Calculate SCI, Transitive Consistency (TCS), MI-APC covariation<br/>• Export Stockholm 1.0 (.sto) with #=GC SS_cons WUSS markup<br/>• Construct and calibrate Covariance Model (cmbuild + cmcalibrate)<br/>• Statistical significance verification via R-scape (E &lt; 0.05)"]
-
+    class S1,S2,S3,S4,S5,S6,S7,S8 bigBox;
     S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7 --> S8
 ```
 
