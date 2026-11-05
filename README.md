@@ -73,7 +73,7 @@ The pipeline processes raw sequences through eight modular stages:
 
 ```mermaid
 flowchart TD
-    S1["<b>Stage 1: All-Against-All Homology Search (MMseqs2 / BLAST-TAB)</b><br/>• Pairwise alignment of unannotated RNA sequences<br/>• Coordinate standardization: 1-based closed &rarr; 0-based half-open"]
+    S1["<b>Stage 1: All-Against-All Homology Search (MMseqs2)</b><br/>• Pairwise alignment of unannotated RNA sequences<br/>• Coordinate standardization: 1-based closed &rarr; 0-based half-open"]
     S2["<b>Stage 2: Query-Level Local Domain Instance Discovery (DPC)</b><br/>• 1D linear span merging per query<br/>• Density Peak Clustering identifies local domain peaks<br/>• Border point filtering (halo filter) prunes noisy transitions"]
     S3["<b>Stage 3: Cross-Sequence Target Partitioning & Indexing</b><br/>• Target sequence hit collation across all discovered query domains<br/>• In-memory contiguous sorting without intermediate Python overhead"]
     S4["<b>Stage 4: Pairwise Target Overlap Calculation</b><br/>• Workload-aware parallel batch processing (executor.Parallel)<br/>• Sharded streaming (ShardedEdgeWriter) bounds worker RAM (&lt; 500 MB)"]
