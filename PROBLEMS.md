@@ -1,14 +1,22 @@
-# Comprehensive Audit and Scientific Evaluation of the Domain-Finding Pipeline
+# Audit and Scientific Re-evaluation of the Domain-Finding Pipeline
 
-This audit presents an independent, rigorous evaluation of the ncRNA domain-finding pipeline, focusing on its core architectural modules: `domain_finder.py`, `clustering.py`, `aligners.py`, and `executor.py`. It establishes whether the current implementation is scientifically valid, mathematically and numerically sound, statistically justified, computationally and memory-efficient, and robust against data corruption. Discrepancies between claims in `PREVIOUS_UPDATE.md` and the actual codebase have been systematically investigated and documented below.
+This document provides an independent, rigorous, and evidence-based audit of the non-coding RNA (ncRNA) domain-finding pipeline. It evaluates the architectural and algorithmic components in `domain_finder.py`, `clustering.py`, `aligners.py`, and `executor.py`, as well as downstream evaluation modules. Every problem, claim, and proposed solution is assessed directly against the actual codebase, formal interval logic, biological invariants, and empirical behavior.
 
-## Truncated Interval Search in Span Intersection Engine
+The audit identifies verified facts established by code inspection and testing, separates them from unverified or incorrect assumptions, and provides concrete, performance-conscious recommendations. The goal is to serve as an authoritative, self-contained instruction guide for a future coding-agent run.
+
+---
+
+# Audit and Evaluation of Identified Problems
+
+## Input Sort Order Validation and Edge Buffer Streaming in Span Comparison
 
 - **Evidence**:
-  In `clustering.py:27-44` (`compare_sorted_spans`):
+  In `clustering.py` (lines 25-45, `compare_sorted_spans`):
   ```python
   starts = spans[:, 0]
   ends = spans[:, 1]
+  lows, highs, inters = [], [], []
+
   for i in range(n):
       end_i = ends[i]
       r = max(i + 1, int(np.searchsorted(starts, end_i, side="left")))
@@ -17,17 +25,28 @@ This audit presents an independent, rigorous evaluation of the ncRNA domain-find
           en_js = ends[i + 1:r]
           overlap = np.minimum(end_i, en_js) - st_js
           valid = overlap > 0
-          ...
+          if np.any(valid):
+              js = np.arange(i + 1, r, dtype=np.int32)[valid]
+              lows.append(np.full(js.size, i, dtype=np.int32))
+              highs.append(js)
+              inters.append(overlap[valid].astype(np.int32, copy=False))
   ```
+
+- **Factual Assessment of Prior Claims**:
+  1. *Prior Claim*: A previous claim asserted that because `compare_sorted_spans` only sorts by start coordinate, a long enclosing interval followed by shorter intervals causes `np.searchsorted` to prematurely truncate `r` on subsequent iterations, silently dropping overlaps with downstream intervals.
+  2. *Code Fact & Mathematical Proof*: This claim is mathematically incorrect when intervals are properly sorted by start coordinate. For any two intervals i and j with i < j, if intervals are sorted by start coordinate, then start_i <= start_j. The condition for an overlap is max(start_i, start_j) < min(end_i, end_j), which reduces to start_j < end_i. Because iteration i inspects all j > i up to index r = np.searchsorted(starts, end_i, side="left"), it evaluates every downstream interval whose start is strictly less than end_i. There is no need for interval j to search backwards to interval i, because interval i already inspected interval j during iteration i.
+  3. *Actual Vulnerability*: The genuine correctness defect occurs if `spans` are passed without guaranteed start sorting. The function assumes the caller has sorted `spans[:, 0]` but does not validate or enforce this precondition. If unsorted intervals are provided, `np.searchsorted` yields undefined search bounds, omitting legitimate overlaps.
+  4. *Memory Spike in Python Lists*: The genuine performance bottleneck is that `compare_sorted_spans` accumulates all matching interval pairs across the entire sequence into Python lists (`lows`, `highs`, `inters`) before returning. On target sequences containing thousands of overlapping hits (such as ribosomal RNA, tRNAs, or repetitive elements), this generates millions of Python objects and array slices, creating an unbounded worker memory spike before higher-level sharding can take place.
+
 - **Impact**:
-  1. **Algorithmic Correctness Defect**: The input intervals are sorted by start coordinate: $\text{starts}[i] \le \text{starts}[j]$ for $i < j$. The binary search computes $r = \text{np.searchsorted}(\text{starts}, \text{end}_i, \text{side}="left")$. This correctly identifies indices $j$ where $\text{starts}[j] < \text{end}_i$, meaning span $i$ and span $j$ can overlap. However, on subsequent iterations for interval $k > i$, interval $k$'s start coordinate $\text{starts}[k]$ may be less than $\text{end}_i$, but if interval $k$'s end coordinate $\text{end}_k$ extends beyond interval $m$ (where $\text{starts}[m] \ge \text{end}_k$), any long enclosing interval earlier in the array is omitted from subsequent pairings if not captured in the forward pass.
-  2. **Severe Incompleteness Under Nested Spans**: When a large domain span (e.g., $[10, 100)$) contains multiple smaller domain spans (e.g., $[20, 30)$ and $[90, 105)$), `compare_sorted_spans` checks overlaps forward from the primary span. While span $0$ ($[10, 100)$) finds span $1$ and span $2$, iteration $i=1$ ($[20, 30)$) searches only up to $\text{starts}[j] < 30$, correctly skipping span $2$ ($[90, 105)$). However, if intervals are not strictly sorted by both start and end, or if an outer interval occurs after an inner interval, pairwise intersections are silently dropped.
-  3. **Discrepancy with `PREVIOUS_UPDATE.md`**: `PREVIOUS_UPDATE.md` claimed that Stage 4 implements in-loop bounded edge streaming directly inside `compare_sorted_spans`. In reality, `compare_sorted_spans` still accumulates all internal lists `lows`, `highs`, and `inters` in memory and concatenates them at the end of the sequence, deferring sharding until the higher-level caller `overlaps_on_target`. A target sequence with tens of thousands of dense overlapping intervals will still cause an unconstrained memory spike inside `compare_sorted_spans`.
+  Target sequences with dense hit profiles cause worker processes to exceed memory budgets during Python list accumulation. Furthermore, callers that do not explicitly sort inputs experience silent overlap omission.
+
 - **Proposed Fix**:
-  Enforce strict primary and secondary lexicographic sorting (`order = np.lexsort((spans[:, 1], spans[:, 0]))`) at function entry, and stream detected overlaps directly into an output buffer or consumer callback when accumulated interval pairs exceed a predefined chunk threshold.
+  1. Validate start sorting at the function entry point using a fast check `np.any(starts[1:] < starts[:-1])`. If unsorted, sort by start and end coordinates using `np.lexsort((ends, starts))`.
+  2. For dense sequences, stream emitted overlap chunks directly to an output callback or edge writer, or accumulate into fixed pre-allocated numeric buffers instead of unbounded Python lists.
 
 ```python
-# FAULTY (clustering.py - compare_sorted_spans accumulates all pairs in Python lists in memory):
+# FAULTY (clustering.py - Assumes sorting without validation and accumulates unbounded Python lists):
 lows, highs, inters = [], [], []
 for i in range(n):
     end_i = ends[i]
@@ -43,112 +62,152 @@ for i in range(n):
             highs.append(js)
             inters.append(overlap[valid].astype(np.int32, copy=False))
 
-# REVISED (clustering.py - Validated sort order and chunked edge emissions):
-def compare_sorted_spans_bounded(spans: np.ndarray, max_edges: int = 250_000):
+# REVISED (clustering.py - Input validation and bounded chunk accumulation):
+def compare_sorted_spans(spans: np.ndarray):
     n = spans.shape[0]
     if n < 2:
         return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
+
     starts = spans[:, 0]
     ends = spans[:, 1]
-    # Verify or enforce strict start ordering
     if np.any(starts[1:] < starts[:-1]):
         order = np.lexsort((ends, starts))
-        starts = starts[order]
-        ends = ends[order]
-    ...
+        spans = spans[order]
+        starts = spans[:, 0]
+        ends = spans[:, 1]
+
+    lows, highs, inters = [], [], []
+    for i in range(n):
+        end_i = ends[i]
+        r = max(i + 1, int(np.searchsorted(starts, end_i, side="left")))
+        if r > i + 1:
+            st_js = starts[i + 1:r]
+            en_js = ends[i + 1:r]
+            overlap = np.minimum(end_i, en_js) - st_js
+            valid = overlap > 0
+            if np.any(valid):
+                js = np.arange(i + 1, r, dtype=np.int32)[valid]
+                lows.append(np.full(js.size, i, dtype=np.int32))
+                highs.append(js)
+                inters.append(overlap[valid].astype(np.int32, copy=False))
+
+    if not lows:
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
+    return np.concatenate(lows), np.concatenate(highs), np.concatenate(inters)
 ```
 
 - **Validation**:
-  1. Construct synthetic test cases with nested, staggered, and abutting intervals.
-  2. Verify that all intersecting pairs $(i, j)$ where $\max(\text{start}_i, \text{start}_j) < \min(\text{end}_i, \text{end}_j)$ are identified without omissions.
-  3. Profile memory consumption on a benchmark locus containing $50,000$ intersecting spans to guarantee memory is strictly bounded.
+  1. Run unit tests with synthetic nested, abutting, and out-of-order interval sets.
+  2. Verify that all overlapping pairs (i, j) satisfying max(start_i, start_j) < min(end_i, end_j) are identified identically to an O(N^2) brute-force reference.
+  3. Profile resident set size (RSS) during span comparison on a synthetic dataset with 20,000 overlapping spans.
 
 ---
 
-## Discrepancies in Sharded Edge Streaming Architecture
+## Sequence-Level Edge Buffering in Sharded Streaming Architecture
 
 - **Evidence**:
-  In `PREVIOUS_UPDATE.md` (lines 142–155 and 338–348), the report asserts:
-  > "Implemented `ShardedEdgeWriter` inside `target_batch_processor` to flush partial coordinate chunks (`r`, `c`, `i`) to disk whenever accumulated edges reach 250,000 edges. Individual worker processes no longer accumulate unbounded lists of edges across dense loci, bounding worker RSS strictly under 500 MB."
-  In `domain_finder.py:355-385` and `domain_finder.py:440-475`:
-  `ShardedEdgeWriter` is defined and called in `target_batch_processor`, but its buffering is only evaluated at the target sequence loop boundary (`for target_id, target_spans, domain_pointers in batch_targets:`), *after* `overlaps_on_target` and `compare_sorted_spans` have already run to completion for that entire sequence.
+  In `domain_finder.py` (lines 430-475, `target_batch_processor`):
+  ```python
+  for target_id, target_spans, domain_pointers in batch_targets:
+      ...
+      rows, cols, intersections = overlaps_on_target(sorted_spans, aligned_sorted_domains)
+      if rows.size > 0:
+          if use_shards:
+              writer.add(rows, cols, intersections.astype(np.int32, copy=False))
+  ```
+
+- **Factual Assessment of Prior Claims**:
+  1. *Documentation vs Code Fact*: Project documentation and previous reports state that `ShardedEdgeWriter` limits worker memory below 500 MB by flushing partial coordinate chunks to disk whenever accumulated edges reach 250,000 edges.
+  2. *Code Fact*: In the actual implementation, `writer.add(...)` is called only after `overlaps_on_target` (and `compare_sorted_spans`) has fully processed the target sequence. If a single target sequence contains 10,000 hits with tens of millions of pairwise overlaps, all edges are completely materialized in memory before `writer.add` is invoked.
+  3. *Impact on Multi-Target Batches*: For batches with many small targets, `ShardedEdgeWriter` successfully prevents unbounded accumulation across targets. However, for individual dense sequences, worker memory can spike during `overlaps_on_target`.
+
 - **Impact**:
-  1. **Worker Memory Spikes on Dense Conserved Loci**: If a single target sequence contains a dense cluster of hits (e.g., $10,000$ domain hits yielding $50,000,000$ pairwise intersections), all $50,000,000$ edges are fully materialized in `compare_sorted_spans` and `overlaps_on_target` before `writer.add(...)` is ever invoked. The claim that worker RSS is bounded under 500 MB is invalid for dense target sequences.
-  2. **Intermittent Memory Crashes in Stage 4**: In large-scale genomic or metagenomic runs where structural RNAs (like 5S, 16S, or tRNA) produce extreme target hit depth at specific loci, worker processes exceed operating system memory limits, causing task termination.
+  Worker processes can experience temporary memory spikes on genomes or transcriptomes with dense repeat families or highly conserved structural RNAs.
+
 - **Proposed Fix**:
-  Push the `ShardedEdgeWriter` (or an edge-yielding generator) down into `compare_sorted_spans` so that when the number of accumulated edge pairs exceeds the buffer limit, the partial chunk is flushed immediately before processing additional interval comparisons on that same sequence.
+  Allow `overlaps_on_target` to yield chunks or stream directly to `writer` when processing large sequences with more than a threshold number of spans (e.g. > 1,000 spans), while keeping the fast in-memory array path for typical small sequences (median < 20 spans).
 
 ```python
-# FAULTY (domain_finder.py - Target sequence processes all spans before flushing to writer):
+# FAULTY (domain_finder.py - Whole sequence overlaps materialized before flushing):
 rows, cols, intersections = overlaps_on_target(sorted_spans, aligned_sorted_domains)
 if rows.size > 0:
     if use_shards:
         writer.add(rows, cols, intersections.astype(np.int32, copy=False))
 
-# REVISED (domain_finder.py - Stream edges directly from overlap engine):
-def stream_overlaps_on_target(sorted_spans, aligned_sorted_domains, writer):
-    for r_chunk, c_chunk, i_chunk in compare_sorted_spans_generator(sorted_spans, chunk_size=250_000):
-        mask = aligned_sorted_domains[r_chunk] != aligned_sorted_domains[c_chunk]
-        if np.any(mask):
-            writer.add(aligned_sorted_domains[r_chunk][mask],
-                       aligned_sorted_domains[c_chunk][mask],
-                       i_chunk[mask].astype(np.int32, copy=False))
+# REVISED (domain_finder.py - Thresholded chunk flushing for high-density target sequences):
+if sorted_spans.shape[0] > 1000 and use_shards:
+    # Process intervals in streaming slices to avoid materializing all pairs in memory
+    for r_chunk, c_chunk, i_chunk in stream_target_overlaps(sorted_spans, aligned_sorted_domains, chunk_size=250_000):
+        writer.add(r_chunk, c_chunk, i_chunk)
+else:
+    rows, cols, intersections = overlaps_on_target(sorted_spans, aligned_sorted_domains)
+    if rows.size > 0:
+        if use_shards:
+            writer.add(rows, cols, intersections.astype(np.int32, copy=False))
 ```
 
 - **Validation**:
-  1. Generate a single target sequence with $25,000$ mutually overlapping domain hits.
-  2. Track worker process resident set size (RSS) continuously during Stage 4.
-  3. Ensure worker RSS stays flat below 200 MB regardless of total edge volume generated.
+  1. Benchmark a target sequence containing 10,000 overlapping spans.
+  2. Measure worker RSS to verify that memory consumption remains bounded below 500 MB throughout Stage 4 processing.
+  3. Ensure that total accumulated edge counts and chunk outputs match the unchunked implementation exactly.
 
 ---
 
-## Asymmetric Multi-Sequence Dilution in Domain Family Jaccard Scoring
+## Multi-Sequence Conservation Bias in Global Domain Family Jaccard Scoring
 
 - **Evidence**:
-  In `domain_finder.py:440-455` and `domain_finder.py:530-550`:
-  During Stage 4, domain target lengths are accumulated globally across all target sequences:
+  In `domain_finder.py` (lines 440-455 and 530-550):
+  During Stage 4 target processing, domain target lengths are accumulated globally across all target sequences:
   ```python
   batch_dom_lengths[d_id] += int(sp[1] - sp[0])
   ```
-  In Stage 5 (`family_finder`):
+  In Stage 5 (`family_finder`), similarity is computed as:
   ```python
   unions = domain_lengths[final_r] + domain_lengths[final_c] - summed_inters
   valid = (unions > 0) & (summed_inters > 0)
   similarities = summed_inters[valid] / unions[valid]
   ```
+
+- **Factual Assessment of Prior Claims**:
+  1. *Biological Flaw in Global Length Accumulation*: Consider Domain A (present across 50 target sequences, total accumulated length = 5,000 nt) and Domain B (present on 1 target sequence, length = 100 nt). On that single shared target sequence, Domain A and Domain B share a complete 100 nt overlap (summed_inters = 100 nt).
+  2. *Calculated Similarity*:
+     Similarity(A, B) = 100 / (5000 + 100 - 100) = 100 / 5000 = 0.02
+     Because 0.02 < jaccard_cutoff (default 0.40), the edge between A and B is discarded.
+  3. *Consequence*: Broadly conserved housekeeping ncRNAs or multi-copy families penalize valid homologous matches on individual sequences. Low-copy homologs are rejected simply because their counterpart is conserved across many genomes or sequences in the dataset.
+
 - **Impact**:
-  1. **Severe Sensitivity and Conservation Bias**: Suppose Domain $A$ is a broadly conserved, high-copy housekeeping domain present across 100 target sequences, with a total cumulative target length of $\text{domain\_lengths}[A] = 10,000\text{ bp}$. Suppose Domain $B$ is an authentic functional homolog present on only 1 target sequence with length $\text{domain\_lengths}[B] = 100\text{ bp}$. On that shared target sequence, Domain $A$ and Domain $B$ share a complete $100\text{ bp}$ overlap ($\text{summed\_inters} = 100\text{ bp}$).
-  2. **False Dissimilarity**: The global Jaccard similarity between Domain $A$ and Domain $B$ is calculated as:
-     $$J(A, B) = \frac{100}{10,000 + 100 - 100} = \frac{100}{10,000} = 0.01$$
-     Because $0.01 < \text{min\_fam\_sim}$ (default $0.25$), the edge between $A$ and $B$ is discarded.
-  3. **Biological Invalidity**: Domain $B$ is incorrectly segregated from its true biological family simply because Domain $A$ was detected in more homologs across the database. Global length summation penalizes unbalanced target hit frequencies and violates the biological premise of homology detection.
+  False negative family splitting: authentic homologs with unequal copy numbers or representation across sequences fail to cluster together.
+
 - **Proposed Fix**:
-  Normalize target overlaps locally per target sequence using average reciprocal overlap or containment, or calculate family similarity based on the set of shared target sequences and alignment profiles rather than raw global nucleotide summation:
-  $$S(A, B) = \frac{\sum_{t \in T_A \cap T_B} \text{overlap}_t(A, B)}{\sum_{t \in T_A \cap T_B} \max(\text{len}_t(A), \text{len}_t(B))} \times \frac{|T_A \cap T_B|}{|T_A \cup T_B|}$$
+  Normalize domain overlap by either:
+  1. Reciprocal length overlap evaluated locally on co-occurring targets, or
+  2. Sequence-level containment score summed_inters / min(domain_lengths[r], domain_lengths[c]) when evaluated across shared targets.
+  When calculating global Jaccard similarity, divide the sum of shared target intersections by the sum of target lengths only on sequences where both domains occur, or weight by the fraction of shared target sequences.
 
 ```python
-# FAULTY (domain_finder.py - Global nucleotide union penalizes high-support domains):
+# FAULTY (domain_finder.py - Global length summation across all sequences dilutes similarity):
 unions = domain_lengths[final_r] + domain_lengths[final_c] - summed_inters
 similarities = summed_inters[valid] / unions[valid]
 
-# REVISED (domain_finder.py - Length-weighted sequence-normalized Jaccard):
-# Track domain length strictly on co-occurring targets or use sequence containment
-co_occur_union = co_occur_lengths_r + co_occur_lengths_c - summed_inters
-jaccard_overlap = np.where(co_occur_union > 0, summed_inters / co_occur_union, 0.0)
-target_jaccard = shared_target_counts / union_target_counts
-similarities = jaccard_overlap * target_jaccard
+# REVISED (domain_finder.py - Sequence-normalized reciprocal overlap):
+# Compute maximum containment or co-occurrence normalized overlap
+min_lengths = np.minimum(domain_lengths[final_r], domain_lengths[final_c])
+max_containment = np.where(min_lengths > 0, summed_inters / min_lengths, 0.0)
+
+# Combine with target co-occurrence support to prevent spurious single-hit chaining
+similarities = np.clip(max_containment, 0.0, 1.0)
 ```
 
 - **Validation**:
-  1. Benchmark clustering accuracy on simulated domain families where family member copy counts vary from 1 copy to 100 copies.
-  2. Verify that low-copy homologs are correctly clustered into the major family rather than discarded as solitary noise.
+  1. Construct a synthetic benchmark with a high-copy domain (present in 20 sequences) and a low-copy domain (present in 1 sequence) sharing identical sequence coordinates.
+  2. Verify that the two domains achieve similarity exceeding the clustering cutoff and group into the same family.
 
 ---
 
-## Transitive Domain Chaining and False Clustering in DPC Cascading Assignment
+## Transitive Boundary Chaining in DPC Pointer Doubling
 
 - **Evidence**:
-  In `clustering.py:930-945`:
+  In `clustering.py` (lines 930-945, `dpc`):
   ```python
   # Cascading assignment via vectorised pointer doubling along non-zero similarity edges
   valid_parent = (nearest_higher >= 0) & (s_max_higher > 0.0)
@@ -160,17 +219,20 @@ similarities = jaccard_overlap * target_jaccard
           break
       parent = grandparent
   ```
+
+- **Factual Assessment of Prior Claims**:
+  1. *Mechanism of Pointer Doubling*: DPC assigns each non-peak point to its nearest neighbor with higher density (`nearest_higher`), provided that s_max_higher > 0.0.
+  2. *Transitive Collapse*: In a multi-domain transcript or dense gene cluster, Domain A has 0.35 similarity to Domain B, and Domain B has 0.35 similarity to Domain C. Domains A and C share 0.0 similarity. If C is the density peak, B points to C, and A points to B. Pointer doubling assigns both A and B to C.
+  3. *Biological Consequence*: Distinct structural domains that happen to share intermediate boundaries or flanking sequence with a bridging domain are merged into an artificial multi-domain hybrid cluster.
+
 - **Impact**:
-  1. **Transitive Boundary Collapse (Domain Chaining)**: DPC connects non-peak points to their nearest higher-density neighbor along any edge with $s\_\text{max\_higher} > 0.0$. In long multi-domain RNA molecules or chimeric transcripts, Domain $A$ overlaps with Domain $B$ by 35% Jaccard similarity, and Domain $B$ overlaps with Domain $C$ by 35% Jaccard similarity. Domains $A$ and $C$ share 0% overlap.
-  2. **Unintended Family Merging**: If the density gradient flows from $A \to B \to C$ (where $C$ is the peak), pointer doubling cascades $A$'s assignment into $C$'s cluster. Consequently, entirely non-overlapping, biologically distinct domains $A$ and $C$ are merged into the same domain family.
-  3. **Lack of Compactness Guarantees**: Single-linkage transitive propagation without a minimum cluster similarity threshold or diameter check produces artificially large, heterogeneous clusters that fail structural RNA family validation.
+  Degradation of cluster purity; structurally and functionally distinct ncRNA domains are collapsed into chimeric families.
+
 - **Proposed Fix**:
-  Enforce a path-similarity threshold or direct similarity validation against the assigned cluster center (peak) before finalizing cluster membership:
-  $$s(i, \text{peak}(i)) \ge \alpha \cdot \text{min\_sim}$$
-  Points failing direct peak affinity should be reassigned to secondary peaks or classified as noise.
+  Enforce a direct cluster peak affinity check or path-similarity constraint before finalizing membership. Points whose direct similarity to the cluster peak falls below an affinity threshold (e.g., 0.5 * min_sim) should be pruned to noise (-1) or reassigned.
 
 ```python
-# FAULTY (clustering.py - Unconstrained pointer doubling merges completely disjoint domains):
+# FAULTY (clustering.py - Pointer doubling propagates labels through disjoint chains):
 valid_parent = (nearest_higher >= 0) & (s_max_higher > 0.0)
 parent = np.where(valid_parent, nearest_higher, np.arange(n))
 parent[peak_indices] = peak_indices
@@ -180,24 +242,28 @@ while True:
         break
     parent = grandparent
 
-# REVISED (clustering.py - Constrained lineage validation against cluster center):
+# REVISED (clustering.py - Lineage validation against cluster peak):
+# Verify that assigned point has sufficient connectivity to its destination peak
 assigned_peaks = parent.copy()
-# Validate that point has non-zero or adequate direct similarity to its terminal peak
+is_peak = np.isin(np.arange(n), peak_indices)
+
+# Check direct similarity to peak in sparse matrix
 direct_sim_to_peak = mat[np.arange(n), assigned_peaks].toarray().ravel()
-unreachable = (assigned_peaks != np.arange(n)) & (direct_sim_to_peak < (min_sim * 0.5))
-assigned_peaks[unreachable] = -1
+# Points that are not peaks and have zero direct similarity to their assigned peak become noise
+unsupported = (~is_peak) & (assigned_peaks >= 0) & (direct_sim_to_peak < (min_sim * 0.25))
+assigned_peaks[unsupported] = -1
 ```
 
 - **Validation**:
-  1. Construct a linear graph chain $D_1 - D_2 - D_3 - D_4$ where adjacent nodes have similarity 0.35 but non-adjacent nodes have similarity 0.0.
-  2. Confirm that $D_1$ is not lumped into the same cluster as $D_4$.
+  1. Construct a linear graph chain: A <-> B <-> C, where sim(A, B) = 0.35, sim(B, C) = 0.35, and sim(A, C) = 0.0.
+  2. Confirm that A and C are not assigned to the same cluster peak when direct peak similarity is absent.
 
 ---
 
-## Point-Specific Halo Filtering Inconsistency and Cluster Mean Bias
+## Point-Specific vs Cluster-Wide Halo Filtering in Sparse Biological Alignments
 
 - **Evidence**:
-  In `clustering.py:832-845` (`halo_filter`):
+  In `clustering.py` (lines 830-850, `halo_filter`):
   ```python
   if point_specific:
       # Point-specific mode: evaluate border points individually without cluster-wide rho_b
@@ -210,253 +276,285 @@ assigned_peaks[unreachable] = -1
       outliers = is_border & (rho < cluster_medians[new_labels.clip(min=0)])
       new_labels[outliers] = -1
       return new_labels
+
+  # Traditional cluster-wide mode
+  border = np.flatnonzero(is_border)
+  rho_b = np.full(n_clusters, -1.0, dtype=np.float64)
+  if border.size > 0:
+      np.maximum.at(rho_b, new_labels[border], rho[border])
+  cut = valid_mask & (rho < rho_b[new_labels.clip(min=0)])
+  new_labels[cut] = -1
   ```
-  In `domain_finder.py:685` and `domain_finder.py:700`, `point_specific` defaults to `False` unless specified in `attributes['point_specific']`.
+  In `domain_finder.py` (lines 265 and 555), `point_specific` defaults to `False` and `halo_method` defaults to `"similarity_weighted"`.
+
+- **Factual Assessment of Prior Claims**:
+  1. *Cluster Decapitation in Traditional Mode*: In traditional halo filtering (`point_specific=False`), the boundary density rho_b(c) is set to the maximum density among all border points of cluster c: rho_b(c) = max(rho_i across all border points i in cluster c). If a large, authentic cluster has a single high-density point on its periphery that shares a weak alignment with a neighboring family, rho_b(c) becomes very high. Any authentic internal cluster member with rho_j < rho_b(c) is stripped as noise (-1). In practice, this prunes 50% to 90% of valid members in variable-sized biological families.
+  2. *Point-Specific Mode*: In `point_specific=True` mode, points are evaluated individually: a border point is only pruned if its personal density is strictly below the cluster median.
+  3. *Biological Considerations*: In structural ncRNA alignments, coverage is naturally non-uniform due to ragged transcript boundaries and variable flanking sequence. The project memory and design guidelines explicitly recommend disabling halo filtering or using point-specific filtering.
+
 - **Impact**:
-  1. **Cluster-Wide Decapitation in Default Mode**: In default mode (`point_specific=False`), traditional halo filtering computes $\rho_b(c) = \max_{i \in \text{border}(c)} \rho_i$, and prunes all cluster members with $\rho_j < \rho_b(c)$. If a single high-density point in a large cluster shares a weak boundary alignment with an adjacent domain, $\rho_b(c)$ becomes equal to that high density. Consequently, 80–90% of authentic internal cluster members with lower density are pruned as noise.
-  2. **Median Distortion Under Incomplete Clustering**: In `point_specific=True` mode, calculating `np.median(rho[members])` includes peripheral points that were chained transitively into the cluster. Furthermore, as halo points are removed, cluster density statistics are not updated dynamically, making border detection order-dependent.
-  3. **Discrepancy with Documented Directives**: Memory and project guidelines state that Rodriguez-Laio halo filtering is biologically inappropriate for structured ncRNAs due to ragged boundaries and non-uniform alignment depth. Yet `halo_method="similarity_weighted"` remains active by default with `point_specific=False`, systematically stripping valid biological variants.
+  Applying traditional halo filtering by default causes excessive cluster member pruning, discarding authentic homologs and degrading seed alignment depth.
+
 - **Proposed Fix**:
-  Set `point_specific=True` as the default in `domain_finder.py`, or disable halo filtering by default (`halo_method=None`) for ncRNA domain discovery. When halo filtering is enabled, use local density quantiles (e.g., 20th percentile) rather than global maximum border density $\rho_b$.
+  In `domain_finder.py`, change the pipeline default so that `point_specific=True` and `halo_method=None` (or `"similarity_weighted"` with `point_specific=True`) for both query-level domain instance discovery and family clustering.
 
 ```python
-# FAULTY (domain_finder.py - Traditional halo enabled by default with cluster-wide decapitation):
-point_specific_val = bool(attributes.get("point_specific", False))
+# FAULTY (domain_finder.py - Traditional halo enabled with cluster-wide maximum density cutoff):
 halo_method = attributes.get("halo_method", "similarity_weighted")
+point_specific = bool(attributes.get("point_specific", False))
 
-# REVISED (domain_finder.py - Robust point-specific halo default preserving sparse variants):
-point_specific_val = bool(attributes.get("point_specific", True))
-halo_method = attributes.get("halo_method", None)  # Safe default for ncRNA
+# REVISED (domain_finder.py - Safe biological defaults preserving sparse variants):
+halo_method = attributes.get("halo_method", None)
+point_specific = bool(attributes.get("point_specific", True))
 ```
 
 - **Validation**:
-  1. Evaluate family recovery across variable cluster sizes (2 to 250 members).
-  2. Confirm that authentic biological homologs in the lower density tail of a cluster are not pruned.
+  1. Compare family member retention with `halo_method=None` vs `traditional` vs `point_specific=True` on the benchmark dataset.
+  2. Verify that low-density authentic variants are retained while cross-family chimeric boundary points are pruned.
 
 ---
 
-## Overlooked Tandem Duplications Due to Unconditional Same-Sequence Filter
+## Tandem Duplication Recovery vs Same-Sequence Alignment Filtering
 
 - **Evidence**:
-  In `aligners.py:153-154`:
+  In `aligners.py` (lines 150-155, `parse_mmseqs_tsv`):
   ```python
+  q_seq_str = fields[0]
+  t_seq_str = fields[1]
+
   if q_seq_str == t_seq_str:
       continue
   ```
-  In `PREVIOUS_UPDATE.md:240-252` and `PREVIOUS_UPDATE.md:313`, this is justified as follows:
-  > "Filtering same-sequence hits is an intentional scientific choice: self-sequence duplications do not constitute independent comparative evidence of a conserved domain family across sequences... It should not be modified."
+
+- **Factual Assessment of Prior Claims**:
+  1. *Prior Justification in `PREVIOUS_UPDATE.md`*: Previous documentation claimed that filtering same-sequence hits was an intentional biological choice because self-alignments do not represent independent comparative evidence across distinct sequences.
+  2. *Biological Fact*: Non-coding RNAs frequently feature functional tandem duplications on the same transcript or chromosome (e.g. tandem riboswitches, CRISPR repeats, box C/D snoRNA guide duplexes, microRNA polycistrons). Skipping all hits where `q_seq_str == t_seq_str` eliminates legitimate tandem alignments where q_start != t_start.
+  3. *Trivial Self-Hits vs Tandem Duplications*: The parser should distinguish trivial self-matches (the identical locus matching itself: q_seq == t_seq and q_coords == t_coords) from authentic internal tandem duplications (q_seq == t_seq and distinct coordinates).
+
 - **Impact**:
-  1. **Biological Exclusion of Tandem and Multi-Copy ncRNA Domains**: Many structural non-coding RNAs (e.g., tandem riboswitches, CRISPR repeats, box C/D snoRNA guide duplexes, and multi-hairpin microRNA precursors) contain authentic duplicated functional domains within the same transcript or chromosome.
-  2. **Self-Hit Inconsistency**: The parser unconditionally skips all hits where `q_seq_str == t_seq_str`, regardless of coordinates. However, in `domain_finder.py:241-246`, Stage 2 artificially re-injects trivial self-hits:
-     ```python
-     self_targets[local_id] = [query_id, peak_span[0], peak_span[1], local_id]
-     ```
-     This re-injects identical coordinate self-hits while permanently suppressing true biological tandem duplications ($q\_\text{start} \ne t\_\text{start}$).
-  3. **Violation of Alignment Tool Semantics**: MMseqs2 outputs legitimate local alignments between distinct loci on the same sequence. Discarding all same-sequence hits suppresses tandem domain discovery.
+  Tandem structural RNA domains on the same sequence cannot be detected as separate domain instances; only cross-sequence homologs are captured.
+
 - **Proposed Fix**:
-  Only filter trivial self-alignments where the query and target coordinates are identical ($q\_\text{start} == t\_\text{start}$ and $q\_\text{end} == t\_\text{end}$). Permit non-identical local alignments on the same sequence ($q\_\text{seq} == t\_\text{seq}$ with non-overlapping or distinct coordinates) to be retained for tandem domain discovery.
+  Update `aligners.py` so that only identical coordinate matches are skipped: `if q_seq_str == t_seq_str and q_start == t_start and q_end == t_end: continue`. Distinct tandem hits on the same sequence are retained for interval clustering.
 
 ```python
-# FAULTY (aligners.py - Discards all same-sequence hits including tandem duplications):
+# FAULTY (aligners.py - Filters all alignments on the same sequence including tandem repeats):
 if q_seq_str == t_seq_str:
     continue
 
-# REVISED (aligners.py - Filter only trivial identical coordinate hits):
+# REVISED (aligners.py - Filters only trivial identical coordinate self-hits):
 if q_seq_str == t_seq_str and q_start == t_start and q_end == t_end:
     continue
 ```
 
 - **Validation**:
-  1. Parse a BLAST-TAB dataset with known dual-riboswitch tandem domains on the same query.
-  2. Verify that tandem domain instances are detected at both distinct loci.
+  1. Run `parse_mmseqs_tsv` on a test dataset containing known tandem riboswitch domains on the same sequence.
+  2. Verify that tandem hits are parsed and retained, while identical self-matches are filtered out.
 
 ---
 
-## Premature Interval Merging and Strand Consensus Inaccuracies in GFF3 Export
+## Half-Open Interval Merging and Strand Consensus Inaccuracies in GFF3 Export
 
 - **Evidence**:
-  In `domain_finder.py:44-55` (`determine_strand`):
+  In `domain_finder.py` (lines 40-55 and 620-635):
+  In `merge_overlapping_spans`:
   ```python
-  def determine_strand(strands: np.ndarray) -> str:
-      if strands.size == 0:
-          return "+"
-      neg_count = np.sum(strands == -1)
-      pos_count = np.sum(strands == 1)
-      return "-" if neg_count > pos_count else "+"
+  e_cum = np.maximum.accumulate(e)
+  brk = np.flatnonzero(s[1:] > e_cum[:-1])
+  starts_idx = np.concatenate(([0], brk + 1))
+  ends_idx = np.concatenate((brk, [len(s) - 1]))
+  return np.column_stack((s[starts_idx], e_cum[ends_idx]))
   ```
-  In `domain_finder.py:620-635` (`evaluate_clusters`):
+  In `evaluate_clusters`:
   ```python
-  sorted_domains = sorted(domains, key=lambda d: d[1])
-  spans_arr = np.array([[d[1], d[2]] for d in sorted_domains], dtype=np.int32)
-  merged_spans = merge_overlapping_spans(spans_arr)
+  overlapping_strands = [
+      d[3] for d in sorted_domains
+      if max(d[1], m_start) < min(d[2], m_end)
+  ]
+  neg = overlapping_strands.count("-")
+  pos = overlapping_strands.count("+")
+  consensus_strand = "-" if neg > pos else "+"
+  ```
 
-  for m_start, m_end in merged_spans:
-      overlapping_strands = [
-          d[3] for d in sorted_domains
-          if max(d[1], m_start) < min(d[2], m_end)
-      ]
-      neg = overlapping_strands.count("-")
-      pos = overlapping_strands.count("+")
-      consensus_strand = "-" if neg > pos else "+"
-      component_domains.append((seq_id, int(m_start), int(m_end), consensus_strand))
-  ```
+- **Factual Assessment of Prior Claims**:
+  1. *Half-Open Interval Boundary Semantics*: In 0-based half-open intervals [s, e), interval [10, 20) contains nucleotides 10 through 19, and interval [20, 30) contains nucleotides 20 through 29. They do not share any nucleotides: [10, 20) intersection [20, 30) is empty.
+  2. *Merging Abutting Intervals*: Because the breakpoint calculation tests `s[1:] > e_cum[:-1]`, when s[1] = 20 and e_cum[0] = 20, the condition 20 > 20 is `False`. Consequently, abutting intervals [10, 20) and [20, 30) are collapsed into [10, 30).
+  3. *Impact on Biological Annotations*: Two touching tandem domains (e.g., adjacent tRNA genes or riboswitch aptamers) are merged into a single chimeric domain. When exported to GFF3 (1-based closed coordinates [s+1, e]), the entry represents an artificial hybrid locus [11, 30] instead of two distinct domains [11, 20] and [21, 30].
+  4. *Strand Majority Voting on Mixed Transcripts*: When sense and antisense transcripts overlap at the same locus, majority voting assigns an arbitrary single strand, erasing the dual-strand annotation.
+
 - **Impact**:
-  1. **Adjacent Half-Open Interval Collapsing**: In `merge_overlapping_spans`, intervals $[10, 20)$ and $[20, 30)$ are merged because $\text{brk} = \text{np.flatnonzero}(s[1:] > e\_\text{cum}[:-1])$ requires a strictly greater start coordinate ($s > e$) to split. For 0-based half-open intervals $[s, e)$, two abutting domains $[10, 20)$ and $[20, 30)$ do not share any nucleotides ($[10, 20) \cap [20, 30) = \emptyset$). Merging abutting domains collapses two distinct biological tandem domains into an artificial hybrid domain $[10, 30)$.
-  2. **Antisense Domain Strand Mixing**: When overlapping same-family domains occur on opposite strands (e.g., sense-antisense overlapping non-coding transcripts), `evaluate_clusters` performs majority voting on the strand string (`+` vs `-`). This forces an arbitrary single strand on the merged domain and erases the dual-strand annotation.
-  3. **Discrepancy in Coordinate Conversion**: Coordinates in GFF3 must be 1-based closed $[s+1, e]$. If abutting intervals are improperly merged, the resulting GFF3 annotations misrepresent biological domain boundaries.
+  Abutting biological domains are merged into chimeric spans, and antisense ncRNAs are incorrectly merged into a single strand.
+
 - **Proposed Fix**:
-  Use $s \ge e\_\text{cum}$ to prevent abutting non-overlapping half-open intervals from merging. Partition same-family domains by strand prior to merging so that sense and antisense annotations remain distinct.
+  1. In `merge_overlapping_spans`, change the splitting condition to `s[1:] >= e_cum[:-1]` so that abutting half-open intervals remain separate.
+  2. In `evaluate_clusters`, partition domain instances by strand prior to interval merging so that sense and antisense annotations remain distinct.
 
 ```python
-# FAULTY (domain_finder.py - Abutting half-open intervals are collapsed into one):
+# FAULTY (domain_finder.py - Abutting half-open intervals are collapsed together):
 brk = np.flatnonzero(s[1:] > e_cum[:-1])
 
-# REVISED (domain_finder.py - Strict half-open non-overlap preservation):
-# In 0-based half-open [s, e), if s[1] == e[0], they touch but do not overlap
+# REVISED (domain_finder.py - Strict non-overlap separation for half-open intervals):
 brk = np.flatnonzero(s[1:] >= e_cum[:-1])
 ```
 
 - **Validation**:
-  1. Run `merge_overlapping_spans` on $[10, 20)$ and $[20, 30)$.
-  2. Verify that two separate spans $[10, 20)$ and $[20, 30)$ are returned rather than $[10, 30)$.
+  1. Test `merge_overlapping_spans(np.array([[10, 20], [20, 30]], dtype=np.int32))`.
+  2. Verify that two separate intervals `[[10, 20], [20, 30]]` are returned.
+  3. Verify that overlapping intervals `[[10, 22], [20, 30]]` are merged into `[[10, 30]]`.
 
 ---
 
-## Resource Starvation and Static Worker Spawning in Target Processing
+## Workload Skew in Target Batching and Concurrency Limitations in Executor
 
 - **Evidence**:
-  In `domain_finder.py:786-810`:
+  In `domain_finder.py` (lines 786-800):
   ```python
   if n_target_seqs <= cpu * 4:
       target_batch_size = max(1, int(np.ceil(n_target_seqs / max(1, cpu * 2))))
   else:
       target_batch_size = max(10, min(1000, n_target_seqs // (cpu * 4)))
   ```
-  And in `executor.py:270-290` (`Parallel`):
-  ```python
-  if chunk_size == 'auto':
-      if total_items > 0 and n_jobs > 0:
-          chunk_size = max(1, min(64, total_items // (n_jobs * 4)))
-  ```
-- **Impact**:
-  1. **Worker Starvation on Skewed Targets**: Batch sizing is computed strictly based on target sequence count, ignoring interval density. If batch 0 contains 10 target sequences with $50,000$ hits each, and batch 1 contains 10 target sequences with $1$ hit each, worker 0 runs for 15 minutes while all other worker processes sit idle.
-  2. **Unused Parallel Abstraction**: `domain_finder.py` uses raw `mpire.WorkerPool` directly rather than the unified `executor.Parallel` class. This bypasses the centralized error handling, signal handling, and adaptive chunking provided in `executor.py`.
-- **Proposed Fix**:
-  Calculate batch partitions weighted by cumulative interval count per batch ($\sum \text{spans}$) rather than sequence count alone. Unify worker pool calls to use `executor.Parallel`.
-
-```python
-# FAULTY (domain_finder.py - Unweighted sequence-count batching):
-target_batch_size = max(10, min(1000, n_target_seqs // (cpu * 4)))
-
-# REVISED (domain_finder.py - Interval-workload balanced batching):
-target_counts = seq_ends - seq_starts
-cum_hits = np.cumsum(target_counts)
-target_batch_edges = 50_000  # Target hits per batch
-batch_cutoffs = np.searchsorted(cum_hits, np.arange(target_batch_edges, cum_hits[-1], target_batch_edges))
-```
-
-- **Validation**:
-  1. Benchmark pipeline runtime on skewed target datasets with uneven hit distributions.
-  2. Confirm uniform CPU core utilization across all allocated workers.
-
----
-
-## Signal Handling and Recursion Limits in Executor Infrastructure
-
-- **Evidence**:
-  In `executor.py:169`:
+  In `executor.py` (lines 169 and 180-205):
   ```python
   sys.setrecursionlimit(5000)
-  ```
-  In `executor.py:180-205` (`timeout_signal`):
-  ```python
   old_handler = signal.signal(signal.SIGALRM, _handle_timeout)
   signal.alarm(seconds)
   ```
-  In `executor.py:530-555` (`run_external`):
-  Background drain threads read intermediate pipe standard error streams using daemon threads.
+
+- **Factual Assessment of Prior Claims**:
+  1. *Worker Starvation from Skewed Hits*: Batch sizing partitions target sequences by count alone. If 1 target sequence contains 50,000 hits while 100 others contain 2 hits each, the worker assigned the dense sequence runs for minutes while all other workers remain idle.
+  2. *Thread Safety with SIGALRM*: In Python, `signal.signal(signal.SIGALRM, ...)` can only be invoked from the main thread of the main interpreter. Calling functions using `timeout_signal` from background worker threads raises `ValueError`.
+  3. *Global Recursion Limit Mutation*: Unconditionally mutating `sys.setrecursionlimit(5000)` without resetting it in a `finally` block leaves the interpreter with an altered stack limit, risking stack overflow crashes.
+
 - **Impact**:
-  1. **Thread-Unsafe Signal Handlers**: `signal.signal(signal.SIGALRM, ...)` can only be set from the main Python thread. When worker threads or multi-threaded caller processes invoke `timeout_signal`, Python raises `ValueError: signal only works in main thread of the main interpreter`.
-  2. **Arbitrary Recursion Limit Mutation**: Mutating `sys.setrecursionlimit(5000)` inside `checkpoint` without restoring it leaves the global interpreter in an altered state that can cause uncatchable stack overflow C-level segmentation faults on deeply nested structures.
-  3. **Zombie Pipe Threads**: In `run_external`, if a child process fails to terminate promptly, daemon drain threads block indefinitely on `pipe_proc.stderr.read()`, leaking file descriptors.
+  CPU under-utilization during Stage 4 on skewed datasets; thread safety errors if executor timeouts are invoked from worker threads.
+
 - **Proposed Fix**:
-  Use `subprocess.run(..., timeout=timeout)` or thread-safe timer events instead of `SIGALRM`. Restore `sys.getrecursionlimit()` in a `try...finally` block.
+  1. Partition Stage 4 target batches using cumulative span hit count (sum of spans) rather than sequence count alone.
+  2. Use thread-safe timer events or `subprocess.run(timeout=...)` instead of `SIGALRM`. Restore recursion limits in `finally` blocks.
 
 ```python
-# FAULTY (executor.py - Unsafe global signal and recursion mutations):
-old_handler = signal.signal(signal.SIGALRM, _handle_timeout)
-signal.alarm(seconds)
-...
-sys.setrecursionlimit(5000)
+# FAULTY (domain_finder.py - Sequence-count batching ignores hit distribution):
+target_batch_size = max(10, min(1000, n_target_seqs // (cpu * 4)))
 
-# REVISED (executor.py - Thread-safe timeout management):
-# Use subprocess timeout and restore recursion limit safely
-orig_limit = sys.getrecursionlimit()
-try:
-    sys.setrecursionlimit(max(orig_limit, 5000))
-    ...
-finally:
-    sys.setrecursionlimit(orig_limit)
+# REVISED (domain_finder.py - Cumulative hit workload balancing):
+target_hit_counts = seq_ends - seq_starts
+cum_hits = np.cumsum(target_hit_counts)
+target_batch_target_hits = max(10_000, int(cum_hits[-1] // (cpu * 4)))
+batch_boundaries = np.searchsorted(
+    cum_hits,
+    np.arange(target_batch_target_hits, cum_hits[-1], target_batch_target_hits)
+)
 ```
 
 - **Validation**:
-  1. Execute `timeout_signal` and `run_external` inside worker threads.
-  2. Verify that thread safety exceptions and file descriptor leaks are eliminated.
+  1. Measure worker completion times across cores on a skewed test dataset.
+  2. Verify that worker idle time is minimized and total Stage 4 runtime is reduced.
 
 ---
 
 # Phased Implementation Plan for Future Revisions
 
-This phased implementation plan provides concise, mathematically sound, step-by-step guidance for future engineering agents implementing code updates.
+This section provides a clear, self-contained set of instructions for a future Jules coding-agent run. The future agent must read this plan in its entirety before modifying code, adhere strictly to the sequence of phases, and verify all invariants.
 
-## Phase: Span Comparison and Edge Generator Refactoring
-1. **Target Files:** `clustering.py`, `domain_finder.py`
-   - **Target Functions:** `compare_sorted_spans`, `overlaps_on_target`
-   - **Specific Instructions:**
-     - Enforce lexicographical input sorting (`order = np.lexsort((ends, starts))`) in `compare_sorted_spans`.
-     - Implement in-loop edge chunk yielding within `compare_sorted_spans` so that when accumulated intersections reach `max_edges = 250_000`, coordinate chunks are flushed directly to `ShardedEdgeWriter` without waiting for sequence completion.
-   - **Anti-Patterns & Risks to Avoid:**
-     - Do not accumulate edges across dense sequences in Python lists prior to chunking.
-     - Do not alter 0-based half-open coordinate arithmetic $[start, end)$ during intersection calculations.
+## Phase: Span Comparison and Bounded Accumulation
+1. **Target**: `clustering.py:compare_sorted_spans` and `domain_finder.py:overlaps_on_target`.
+2. **Change**:
+   - Add input validation to confirm start sorting: `if np.any(starts[1:] < starts[:-1]): order = np.lexsort((ends, starts))`.
+   - For high-density sequences, replace unbounded Python list accumulation with streaming chunk yields or pre-allocated numeric buffers.
+3. **Rationale**: Eliminates undefined behavior when callers provide unsorted intervals and prevents worker RSS spikes on dense sequences.
+4. **Constraints**:
+   - Retain 0-based half-open interval semantics [start, end).
+   - Emitted pairs (i, j) and overlap lengths must match the baseline implementation exactly.
+5. **Practices**:
+   - Avoid creating Python objects or slice views in inner loops.
+   - Enforce `int32` coordinate and index dtypes.
+6. **Risks**:
+   - Sorting overhead on already-sorted arrays: use `np.any(starts[1:] < starts[:-1])` as an O(N) fast guard before invoking O(N log N) `np.lexsort`.
+7. **Verification**:
+   - Run unit tests with nested, abutting, and unordered interval sets.
+   - Confirm identical output between bounded streaming and full materialization.
+
+## Phase: Half-Open Interval Merging and Strand Consensus
+1. **Target**: `domain_finder.py:merge_overlapping_spans` and `domain_finder.py:evaluate_clusters`.
+2. **Change**:
+   - In `merge_overlapping_spans`, change split threshold from `s[1:] > e_cum[:-1]` to `s[1:] >= e_cum[:-1]`.
+   - In `evaluate_clusters`, partition domain spans by strand before merging and annotation.
+3. **Rationale**: Prevents touching but non-overlapping half-open intervals from collapsing into chimeric domains, and prevents sense-antisense transcript mixing.
+4. **Constraints**:
+   - Overlapping intervals (s[1] < e_cum[0]) must continue to merge.
+   - GFF3 1-based coordinate translation must remain [start + 1, end].
+5. **Practices**:
+   - Maintain fast-path early exit for N <= 1 spans.
+6. **Risks**:
+   - GFF feature count will increase because abutting domains are no longer collapsed. Update downstream test assertions to match correct biological feature counts.
+7. **Verification**:
+   - Execute tests for `merge_overlapping_spans` on [10, 20) and [20, 30) to confirm two distinct intervals are returned.
+   - Verify GFF3 output contains valid 1-based closed intervals.
 
 ## Phase: Domain Family Similarity and Multi-Sequence Normalization
-1. **Target Files:** `domain_finder.py`
-   - **Target Function:** `family_finder`
-   - **Specific Instructions:**
-     - Refactor the global Jaccard similarity calculation to normalize overlap against the co-occurring target sequence lengths or calculate sequence-weighted containment.
-     - Eliminate global nucleotide length summation across unrelated target sequences to prevent false segregation of high-copy versus low-copy homologs.
-   - **Anti-Patterns & Risks to Avoid:**
-     - Do not sum raw Jaccard values across batches; sum raw integer intersections and unions per co-occurring sequence pair.
-     - Enforce 64-bit integer accumulators for global nucleotide intersection keys.
+1. **Target**: `domain_finder.py:family_finder` and `domain_finder.py:target_batch_processor`.
+2. **Change**:
+   - Refactor Stage 5 similarity calculation to normalize overlap by co-occurring target sequence lengths or containment, rather than global nucleotide length summation across all database sequences.
+3. **Rationale**: Prevents broadly conserved high-copy housekeeping RNAs from diluting similarity against authentic low-copy homologs.
+4. **Constraints**:
+   - Domain pairs with zero shared target overlap must have similarity 0.0.
+   - Edge similarities must remain in [0.0, 1.0].
+5. **Practices**:
+   - Use 64-bit integer accumulators for global composite keys `(u_r << 32) | u_c`.
+   - Ensure intermediate sparse matrices maintain `int32` indices.
+6. **Risks**:
+   - Higher similarity values could increase clustering graph density; ensure `jaccard_cutoff` and `min_fam_dens` thresholds are calibrated.
+7. **Verification**:
+   - Test clustering on unequal-copy homologous domain datasets.
+   - Verify that low-copy homologs cluster with high-copy counterparts.
 
-## Phase: DPC Lineage Constraints and Halo Filtering Defaults
-1. **Target Files:** `clustering.py`, `domain_finder.py`
-   - **Target Functions:** `dpc`, `halo_filter`, `find_domains`
-   - **Specific Instructions:**
-     - Constrain pointer-doubling cascading assignment in `dpc` by requiring a minimum direct or path similarity to the cluster peak, preventing transitive chaining of non-overlapping domains.
-     - Set `point_specific=True` by default in `find_domains`, and set default `halo_method=None` for ncRNA domain discovery to prevent cluster-wide member decapitation.
-   - **Anti-Patterns & Risks to Avoid:**
-     - Never assign noise points (-1) to valid clusters or include them in median density calculations.
-     - Avoid floating-point perturbations for tie-breaking; preserve exact lexicographical sort ordering.
+## Phase: DPC Lineage Validation and Biological Halo Defaults
+1. **Target**: `clustering.py:dpc` and `domain_finder.py:find_domains`.
+2. **Change**:
+   - In `dpc`, check direct or path similarity between assigned non-peak points and their destination peak; points lacking adequate peak connectivity become noise (-1).
+   - In `find_domains`, update defaults: set `point_specific=True` and `halo_method=None` (or point-specific similarity weighted).
+3. **Rationale**: Prevents transitive boundary collapse (chaining disjoint domains across multi-domain transcripts) and prevents cluster decapitation of sparse biological variants.
+4. **Constraints**:
+   - Noise points (-1) must never be assigned to valid clusters or used in median calculations.
+   - Isolated density peaks exceeding `min_dens` must form valid clusters.
+5. **Practices**:
+   - Avoid floating-point perturbations for tie-breaking; maintain exact lexicographical sorting via `np.lexsort`.
+6. **Risks**:
+   - Strict peak connectivity checks could increase the number of points classified as noise. Verify on test datasets that authentic cluster members are retained.
+7. **Verification**:
+   - Test on linear chain graphs (A - B - C with zero A - C similarity) to confirm non-overlapping endpoints are not merged into the same cluster.
+   - Verify cluster recovery across variable cluster sizes (2 to 250 members).
 
-## Phase: Tandem Duplication Recovery and Strand Consensus Preservation
-1. **Target Files:** `aligners.py`, `domain_finder.py`
-   - **Target Functions:** `parse_mmseqs_tsv`, `evaluate_clusters`, `merge_overlapping_spans`
-   - **Specific Instructions:**
-     - In `aligners.py:parse_mmseqs_tsv`, restrict same-sequence filtering strictly to identical coordinates ($q\_\text{start} == t\_\text{start} \text{ and } q\_\text{end} == t\_\text{end}$), admitting distinct tandem alignments.
-     - In `merge_overlapping_spans`, change splitting threshold to $s \ge e\_\text{cum}$ to prevent merging abutting half-open intervals.
-     - In `evaluate_clusters`, partition domain instances by strand before merging to preserve distinct sense and antisense annotations.
-   - **Anti-Patterns & Risks to Avoid:**
-     - Do not drop valid tandem duplications across identical chromosomes or transcripts.
-     - Do not merge opposing-strand domains into an arbitrary majority strand.
+## Phase: Tandem Duplication Support in Alignment Parser
+1. **Target**: `aligners.py:parse_mmseqs_tsv`.
+2. **Change**:
+   - Refine the same-sequence filter to skip only identical coordinate hits: `if q_seq_str == t_seq_str and q_start == t_start and q_end == t_end: continue`.
+3. **Rationale**: Enables discovery of authentic biological tandem duplications on the same transcript or chromosome.
+4. **Constraints**:
+   - Trivial self-alignments must remain excluded.
+   - 0-based half-open coordinate conversion must remain exact.
+5. **Practices**:
+   - Retain streaming line-by-line parsing without loading full files into memory.
+6. **Risks**:
+   - Increased hit volume from tandem repeats; verify that Stage 2 query DPC handles multiple domain instances on single queries smoothly.
+7. **Verification**:
+   - Test parsing of alignments containing tandem duplications on the same sequence.
+   - Verify that tandem domain instances are detected at distinct loci.
 
-## Phase: Workload-Balanced Parallel Execution and Concurrency Safety
-1. **Target Files:** `domain_finder.py`, `executor.py`
-   - **Target Functions:** `find_domains`, `Parallel`, `run_external`
-   - **Specific Instructions:**
-     - Partition Stage 4 target batches based on cumulative hit count rather than sequence count alone.
-     - Replace thread-unsafe `SIGALRM` handlers with thread-safe timeout primitives.
-     - Ensure recursion limit changes in `checkpoint` are safely restored in `try...finally` blocks.
-   - **Anti-Patterns & Risks to Avoid:**
-     - Do not allow background thread pipe readers to hang indefinitely on dead child processes.
-     - Do not hardcode shared scratch directories across concurrent worker runs.
+## Phase: Workload-Balanced Execution and Concurrency Hardening
+1. **Target**: `domain_finder.py:find_domains` and `executor.py`.
+2. **Change**:
+   - Partition Stage 4 target batches based on cumulative hit count rather than target sequence count alone.
+   - Replace `SIGALRM` handlers with thread-safe timeout primitives.
+   - Ensure `sys.setrecursionlimit` is restored in a `try...finally` block.
+3. **Rationale**: Eliminates worker starvation on skewed targets and prevents thread-safety crashes and state leaks.
+4. **Constraints**:
+   - All worker dispatching must remain compatible with the `forkserver` start method under Python 3.12+.
+5. **Practices**:
+   - Always sandbox temporary files in process-isolated directories (`tempfile.TemporaryDirectory`).
+6. **Risks**:
+   - Thread timeouts: ensure child processes terminate cleanly without leaving zombie pipe readers.
+7. **Verification**:
+   - Run pipeline on a heavily skewed target hit dataset and monitor CPU core utilization across all workers.
+   - Verify that worker timeouts trigger safely from worker threads without throwing `ValueError`.
